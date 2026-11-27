@@ -15,6 +15,7 @@ muninn-simd = { path = "crates/muninn-simd" }
 muninn-vector = { path = "crates/muninn-vector" }
 muninn-text = { path = "crates/muninn-text" }
 muninn-store = { path = "crates/muninn-store" }
+muninn-filter = { path = "crates/muninn-filter" }
 muninn = { path = "crates/muninn" }
 
 [workspace.lints.rust]
