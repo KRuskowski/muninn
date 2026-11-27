@@ -10,6 +10,8 @@ license.workspace = true
 [dependencies]
 muninn-core.workspace = true
 muninn-simd.workspace = true
+# Work-stealing thread pool for parallel scans and graph builds.
+rayon = "1.10"
 
 [lints]
 workspace = true

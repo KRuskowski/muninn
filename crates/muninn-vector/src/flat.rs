@@ -1,44 +1,189 @@
-use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Result, TopK};
+use std::io::Write;
+use std::ops::Range;
 
-use crate::{SearchParams, VectorIndex};
+use muninn_core::container::{Container, ContainerWriter, tag};
+use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Region, Result};
+
+use crate::dist::scan_dist;
+use crate::quant::{Quantization, Quantizer, with_code_dist};
+use crate::scan::{exact_search, par_scan, rerank};
+use crate::slab::Slab;
+use crate::{SearchParams, VectorIndex, meta};
+
+/// Container kind of a [`FlatIndex`] file.
+pub const FLAT_KIND: [u8; 8] = tag("flat");
+/// Current [`FlatIndex`] file format version.
+pub const FLAT_VERSION: u32 = 1;
+
+const T_META: [u8; 8] = tag("meta");
+const T_VECTORS: [u8; 8] = tag("vectors");
 
 /// Exact brute-force index over full-precision vectors.
 ///
-/// Reference implementation: simple and obviously correct, used as the
-/// ground truth in recall tests. Optimised scanning (parallelism,
-/// blocking, quantised pre-filtering) belongs in the vector workstream.
+/// The recall oracle for every approximate index and the memtable index
+/// of the engine: inserts are O(1) and, below tens of thousands of
+/// vectors, a blocked scan beats any graph. Search scans blocks of rows
+/// with [`muninn_simd::distance_batch`], applies the filter during the
+/// scan, and splits large scans across rayon's thread pool with one
+/// [`muninn_core::TopK`] per task merged at the end.
+///
+/// Vectors are either owned (growable) or read in place from a mapped
+/// [`Region`] after [`FlatIndex::open`]; adding to a mapped index copies
+/// it first.
+///
+/// Optionally ([`FlatIndex::quantize`]) the scan runs over SQ8 or binary
+/// codes and the best `params.rerank` candidates are re-scored exactly.
+/// Unquantised (the default), results are exact.
 #[derive(Clone, Debug)]
 pub struct FlatIndex {
   dim: usize,
   metric: Metric,
-  data: Vec<f32>,
+  data: Slab<f32>,
+  quant: Option<Quantizer>,
+  trained_on: usize,
 }
 
 impl FlatIndex {
+  /// An empty index of `dim`-dimensional vectors compared by `metric`.
   pub fn new(dim: usize, metric: Metric) -> Self {
     Self {
       dim,
       metric,
-      data: Vec::new(),
+      data: Slab::default(),
+      quant: None,
+      trained_on: 0,
     }
+  }
+
+  /// Builds an index from row-major `vectors` (`dim` floats per row).
+  pub fn from_vectors(
+    dim: usize,
+    metric: Metric,
+    vectors: &[f32],
+  ) -> Result<Self> {
+    let mut idx = Self::new(dim, metric);
+    idx.add_batch(vectors)?;
+    Ok(idx)
   }
 
   /// Appends a vector and returns its id.
   pub fn add(&mut self, vector: &[f32]) -> Result<DocId> {
     check_dim(self.dim, vector)?;
-    let id = self.len() as DocId;
-    let start = self.data.len();
-    self.data.extend_from_slice(vector);
-    if self.metric.normalizes() {
-      muninn_simd::normalize(&mut self.data[start..]);
-    }
-    Ok(id)
+    Ok(self.add_batch(vector)?.start)
   }
 
-  /// The stored (possibly normalised) vector for `id`.
+  /// Appends row-major `vectors` (`dim` floats per row) and returns the
+  /// ids they were given.
+  pub fn add_batch(&mut self, vectors: &[f32]) -> Result<Range<DocId>> {
+    let rows = check_rows(self.dim, vectors)?;
+    let first = self.len();
+    check_capacity(first, rows)?;
+    let data = self.data.to_mut();
+    let start = data.len();
+    data.extend_from_slice(vectors);
+    if self.metric.normalizes() {
+      for row in data[start..].chunks_exact_mut(self.dim) {
+        muninn_simd::normalize(row);
+      }
+    }
+    if let Some(q) = &mut self.quant {
+      q.append(&data[start..]);
+      self.trained_on =
+        q.maybe_retrain(self.metric, self.dim, data, self.trained_on);
+    }
+    Ok(first as DocId..(first + rows) as DocId)
+  }
+
+  /// The stored (possibly normalised) vector for `id`. Panics if `id` is
+  /// out of range.
   pub fn vector(&self, id: DocId) -> &[f32] {
     let s = id as usize * self.dim;
-    &self.data[s..s + self.dim]
+    &self.data.as_slice()[s..s + self.dim]
+  }
+
+  /// All stored vectors, row-major (normalised for cosine).
+  pub fn vectors(&self) -> &[f32] {
+    self.data.as_slice()
+  }
+
+  /// Switches the scan to quantised codes trained on the current vectors
+  /// (re-trained automatically while the index is small and growing), or
+  /// back to exact search with [`Quantization::None`].
+  pub fn quantize(&mut self, kind: Quantization) {
+    self.quant =
+      Quantizer::train(kind, self.dim, self.metric, self.data.as_slice());
+    self.trained_on = self.len();
+  }
+
+  /// The active quantisation.
+  pub fn quantization(&self) -> Quantization {
+    self.quant.as_ref().map_or(Quantization::None, |q| q.kind())
+  }
+
+  /// Whether the vectors are read in place from a mapped region.
+  pub fn is_mapped(&self) -> bool {
+    self.data.is_mapped()
+  }
+
+  /// Bytes held for vectors and codes (owned or mapped).
+  pub fn memory_bytes(&self) -> usize {
+    self.data.bytes() + self.quant.as_ref().map_or(0, |q| q.bytes())
+  }
+
+  /// Writes the index as one container file in a single streaming pass.
+  pub fn write_to<W: Write>(&self, out: W) -> Result<W> {
+    let mut w = ContainerWriter::new(out, FLAT_KIND, FLAT_VERSION)?;
+    self.write_sections(&mut w)?;
+    w.finish()
+  }
+
+  /// Writes the index's sections into an already open container, for
+  /// callers that bundle several structures in one file.
+  pub fn write_sections<W: Write>(
+    &self,
+    w: &mut ContainerWriter<W>,
+  ) -> Result<()> {
+    let m = [
+      self.dim as u64,
+      self.metric.to_u8() as u64,
+      self.len() as u64,
+      self.quantization().to_u8() as u64,
+      self.trained_on as u64,
+    ];
+    w.pod_section(T_META, &m)?;
+    w.pod_section(T_VECTORS, self.data.as_slice())?;
+    if let Some(q) = &self.quant {
+      q.write_sections(w)?;
+    }
+    Ok(())
+  }
+
+  /// Opens a file written by [`FlatIndex::write_to`]. Vectors and codes
+  /// are read in place from `region`; nothing is copied.
+  pub fn open(region: Region) -> Result<Self> {
+    let c = Container::open_kind(region, FLAT_KIND, FLAT_VERSION)?;
+    Self::from_container(&c)
+  }
+
+  /// Opens the sections written by [`FlatIndex::write_sections`].
+  pub fn from_container(c: &Container) -> Result<Self> {
+    let m = meta::read(c.section(T_META)?, 5)?;
+    let dim = meta::usize_field(m[0], "dimension")?;
+    let metric = meta::metric(m[1])?;
+    let n = meta::usize_field(m[2], "vector count")?;
+    let kind = meta::quantization(m[3])?;
+    let data = Slab::from_region(c.section(T_VECTORS)?)?;
+    if Some(data.len()) != n.checked_mul(dim) {
+      return Err(Error::corrupt("flat vectors section has the wrong size"));
+    }
+    let quant = Quantizer::open(kind, c, dim, metric, n)?;
+    Ok(Self {
+      dim,
+      metric,
+      data,
+      quant,
+      trained_on: meta::usize_field(m[4], "training size")?,
+    })
   }
 }
 
@@ -52,6 +197,44 @@ pub(crate) fn check_dim(dim: usize, v: &[f32]) -> Result<()> {
   Ok(())
 }
 
+/// Checks a row-major batch and returns its row count.
+pub(crate) fn check_rows(dim: usize, vectors: &[f32]) -> Result<usize> {
+  if dim == 0 {
+    return if vectors.is_empty() {
+      Ok(0)
+    } else {
+      Err(Error::DimensionMismatch {
+        expected: 0,
+        got: vectors.len(),
+      })
+    };
+  }
+  if vectors.len() % dim != 0 {
+    return Err(Error::DimensionMismatch {
+      expected: dim,
+      got: vectors.len() % dim,
+    });
+  }
+  Ok(vectors.len() / dim)
+}
+
+/// Ids are `u32`; refuses batches that would overflow them.
+pub(crate) fn check_capacity(len: usize, more: usize) -> Result<()> {
+  if len + more > DocId::MAX as usize {
+    return Err(Error::invalid("index would exceed u32::MAX vectors"));
+  }
+  Ok(())
+}
+
+/// The query, normalised for cosine.
+pub(crate) fn prepare_query(metric: Metric, query: &[f32]) -> Vec<f32> {
+  let mut q = query.to_vec();
+  if metric.normalizes() {
+    muninn_simd::normalize(&mut q);
+  }
+  q
+}
+
 impl VectorIndex for FlatIndex {
   fn dim(&self) -> usize {
     self.dim
@@ -62,11 +245,7 @@ impl VectorIndex for FlatIndex {
   }
 
   fn len(&self) -> usize {
-    if self.dim == 0 {
-      0
-    } else {
-      self.data.len() / self.dim
-    }
+    self.data.len().checked_div(self.dim).unwrap_or(0)
   }
 
   fn search(
@@ -76,24 +255,39 @@ impl VectorIndex for FlatIndex {
     filter: Option<&dyn DocFilter>,
   ) -> Result<Vec<Hit>> {
     check_dim(self.dim, query)?;
-    let mut q = query.to_vec();
-    if self.metric.normalizes() {
-      muninn_simd::normalize(&mut q);
+    if params.k == 0 || self.is_empty() {
+      return Ok(Vec::new());
     }
-    let mut top = TopK::new(params.k);
-    for id in 0..self.len() as DocId {
-      if filter.is_some_and(|f| !f.matches(id)) {
-        continue;
+    let q = prepare_query(self.metric, query);
+    let data = self.data.as_slice();
+    let top = match &self.quant {
+      None => exact_search(self.metric, self.dim, data, &q, params.k, filter),
+      Some(qz) => {
+        let r = match params.rerank {
+          0 => qz.kind().default_rerank(params.k),
+          r => r,
+        }
+        .max(params.k);
+        let qc = qz.prepare(self.metric, &q);
+        let cd = qz.dist(&qc);
+        let n = self.len();
+        let cands = with_code_dist!(cd, |d| {
+          par_scan(n, r, n * self.dim / 4, |range, top| {
+            scan_dist(&d, range, filter, top)
+          })
+        });
+        let ids = cands.iter().map(|(id, _)| id);
+        rerank(self.metric, self.dim, data, &q, ids, params.k)
       }
-      let d = muninn_simd::distance(self.metric, &q, self.vector(id));
-      top.push(id, d);
-    }
+    };
     Ok(top.into_hits(self.metric))
   }
 }
 
 #[cfg(test)]
 mod tests {
+  use muninn_core::AlignedBuf;
+
   use super::*;
 
   #[test]
@@ -128,5 +322,36 @@ mod tests {
         got: 1
       })
     ));
+    assert!(idx.add_batch(&[1.0, 2.0, 3.0]).is_err());
+    assert_eq!(idx.len(), 2);
+  }
+
+  #[test]
+  fn round_trip_is_zero_copy_and_growable() -> Result<()> {
+    let mut idx = FlatIndex::new(3, Metric::Dot);
+    idx.add_batch(&[1.0, 0.0, 0.0, 0.0, 2.0, 0.0]).unwrap();
+    let buf = idx.write_to(AlignedBuf::new()).unwrap();
+    let mut back = FlatIndex::open(Region::new(buf)).unwrap();
+    assert!(back.is_mapped());
+    assert_eq!(back.vectors(), idx.vectors());
+    let p = SearchParams::new(2);
+    let q = [0.5, 1.0, 0.0];
+    assert_eq!(back.search(&q, &p, None)?, idx.search(&q, &p, None)?);
+    assert_eq!(back.add(&[0.0, 0.0, 9.0]).unwrap(), 2);
+    assert!(!back.is_mapped());
+    assert_eq!(back.search(&[0.0, 0.0, 1.0], &p, None)?[0].id, 2);
+    Ok(())
+  }
+
+  #[test]
+  fn open_rejects_garbage() {
+    let idx = FlatIndex::new(3, Metric::L2);
+    let buf = idx.write_to(AlignedBuf::new()).unwrap();
+    let mut bad = buf.clone();
+    // Corrupt the metric byte in the meta section (offset 64 + 8).
+    bad.as_mut_slice()[72] = 9;
+    assert!(FlatIndex::open(Region::new(bad)).is_err());
+    let short = Region::copy_from(&buf.as_slice()[..buf.len() - 3]);
+    assert!(FlatIndex::open(short).is_err());
   }
 }
