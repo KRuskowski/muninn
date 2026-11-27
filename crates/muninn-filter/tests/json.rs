@@ -202,3 +202,70 @@ fn schema_json() {
     assert!(e.contains(want), "{e}");
   }
 }
+
+#[test]
+fn floats_round_trip_exactly_through_text() {
+  // Random bit patterns cover every exponent; the default serde_json
+  // parser is not correctly rounded and misses ~30% of these.
+  let mut r = Rng::new(5);
+  let mut checked = 0;
+  while checked < 20_000 {
+    let x = f64::from_bits(r.next());
+    if !x.is_finite() {
+      continue;
+    }
+    checked += 1;
+    let text = Filter::eq("f", x).to_json().unwrap().to_string();
+    match Filter::parse(&text).unwrap() {
+      Filter::Eq(_, Value::Float(y)) => {
+        assert_eq!(y.to_bits(), x.to_bits(), "{text}")
+      }
+      other => panic!("{text} parsed as {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn float_eq_survives_text_round_trips_end_to_end() {
+  use muninn_core::{AlignedBuf, Region};
+  use muninn_filter::{FrozenIndex, MemIndex};
+  let schema = Schema::new().with("f", FieldType::Float).unwrap();
+  let mut r = Rng::new(6);
+  let mut xs = Vec::new();
+  while xs.len() < 2000 {
+    let x = f64::from_bits(r.next());
+    if x.is_finite() {
+      xs.push(x);
+    }
+  }
+  // The engine's two mixes: payload parsed from text (HTTP) with a filter
+  // built in Rust, and a payload built in Rust with a filter parsed from
+  // text. Both must agree on every bit of the value.
+  let mut from_text = MemIndex::new(schema.clone());
+  let mut in_memory = MemIndex::new(schema);
+  for (i, x) in xs.iter().enumerate() {
+    let built = json!({ "f": x });
+    let parsed: serde_json::Value =
+      serde_json::from_str(&built.to_string()).unwrap();
+    from_text.add(i as u32, &parsed).unwrap();
+    in_memory.add(i as u32, &built).unwrap();
+  }
+  let freeze = |m: &MemIndex| {
+    FrozenIndex::open(Region::new(m.write_to(AlignedBuf::new()).unwrap()))
+      .unwrap()
+  };
+  let (ft, fm) = (freeze(&from_text), freeze(&in_memory));
+  let n = xs.len();
+  for (i, x) in xs.iter().enumerate() {
+    let rust = Filter::eq("f", *x);
+    let text = Filter::parse(&rust.to_json().unwrap().to_string()).unwrap();
+    for hits in [
+      from_text.evaluate(&rust, n),
+      ft.evaluate(&rust, n),
+      in_memory.evaluate(&text, n),
+      fm.evaluate(&text, n),
+    ] {
+      assert!(hits.unwrap().contains(i as u32), "{x:e} not found");
+    }
+  }
+}

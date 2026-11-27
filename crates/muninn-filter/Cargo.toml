@@ -10,7 +10,9 @@ license.workspace = true
 [dependencies]
 muninn-core.workspace = true
 serde = "1"
-serde_json = "1"
+# Correctly rounded float parsing: filter values and payload numbers
+# must survive a JSON text round trip bit for bit, or `eq` misses.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = [
