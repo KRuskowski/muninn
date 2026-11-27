@@ -217,3 +217,32 @@ fn global_stats_make_segments_equal_one_index() {
     assert_eq!(merged, want, "q={query:?}");
   }
 }
+
+/// Queries with more distinct terms than the canonical-summation limit
+/// take the slack path; it must be exact too.
+#[test]
+fn pruned_equals_exhaustive_long_queries() {
+  let analyzer = Analyzer::default();
+  let corpus = zipf_corpus(11, 3000, 400);
+  let mem = build(&corpus, &analyzer);
+  let frozen = mem.freeze().unwrap();
+  let reference = Reference::new(&analyzer, &corpus.docs);
+  let mut rng = Rng::new(12);
+  let half = |id: DocId| id % 2 == 0;
+  for qi in 0..60 {
+    let n = [20, 33, 40, 80][qi % 4];
+    let query: Vec<String> = (0..n)
+      .map(|_| common::word(rng.below(400) as usize))
+      .collect();
+    let query = query.join(" ");
+    assert!(reference.terms(&query).len() > 12);
+    for k in [1, 10, 100] {
+      for filter in [None, Some(&half as &dyn DocFilter)] {
+        let want = reference.search(&query, k, filter, None);
+        let ctx = format!("n={n} k={k}");
+        assert_same(&mem.search(&query, k, filter).unwrap(), &want, &ctx);
+        assert_same(&frozen.search(&query, k, filter).unwrap(), &want, &ctx);
+      }
+    }
+  }
+}

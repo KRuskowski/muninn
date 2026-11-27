@@ -289,6 +289,9 @@ pub(crate) struct Cursor<'a> {
   tfs_ready: bool,
   bound_block: usize,
   bound: f32,
+  /// Impacts `bound` was computed from: consecutive blocks often share
+  /// them, which saves the evaluation.
+  bound_imp: Impacts,
   /// Query weight `idf * (k1 + 1)`.
   pub weight: f32,
   /// Position of the term in the query, for canonical summation.
@@ -325,6 +328,7 @@ impl<'a> Cursor<'a> {
       tf_bits: 0,
       tfs_ready: false,
       bound_block: usize::MAX,
+      bound_imp: [0; crate::impacts::IMPACTS],
       bound: 0.0,
       weight: 0.0,
       idx: 0,
@@ -419,10 +423,33 @@ impl<'a> Cursor<'a> {
   #[inline]
   pub fn block_bound(&mut self, norms: &LenNorms) -> f32 {
     if self.bound_block != self.block {
-      self.bound = bound(&self.rec(self.block).impacts, self.weight, norms);
+      let imp = self.rec(self.block).impacts;
+      if imp != self.bound_imp {
+        // `bound_imp` starts all-zero, whose bound is 0.
+        self.bound = bound(&imp, self.weight, norms);
+        self.bound_imp = imp;
+      }
       self.bound_block = self.block;
     }
     self.bound
+  }
+
+  /// Skips the current block and every following block whose bound is
+  /// at most `theta`, without decoding them. Returns the first doc id
+  /// after the skipped range ([`END`] when the list is exhausted).
+  pub fn skip_blocks_at_most(&mut self, theta: f32, norms: &LenNorms) -> DocId {
+    loop {
+      let last = self.rec(self.block).last_doc;
+      self.block += 1;
+      if self.block >= self.nblocks || last >= END - 1 {
+        self.block = self.nblocks;
+        self.doc = END;
+        return END;
+      }
+      if self.block_bound(norms) > theta {
+        return last + 1;
+      }
+    }
   }
 
   /// Moves to the first block whose last doc is `>= target`, without
