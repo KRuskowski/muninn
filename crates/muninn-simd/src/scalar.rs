@@ -65,28 +65,32 @@ pub fn distance_batch(
   }
 }
 
-/// `i8` dot product in `i32`.
+/// `i8` dot product in `i32`. The sum wraps (mod 2^32) instead of
+/// overflowing, like every SIMD implementation, see [`crate::dot_i8`].
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
-  debug_assert_eq!(a.len(), b.len());
-  a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
-}
-
-/// `u8` squared L2 distance in `u32`.
-pub fn l2sq_u8(a: &[u8], b: &[u8]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
   a.iter()
     .zip(b)
-    .map(|(&x, &y)| {
-      let d = x as i32 - y as i32;
-      (d * d) as u32
-    })
-    .sum()
+    .fold(0i32, |s, (&x, &y)| s.wrapping_add(x as i32 * y as i32))
 }
 
-/// Hamming distance over packed bits.
+/// `u8` squared L2 distance in `u32`. The sum wraps (mod 2^32) instead of
+/// overflowing, like every SIMD implementation, see [`crate::l2sq_u8`].
+pub fn l2sq_u8(a: &[u8], b: &[u8]) -> u32 {
+  debug_assert_eq!(a.len(), b.len());
+  a.iter().zip(b).fold(0u32, |s, (&x, &y)| {
+    let d = x as i32 - y as i32;
+    s.wrapping_add((d * d) as u32)
+  })
+}
+
+/// Hamming distance over packed bits. The sum wraps (mod 2^32) instead of
+/// overflowing, like every SIMD implementation, see [`crate::hamming`].
 pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
-  a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+  a.iter()
+    .zip(b)
+    .fold(0u32, |s, (x, y)| s.wrapping_add((x ^ y).count_ones()))
 }
 
 /// Half-precision dot product, computed in `f32`.

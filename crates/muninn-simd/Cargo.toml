@@ -3,8 +3,8 @@ name = "muninn-simd"
 description = "Distance kernels for muninn with runtime CPU dispatch."
 version.workspace = true
 edition.workspace = true
-# AVX-512 intrinsics were stabilised in Rust 1.89.
-rust-version = "1.89"
+# AVX-512 intrinsics need Rust 1.89, the workspace minimum.
+rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 

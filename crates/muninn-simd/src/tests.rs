@@ -367,6 +367,31 @@ fn l2sq_u8_extremes_are_exact() {
   }
 }
 
+/// Past the exact range the true sum no longer fits; every instruction
+/// set must then agree on the same wrapped (mod 2^32) value instead of
+/// one panicking and another wrapping.
+#[test]
+fn l2sq_u8_wraps_identically_past_exact_limit() {
+  // 66_051 is the longest worst-case input whose sum fits in u32.
+  let len = 70_000;
+  let (a, b) = (vec![0u8; len], vec![255u8; len]);
+  let want = (255u64 * 255 * len as u64) as u32;
+  for k in variants() {
+    assert_eq!((k.l2sq_u8)(&a, &b), want, "{}", k.features);
+  }
+}
+
+#[test]
+fn dot_i8_wraps_identically_past_exact_limit() {
+  // 131_071 * 16_384 is the largest all -128 sum that fits in i32.
+  let len = 140_000;
+  let a = vec![i8::MIN; len];
+  let want = (16_384i64 * len as i64) as i32;
+  for k in variants() {
+    assert_eq!((k.dot_i8)(&a, &a), want, "{}", k.features);
+  }
+}
+
 #[test]
 fn hamming_matches_scalar_exactly() {
   for k in variants() {
