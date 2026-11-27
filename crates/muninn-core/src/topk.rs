@@ -20,11 +20,18 @@ fn worse(a: (f32, DocId), b: (f32, DocId)) -> bool {
 }
 
 impl TopK {
+  /// Largest capacity reserved up front.
+  const PREALLOC: usize = 1024;
+
   /// Creates an empty collector for `k` results.
+  ///
+  /// Any `k` is accepted: memory grows with the number of candidates
+  /// actually kept, so a huge `k` from a caller cannot trigger a huge
+  /// up-front allocation.
   pub fn new(k: usize) -> Self {
     Self {
       k,
-      heap: Vec::with_capacity(k),
+      heap: Vec::with_capacity(k.min(Self::PREALLOC)),
     }
   }
 
@@ -175,6 +182,14 @@ mod tests {
     assert!(!t.push(1, 0.0));
     assert!(t.is_empty());
     assert_eq!(t.threshold(), f32::INFINITY);
+  }
+
+  #[test]
+  fn huge_k_does_not_allocate_up_front() {
+    let mut t = TopK::new(usize::MAX);
+    assert!(t.push(1, 1.0) && t.push(2, 0.5));
+    assert_eq!(t.threshold(), f32::INFINITY);
+    assert_eq!(t.into_sorted_vec(), vec![(2, 0.5), (1, 1.0)]);
   }
 
   #[test]
