@@ -224,8 +224,13 @@ impl FrozenIndex {
     plan::estimate(self, filter, num_docs)
   }
 
-  /// Merges several frozen indexes into one, written in one streaming
-  /// pass to `out`.
+  /// Merges several frozen indexes into one, written front to back to
+  /// `out` without seeking.
+  ///
+  /// Memory: postings are merged one term at a time, but each numeric
+  /// field's surviving entries are buffered and sorted before they are
+  /// written (16 bytes per value), because a remap may reorder ids;
+  /// keyword term lists of all inputs are walked in step.
   ///
   /// Each input comes with a remap: `remap[old_id]` is the document's id
   /// in the merged index, or [`DELETED`] to drop it. A remap must cover
@@ -601,6 +606,9 @@ impl WriteSource for Merge<'_> {
     }
   }
 
+  /// Buffers the field's surviving entries from every input (16 bytes
+  /// each) and sorts them: a remap may reorder ids, so the inputs' sorted
+  /// columns cannot simply be merged in a stream.
   fn numbers(&self, field: usize) -> Result<Vec<(i64, DocId)>> {
     let mut out = Vec::new();
     for ((input, map), fmap) in self.inputs.iter().zip(&self.maps) {

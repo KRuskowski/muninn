@@ -178,7 +178,30 @@ fn deep_nesting_is_rejected_not_overflowed() {
     v = json!({ "not": v });
   }
   let e = Filter::from_json(&v).unwrap_err();
-  assert!(e.to_string().contains("nested deeper than 256"), "{e}");
+  assert!(e.to_string().contains("nested deeper than 32"), "{e}");
+}
+
+/// The documented depth error is what users of the JSON text form see,
+/// for every shape of nesting, not serde_json's recursion limit.
+#[test]
+fn depth_limit_is_reachable_from_text() {
+  use muninn_filter::MAX_DEPTH;
+  let chain = |depth: usize, open: &str, close: &str| {
+    let mut t = r#"{"exists":"a"}"#.to_string();
+    for _ in 1..depth {
+      t = format!("{open}{t}{close}");
+    }
+    t
+  };
+  for (open, close) in [(r#"{"not":"#, "}"), (r#"{"and":["#, "]}")] {
+    let ok = chain(MAX_DEPTH, open, close);
+    assert_eq!(Filter::parse(&ok).unwrap().depth(), MAX_DEPTH);
+    for depth in [MAX_DEPTH + 1, 100, 1000] {
+      let e = Filter::parse(&chain(depth, open, close)).unwrap_err();
+      let msg = e.to_string();
+      assert!(msg.contains("nested deeper than 32 levels"), "{msg}");
+    }
+  }
 }
 
 #[test]

@@ -11,8 +11,12 @@ use crate::value::norm_f64;
 use crate::value::{TWO_POW_63, exact_i64, f64_key, next_down, next_up};
 use crate::{FieldType, Filter, Schema, Value};
 
-/// Deepest filter tree accepted, so evaluation cannot exhaust the stack.
-pub const MAX_DEPTH: usize = 256;
+/// Deepest filter tree accepted: 32 levels, so evaluation cannot exhaust
+/// the stack. One filter level takes at most two JSON nesting levels
+/// (`{"and": [...]}`), so every filter within this limit also stays within
+/// serde_json's own recursion limit of 128, and users of the JSON text
+/// form see this limit's error rather than a parser error.
+pub const MAX_DEPTH: usize = 32;
 
 /// A predicate on one field, already checked against its type and
 /// normalised to the field's domain.

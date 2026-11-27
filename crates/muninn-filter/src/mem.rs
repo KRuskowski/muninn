@@ -402,9 +402,11 @@ impl MemIndex {
     plan::estimate(self, filter, num_docs)
   }
 
-  /// Writes the frozen form (see [`crate::FrozenIndex`]) in one
-  /// streaming pass and returns the writer. Flushing and fsync are the
-  /// caller's.
+  /// Writes the frozen form (see [`crate::FrozenIndex`]) and returns the
+  /// writer. The output is written front to back without seeking;
+  /// postings stream straight from the index, while each numeric field's
+  /// entries are first collected into one sorted buffer (16 bytes per
+  /// value). Flushing and fsync are the caller's.
   pub fn write_to<W: Write>(&self, out: W) -> Result<W> {
     write_index(self, out)
   }

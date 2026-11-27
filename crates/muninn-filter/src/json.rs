@@ -245,8 +245,15 @@ impl Filter {
 
   /// Parses JSON text.
   pub fn parse(text: &str) -> Result<Filter> {
-    let v: Json = serde_json::from_str(text)
-      .map_err(|e| Error::invalid(format!("filter is not valid JSON: {e}")))?;
+    let v: Json = serde_json::from_str(text).map_err(|e| {
+      // Text nested beyond serde_json's limit (128) is necessarily a
+      // filter deeper than MAX_DEPTH: report it as such.
+      if e.to_string().contains("recursion limit exceeded") {
+        err("$", format!("nested deeper than {MAX_DEPTH} levels"))
+      } else {
+        Error::invalid(format!("filter is not valid JSON: {e}"))
+      }
+    })?;
     Self::from_json(&v)
   }
 
