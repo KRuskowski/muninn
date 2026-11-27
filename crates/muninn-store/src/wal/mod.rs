@@ -74,14 +74,14 @@ pub enum Durability {
   /// Concurrent appends share fsyncs (group commit).
   SyncEachWrite,
   /// An append returns after its record reached the OS; a background
-  /// thread fsyncs every `max_delay`. An OS crash or power loss loses at
+  /// thread fsyncs the log every `max_delay`, while appends continue. An OS crash or power loss loses at
   /// most the records of the last `max_delay` (plus one fsync).
   SyncBatch {
     /// Longest time a record may stay written but not fsynced.
     max_delay: Duration,
   },
-  /// Never fsync, except in [`Wal::sync`] and on rotation-free shutdown
-  /// paths the caller requests. Survives process crashes only.
+  /// Never fsync unless [`Wal::sync`] is called. Survives process crashes
+  /// only.
   NoSync,
 }
 
@@ -165,7 +165,9 @@ struct SegmentInfo {
 
 /// The segment currently appended to. Touched only by the I/O leader.
 struct Active {
-  file: File,
+  /// Shared so the background syncer can fsync it without blocking
+  /// writes.
+  file: Arc<File>,
   len: u64,
 }
 
@@ -326,7 +328,7 @@ impl Shared {
         Ok(()) => {
           st.written = last;
           if do_sync {
-            st.synced = last;
+            st.synced = st.synced.max(last);
           }
           self.io_done.notify_all();
         }
@@ -348,7 +350,7 @@ impl Shared {
       self.rotate(&mut a, first)?;
     }
     if !buf.is_empty() {
-      a.file.write_all(buf)?;
+      (&*a.file).write_all(buf)?;
       a.len += buf.len() as u64;
       self.counters.writes.fetch_add(1, Ordering::Relaxed);
       self
@@ -378,7 +380,7 @@ impl Shared {
     };
     let (file, path) = create_segment(&self.dir, header, sync)?;
     *a = Active {
-      file,
+      file: Arc::new(file),
       len: HEADER_LEN as u64,
     };
     lock(&self.segments).push(SegmentInfo {
@@ -406,11 +408,29 @@ impl Shared {
       if st.shutdown || st.failed.is_some() {
         return;
       }
-      let target = st.next_lsn - 1;
-      if st.synced < target {
-        // Errors poison the WAL; appenders report them.
-        let _ = self.drive(st, target, true, false);
-        st = lock(&self.state);
+      // Sync what is already written, without taking the I/O leader role,
+      // so appenders keep writing while the fsync runs. Every record up to
+      // `target` is in the current segment or in an older one, and older
+      // ones were synced when they were rotated out.
+      let target = st.written;
+      if st.synced >= target {
+        continue;
+      }
+      drop(st);
+      let file = lock(&self.active).file.clone();
+      let res = file.sync_data();
+      st = lock(&self.state);
+      match res {
+        Ok(()) => {
+          self.counters.syncs.fetch_add(1, Ordering::Relaxed);
+          st.synced = st.synced.max(target);
+        }
+        Err(e) => {
+          // Poisons the WAL; appenders report it.
+          st.failed = Some(e.to_string());
+          self.io_done.notify_all();
+          return;
+        }
       }
     }
   }
@@ -559,7 +579,13 @@ impl Wal {
         .write(true)
         .open(&segs[gi].path)?;
       file.seek(SeekFrom::Start(end))?;
-      active = Some((Active { file, len: end }, next));
+      active = Some((
+        Active {
+          file: Arc::new(file),
+          len: end,
+        },
+        next,
+      ));
     }
 
     let min_next = opts.min_next_lsn.max(1);
@@ -578,7 +604,7 @@ impl Wal {
           path,
         });
         let a = Active {
-          file,
+          file: Arc::new(file),
           len: HEADER_LEN as u64,
         };
         if report.segments_scanned == 0 {
