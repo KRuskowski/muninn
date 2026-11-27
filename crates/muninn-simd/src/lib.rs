@@ -116,14 +116,18 @@ pub fn distance_batch(
 
 /// Dot product of two `i8` vectors, accumulated exactly in `i32`.
 /// Used by scalar-quantised (SQ8) indexes. Exact whenever the result fits
-/// in `i32`, which holds for any input of length below 2^17.
+/// in `i32`, which holds for any input of length below 2^17; beyond that
+/// every instruction set returns the same sum wrapped modulo 2^32.
 #[inline]
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
   debug_assert_eq!(a.len(), b.len());
   (kernels().dot_i8)(a, b)
 }
 
-/// Squared L2 distance of two `u8` vectors, exact in `u32`.
+/// Squared L2 distance of two `u8` vectors, accumulated in `u32`. Exact
+/// whenever the result fits in `u32`, which holds for any input of up to
+/// 66,051 elements (each term is at most 255^2); beyond that every
+/// instruction set returns the same sum wrapped modulo 2^32.
 #[inline]
 pub fn l2sq_u8(a: &[u8], b: &[u8]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
@@ -131,7 +135,9 @@ pub fn l2sq_u8(a: &[u8], b: &[u8]) -> u32 {
 }
 
 /// Hamming distance between two bit vectors packed into `u64` words.
-/// Used by binary-quantised indexes.
+/// Used by binary-quantised indexes. Exact for fewer than 2^26 words
+/// (2^32 bits); beyond that the count wraps modulo 2^32 on every
+/// instruction set.
 #[inline]
 pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
   debug_assert_eq!(a.len(), b.len());

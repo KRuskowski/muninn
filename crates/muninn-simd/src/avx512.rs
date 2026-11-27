@@ -18,13 +18,14 @@ use muninn_core::Metric;
 use crate::dispatch::{Isa, Kernels};
 use crate::{finish, scalar};
 
-/// Accumulators per row in the f32 kernel. FMA has a 4-cycle latency and
-/// two ports, so eight independent sums keep both busy.
+/// Accumulators per row in the f32 kernel: four independent sums hide most
+/// of the FMA latency. Eight measured no faster on Emerald Rapids (the
+/// kernel is load-bound) and slower for short vectors.
 const ACC: usize = 4;
 
-/// Rows per iteration in `distance_batch`: 2 rows x 8 accumulators use 16
+/// Rows per iteration in `distance_batch`: 4 rows x 4 accumulators use 16
 /// of the 32 zmm registers for sums; the query vector is loaded once per
-/// pair of rows.
+/// group of rows.
 const BATCH_ROWS: usize = 4;
 
 /// Optional features detected on top of the base requirement.
@@ -641,7 +642,8 @@ fn hamming_vpopcntdq_impl(a: &[u64], b: &[u64]) -> u32 {
   let mut acc1 = _mm512_setzero_si512();
   let mut j = 0;
   while j + 16 <= n {
-    // SAFETY: `j + 8 < n`; both pointers are valid for `n` reads.
+    // SAFETY: `j + 16 <= n`, so both 8-word blocks are in bounds; both
+    // pointers are valid for `n` reads.
     let (x0, x1) =
       unsafe { (load_xor(pa, pb, j, n), load_xor(pa, pb, j + 8, n)) };
     acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(x0));

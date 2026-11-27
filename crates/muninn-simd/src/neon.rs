@@ -523,7 +523,7 @@ fn hamming_impl(a: &[u64], b: &[u64]) -> u32 {
   }
   let mut s = vaddvq_u32(acc32);
   for k in j..n {
-    s += (a[k] ^ b[k]).count_ones();
+    s = s.wrapping_add((a[k] ^ b[k]).count_ones());
   }
   s
 }
@@ -534,7 +534,8 @@ fn hamming_impl(a: &[u64], b: &[u64]) -> u32 {
 fn widen_f16(x: uint16x8_t) -> (float32x4_t, float32x4_t) {
   let lo: float32x4_t;
   let hi: float32x4_t;
-  // SAFETY: register-only baseline AdvSIMD instructions. `lo` is an
+  // SAFETY: register-only baseline AdvSIMD instructions (they may set
+  // FPSR exception flags, so no `preserves_flags`). `lo` is an
   // `out` (not `lateout`) operand, so it cannot share a register with `x`,
   // which the second instruction still reads.
   unsafe {
@@ -544,7 +545,7 @@ fn widen_f16(x: uint16x8_t) -> (float32x4_t, float32x4_t) {
       x = in(vreg) x,
       lo = out(vreg) lo,
       hi = out(vreg) hi,
-      options(pure, nomem, nostack, preserves_flags)
+      options(pure, nomem, nostack)
     );
   }
   (lo, hi)
@@ -556,7 +557,8 @@ fn widen_f16(x: uint16x8_t) -> (float32x4_t, float32x4_t) {
 #[target_feature(enable = "neon")]
 fn narrow_f16(lo: float32x4_t, hi: float32x4_t) -> uint16x8_t {
   let out: uint16x8_t;
-  // SAFETY: register-only baseline AdvSIMD instructions. `o` is an `out`
+  // SAFETY: register-only baseline AdvSIMD instructions (they may set
+  // FPSR exception flags, so no `preserves_flags`). `o` is an `out`
   // (not `lateout`) operand, so it cannot share a register with `hi`,
   // which the second instruction still reads.
   unsafe {
@@ -566,7 +568,7 @@ fn narrow_f16(lo: float32x4_t, hi: float32x4_t) -> uint16x8_t {
       lo = in(vreg) lo,
       hi = in(vreg) hi,
       o = out(vreg) out,
-      options(pure, nomem, nostack, preserves_flags)
+      options(pure, nomem, nostack)
     );
   }
   out

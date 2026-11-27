@@ -29,7 +29,7 @@ fn detected() -> bool {
 
 static KERNELS: Kernels = Kernels {
   isa: Isa::Avx2,
-  features: "avx2+fma+f16c",
+  features: "avx2+fma+f16c+popcnt",
   dot,
   l2sq,
   distance_batch,
