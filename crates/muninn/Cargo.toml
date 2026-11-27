@@ -1,0 +1,18 @@
+[package]
+name = "muninn"
+description = "Embedded vector database and full-text search engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+muninn-core.workspace = true
+muninn-simd.workspace = true
+muninn-vector.workspace = true
+muninn-text.workspace = true
+muninn-store.workspace = true
+
+[lints]
+workspace = true

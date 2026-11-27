@@ -1,0 +1,14 @@
+[package]
+name = "muninn-store"
+description = "Durable storage for muninn: WAL, memory-mapped segments, payloads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+muninn-core.workspace = true
+
+[lints]
+workspace = true
