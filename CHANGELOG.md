@@ -12,4 +12,5 @@ All notable changes to muninn are recorded here, written for people who use muni
 - Search filters (for example "only documents from this user") are applied while searching, so you always get the requested number of results when enough matching documents exist.
 - Relevance scores stay consistent across a whole collection even when it is stored in several parts, so results from different parts can be combined fairly.
 - Text indexes are stored compactly on disk (about 2 bytes per word in our tests), open instantly, and are checked for corruption. Indexes can be combined into one, with deleted documents removed.
+- A search may contain up to 1024 different words; longer searches are refused with a clear error. Repeating a word does not count against the limit.
 - Current limitation: languages written without spaces between words (Chinese, Japanese, Thai) are not yet split into words, so searching them only finds exact runs of text.
