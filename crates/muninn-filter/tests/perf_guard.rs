@@ -47,3 +47,35 @@ fn large_numeric_in_on_memtable_is_not_quadratic() {
     assert!(took < Duration::from_secs(1), "took {took:?}");
   }
 }
+
+/// The field limit keeps per-field container sections bounded; a schema
+/// at the limit writes and opens quickly.
+#[test]
+fn field_count_is_capped_and_fast_at_the_cap() {
+  use muninn_filter::MAX_FIELDS;
+  assert_eq!(MAX_FIELDS, 4096);
+  let mut schema = Schema::new();
+  for i in 0..MAX_FIELDS {
+    let ty = [FieldType::Keyword, FieldType::Integer, FieldType::Bool][i % 3];
+    schema.add(&format!("f{i}"), ty).unwrap();
+  }
+  let e = schema.add("one_more", FieldType::Keyword).unwrap_err();
+  assert!(e.to_string().contains("at most 4096 fields"), "{e}");
+  let start = Instant::now();
+  let mut m = MemIndex::new(schema);
+  for d in 0..50u32 {
+    m.add(
+      d,
+      &json!({"f0": "x", "f4095": "y", "f4093": d, "f4094": true}),
+    )
+    .unwrap();
+  }
+  let buf = m.write_to(AlignedBuf::new()).unwrap();
+  let f = FrozenIndex::open(Region::new(buf)).unwrap();
+  assert_eq!(
+    f.evaluate(&Filter::exists("f4095"), 50).unwrap().count(),
+    50
+  );
+  let took = start.elapsed();
+  assert!(took < Duration::from_secs(2), "took {took:?}");
+}

@@ -17,10 +17,13 @@
 //! with plain [`std::io::Write`] (no seeking), which lets index builders
 //! write gigabyte sections without buffering them.
 //!
-//! Opening checks the structure only. The checksum covers the whole file,
+//! Opening checks the structure only (bounds, alignment, unique tags) and
+//! builds a sorted tag index, so section lookup is O(log n) and opening
+//! is O(n log n) in the section count. The checksum covers the whole file,
 //! so it is verified on demand ([`Container::verify_checksum`]) rather
 //! than on every open of a large memory map.
 
+use std::collections::HashSet;
 use std::io::Write;
 
 use crate::crc32c::Crc32c;
@@ -59,6 +62,8 @@ pub struct ContainerWriter<W: Write> {
   pos: u64,
   crc: Crc32c,
   table: Vec<([u8; 8], u64, u64)>,
+  /// Tags used so far, so the duplicate check is O(1) per section.
+  used: HashSet<[u8; 8]>,
   open: Option<([u8; 8], u64)>,
 }
 
@@ -71,6 +76,7 @@ impl<W: Write> ContainerWriter<W> {
       pos: 0,
       crc: Crc32c::new(),
       table: Vec::new(),
+      used: HashSet::new(),
       open: None,
     };
     let mut h = [0u8; HEADER_LEN];
@@ -102,7 +108,7 @@ impl<W: Write> ContainerWriter<W> {
     if self.open.is_some() {
       return Err(Error::invalid("previous section still open"));
     }
-    if self.table.iter().any(|e| e.0 == tag) {
+    if !self.used.insert(tag) {
       return Err(Error::invalid(format!("duplicate tag {}", tag_str(&tag))));
     }
     self.pad()?;
@@ -181,6 +187,8 @@ pub struct Container {
   kind: [u8; 8],
   version: u32,
   sections: Vec<([u8; 8], Region)>,
+  /// `(tag, index into sections)` sorted by tag, for O(log n) lookup.
+  index: Vec<([u8; 8], usize)>,
   crc: u32,
 }
 
@@ -227,11 +235,21 @@ impl Container {
       sections.push((tag, region.slice(off..end)?));
       at += ENTRY_LEN;
     }
+    let mut index: Vec<([u8; 8], usize)> =
+      sections.iter().enumerate().map(|(i, s)| (s.0, i)).collect();
+    index.sort_unstable();
+    if let Some(w) = index.windows(2).find(|w| w[0].0 == w[1].0) {
+      return Err(Error::corrupt(format!(
+        "duplicate section {}",
+        tag_str(&w[0].0)
+      )));
+    }
     Ok(Self {
       region,
       kind,
       version,
       sections,
+      index,
       crc,
     })
   }
@@ -277,11 +295,8 @@ impl Container {
 
   /// The bytes of section `tag`, if present.
   pub fn try_section(&self, tag: [u8; 8]) -> Option<Region> {
-    self
-      .sections
-      .iter()
-      .find(|s| s.0 == tag)
-      .map(|s| s.1.clone())
+    let i = self.index.binary_search_by_key(&tag, |e| e.0).ok()?;
+    Some(self.sections[self.index[i].1].1.clone())
   }
 
   /// Section tags in file order.
@@ -360,5 +375,52 @@ mod tests {
     w.begin_section(tag("b")).unwrap();
     assert!(w.begin_section(tag("c")).is_err());
     assert!(w.finish().is_err());
+  }
+
+  /// Writing, opening and looking up many sections must not be
+  /// quadratic in the section count: an untrusted file could otherwise
+  /// make open() and lookups take tens of seconds.
+  #[test]
+  fn many_sections_stay_fast() {
+    let n = 1usize << 17;
+    let name = |i: usize| -> [u8; 8] {
+      let mut t = *b"s0000000";
+      t[1..].copy_from_slice(format!("{i:07}").as_bytes());
+      t
+    };
+    let start = std::time::Instant::now();
+    let mut w = ContainerWriter::new(AlignedBuf::new(), KIND, 1).unwrap();
+    for i in 0..n {
+      w.section(name(i), &[]).unwrap();
+    }
+    assert!(w.section(name(17), &[]).is_err());
+    let buf = w.finish().unwrap();
+    let c = Container::open(Region::new(buf)).unwrap();
+    for i in 0..n {
+      assert!(c.try_section(name(i)).is_some());
+    }
+    assert!(c.try_section(*b"missing\0").is_none());
+    assert_eq!(c.tags().count(), n);
+    assert_eq!(c.tags().nth(5), Some(name(5)));
+    let took = start.elapsed();
+    eprintln!("{n} sections: {took:?}");
+    assert!(
+      took < std::time::Duration::from_millis(1500),
+      "took {took:?}"
+    );
+  }
+
+  #[test]
+  fn duplicate_tags_in_a_file_are_rejected() {
+    let mut w = ContainerWriter::new(AlignedBuf::new(), KIND, 1).unwrap();
+    w.section(tag("a"), b"1").unwrap();
+    w.section(tag("b"), b"2").unwrap();
+    let mut buf = w.finish().unwrap();
+    // Rename section "b" to "a" in the table (just before the footer).
+    let n = buf.len();
+    let entry = n - 64 - 24;
+    assert_eq!(&buf.as_slice()[entry..entry + 8], &tag("b"));
+    buf.as_mut_slice()[entry] = b'a';
+    assert!(Container::open(Region::new(buf)).is_err());
   }
 }

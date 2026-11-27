@@ -7,8 +7,12 @@ use serde_json::Value as Json;
 
 use crate::value::{json_f64, json_i64};
 
-/// Most fields one schema may declare.
-pub const MAX_FIELDS: usize = 1 << 16;
+/// Most fields one schema may declare: 4096.
+///
+/// Each field becomes up to five sections of the frozen index file, and
+/// a file claiming more fields than this is rejected as corrupt, which
+/// bounds the work an untrusted file can cause on open.
+pub const MAX_FIELDS: usize = 4096;
 
 /// The type of a filterable field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
