@@ -36,7 +36,9 @@ impl Bits {
     }
   }
 
-  /// Inserts sorted ids; ids past `len` are cut off with one search.
+  /// Inserts ids that should be sorted; the tail past `len` is cut off
+  /// with one search. Every id is still bounds-checked, because ids read
+  /// from a damaged file may be unsorted or out of range.
   pub(crate) fn set_sorted(&mut self, ids: &[DocId]) {
     let len = self.len;
     let end = match ids.last() {
@@ -45,7 +47,9 @@ impl Bits {
     };
     for &d in &ids[..end] {
       let i = d as usize;
-      self.words[i >> 6] |= 1 << (i & 63);
+      if i < len {
+        self.words[i >> 6] |= 1 << (i & 63);
+      }
     }
   }
 
@@ -127,6 +131,8 @@ mod tests {
   fn truncates_and_combines() {
     let mut a = Bits::new(70);
     a.set_sorted(&[1, 5, 69, 70, 200]);
+    // Unsorted, out-of-range ids (as from a damaged file) are skipped.
+    a.set_sorted(&[1 << 30, 5, 69]);
     a.set(100);
     assert_eq!(ids(a.clone()), [1, 5, 69]);
     let mut b = Bits::new(70);

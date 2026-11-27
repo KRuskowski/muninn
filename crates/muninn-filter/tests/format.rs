@@ -117,9 +117,7 @@ fn corruption_is_detected_and_never_panics() {
   let mut r = Rng::new(11);
   let queries: Vec<Filter> =
     (0..20).map(|_| filter(&mut r, 3, false)).collect();
-  // The footer's zero padding is outside the checksum by design of the
-  // container format, so damage is applied to everything before it.
-  let len = buf.len() - 64;
+  let len = buf.len();
   let mut opened = 0;
   let step = (len / 1500).max(1);
   for pos in (0..len).step_by(step) {
@@ -142,6 +140,71 @@ fn corruption_is_detected_and_never_panics() {
     opened > 0,
     "no corrupt file passed open; test covers nothing"
   );
+}
+
+/// Every byte of every posting section, flipped at low, middle and high
+/// bit positions: ids inside lists and bitsets become arbitrary, and
+/// open() does not scan posting contents (it stays lazy), so evaluation
+/// must cope with unsorted and out-of-range ids.
+#[test]
+fn corrupt_posting_contents_never_panic() {
+  let (_, buf) = sample();
+  let region = Region::new(buf.clone());
+  let c = muninn_core::container::Container::open(region.clone()).unwrap();
+  let base = region.bytes().as_ptr() as usize;
+  let mut queries = Vec::new();
+  for f in schema().fields() {
+    queries.push(Filter::exists(f.name()));
+    queries.push(!Filter::exists(f.name()));
+  }
+  for k in common::VOCAB.iter().chain(&common::RARE) {
+    for field in ["kw", "tags", "o.k"] {
+      queries.push(Filter::eq(field, *k));
+    }
+  }
+  queries.push(Filter::is_in("b", [true, false]));
+  let mut flips = 0;
+  for t in c.tags().filter(|t| t[0] == b'P') {
+    let s = c.section(t).unwrap();
+    let start = s.bytes().as_ptr() as usize - base;
+    for pos in start..start + s.len() {
+      for flip in [0x01u8, 0x10, 0x80] {
+        let mut bad = buf.clone();
+        bad.as_mut_slice()[pos] ^= flip;
+        let ix = FrozenIndex::open(Region::new(bad)).unwrap();
+        for q in &queries {
+          for n in [0, 100, 500, 2000] {
+            let _ = ix.evaluate(q, n);
+          }
+        }
+        flips += 1;
+      }
+    }
+  }
+  assert!(flips > 1000, "only {flips} flips");
+}
+
+/// A list id beyond the document count, ahead of a valid last id.
+#[test]
+fn out_of_range_id_inside_a_list_does_not_panic() {
+  let schema = Schema::new().with("k", FieldType::Keyword).unwrap();
+  let mut m = MemIndex::new(schema);
+  m.add(10, &json!({"k": "x"})).unwrap();
+  m.add(500, &json!({"k": "x"})).unwrap();
+  m.add(999, &json!({})).unwrap();
+  let buf = m.write_to(AlignedBuf::new()).unwrap();
+  let region = Region::new(buf.clone());
+  let c = muninn_core::container::Container::open(region.clone()).unwrap();
+  let p = c.section(*b"P0000\0\0\0").unwrap();
+  let at = p.bytes().as_ptr() as usize - region.bytes().as_ptr() as usize;
+  // The exists list [10, 500] comes first in the section.
+  assert_eq!(&p.bytes()[..8], &[10, 0, 0, 0, 244, 1, 0, 0]);
+  let mut bad = buf;
+  bad.as_mut_slice()[at..at + 4].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+  let ix = FrozenIndex::open(Region::new(bad)).unwrap();
+  let got = ix.evaluate(&Filter::exists("k"), 1000).unwrap();
+  assert_eq!(got.iter().collect::<Vec<_>>(), [500]);
+  assert!(ix.verify_checksum().is_err());
 }
 
 /// Damage aimed at the structures open() validates: each must be
