@@ -1,12 +1,32 @@
 //! Vector indexes.
 //!
 //! Every index implements [`VectorIndex`], so the engine can hold a mix of
-//! index kinds across segments and search them uniformly. [`FlatIndex`] is
-//! the exact baseline and the recall oracle for every approximate index.
+//! index kinds across segments and search them uniformly.
+//!
+//! - [`FlatIndex`]: exact, blocked and multi-threaded scan; the recall
+//!   oracle for every approximate index and the memtable index.
+//! - [`HnswIndex`]: approximate graph search with parallel build,
+//!   incremental insert and filter-aware search.
+//! - [`Quantization`]: SQ8 or binary codes for either index's first pass,
+//!   re-ranked with full-precision vectors.
+//!
+//! Every index writes one `muninn_core::container` file in a single pass
+//! and opens from a `Region` without copying its arrays.
 
+mod dist;
 mod flat;
+mod hnsw;
+mod meta;
+mod quant;
+mod scan;
+mod slab;
 
-pub use flat::FlatIndex;
+pub use flat::{FLAT_KIND, FLAT_VERSION, FlatIndex};
+pub use hnsw::{
+  FilterStrategy, HNSW_KIND, HNSW_VERSION, HnswIndex, HnswParams, HnswStats,
+  MAX_M,
+};
+pub use quant::Quantization;
 
 use muninn_core::{DocFilter, Hit, Metric, Result};
 
@@ -19,11 +39,13 @@ pub struct SearchParams {
   /// and more accurate. Ignored by exact indexes.
   pub ef: usize,
   /// How many quantised candidates to re-score with full-precision
-  /// vectors. Ignored by unquantised indexes.
+  /// vectors (default: [`Quantization::default_rerank`]). Ignored by
+  /// unquantised indexes.
   pub rerank: usize,
 }
 
 impl SearchParams {
+  /// Asks for `k` results with every other knob at its default.
   pub fn new(k: usize) -> Self {
     Self {
       k,
@@ -32,11 +54,13 @@ impl SearchParams {
     }
   }
 
+  /// Sets the graph candidate-list size.
   pub fn with_ef(mut self, ef: usize) -> Self {
     self.ef = ef;
     self
   }
 
+  /// Sets how many quantised candidates are re-scored exactly.
   pub fn with_rerank(mut self, rerank: usize) -> Self {
     self.rerank = rerank;
     self
