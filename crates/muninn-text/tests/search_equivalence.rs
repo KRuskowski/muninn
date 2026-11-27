@@ -246,3 +246,104 @@ fn pruned_equals_exhaustive_long_queries() {
     }
   }
 }
+
+/// Review finding: `w * tf / (tf + kc)` is not monotonic in tf under f32
+/// rounding, so a document with tf - 1 (same length norm) scored an ulp
+/// above its block's bound and pruning dropped the true top hit.
+#[test]
+fn tf_rounding_cannot_lift_a_document_above_its_block_bound() {
+  let big = "x ".repeat(29_894);
+  let almost = format!("{}y", "x ".repeat(29_893));
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..256u32 {
+    let text = match id {
+      0 | 128 => big.as_str(),
+      129 => almost.as_str(),
+      _ => "x",
+    };
+    mem.add(id, text).unwrap();
+  }
+  let frozen = mem.freeze().unwrap();
+  for (name, idx) in [
+    ("mem", &mem as &dyn TextSearcher),
+    ("frozen", &frozen as &dyn TextSearcher),
+  ] {
+    let exhaustive = |k| match name {
+      "mem" => mem.search_exhaustive("x", k, None, None).unwrap(),
+      _ => frozen.search_exhaustive("x", k, None, None).unwrap(),
+    };
+    // Before the fix, doc 129 (one "x" fewer, same length) out-scored
+    // docs 0 and 128 by an ulp and pruning returned doc 0.
+    let all = exhaustive(256);
+    let score = |id| all.iter().find(|h| h.id == id).unwrap().score;
+    assert!(score(129) <= score(0), "{name}: tf - 1 scored higher");
+    assert_eq!(score(0), score(128));
+    for k in [1, 2, 3, 256] {
+      assert_eq!(idx.search("x", k, None).unwrap(), exhaustive(k), "{name}");
+    }
+  }
+}
+
+/// The same property under supplied statistics with a huge average
+/// length. For each average length, finds a tf where the old formula
+/// `w * tf / (tf + K)` ranks tf - 1 above tf at equal length, and puts
+/// exactly those two documents first in one block.
+#[test]
+fn tf_rounding_with_large_supplied_stats() {
+  use muninn_text::bm25::{B, K1, idf};
+  use muninn_text::norm::{decode_doc_len, encode_doc_len};
+  let old = |w: f32, tf: u32, kc: f32| {
+    let tf = tf as f32;
+    w * tf / (tf + kc)
+  };
+  let analyzer = Analyzer::default();
+  let n = 10_000_000u64;
+  let mut found = 0;
+  for avgdl in [1.0e5f64, 1.0e6, 1.0e7, 1.0e8, 1.0e9] {
+    let stats = CorpusStats {
+      doc_count: n,
+      total_doc_len: (n as f64 * avgdl) as u64,
+      terms: vec![TermDocFreq {
+        term: "x".into(),
+        doc_freq: 5_000,
+      }],
+    };
+    let w = idf(5_000, n) * (K1 + 1.0);
+    let avg = (stats.total_doc_len as f64 / n as f64) as f32;
+    let kc = |len: u32| {
+      let len = decode_doc_len(encode_doc_len(len)) as f32;
+      K1 * (1.0 - B + B * (len / avg))
+    };
+    let Some(tf) =
+      (2..20_000u32).find(|&tf| old(w, tf - 1, kc(tf)) > old(w, tf, kc(tf)))
+    else {
+      continue;
+    };
+    found += 1;
+    let mut docs: Vec<(DocId, String)> = vec![
+      (0, "x ".repeat(tf as usize)),
+      (1, format!("{}y", "x ".repeat(tf as usize - 1))),
+    ];
+    docs.extend((2..128).map(|id| (id, "x".to_string())));
+    let mem = build(
+      &Corpus {
+        docs: docs.clone(),
+        vocab: 2,
+      },
+      &analyzer,
+    );
+    let frozen = mem.freeze().unwrap();
+    let reference = Reference::new(&analyzer, &docs);
+    for k in [1, 2, 3] {
+      let want = reference.search("x", k, None, Some(&stats));
+      let ctx = format!("avgdl {avgdl} tf {tf} k {k}");
+      let m = mem.search_with_stats("x", k, None, &stats).unwrap();
+      let f = frozen.search_with_stats("x", k, None, &stats).unwrap();
+      assert_same(&m, &want, &ctx);
+      assert_same(&f, &want, &ctx);
+      let ex = mem.search_exhaustive("x", k, None, Some(&stats)).unwrap();
+      assert_eq!(m, ex, "{ctx}");
+    }
+  }
+  assert!(found >= 3, "only {found} averages produced an inversion");
+}

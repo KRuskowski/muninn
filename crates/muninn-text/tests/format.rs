@@ -5,7 +5,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{Reference, Rng, assert_same, random_query, zipf_corpus};
-use muninn_core::container::{ContainerWriter, tag};
+use muninn_core::container::{Container, ContainerWriter, tag};
 use muninn_core::{AlignedBuf, BitSet, DocId, Error, Region};
 use muninn_text::{
   Analyzer, AnalyzerConfig, CorpusStats, DELETED, FORMAT_VERSION, KIND,
@@ -191,6 +191,8 @@ fn edge_cases() {
     assert!(idx.search(" ,;. ", 10, None).unwrap().is_empty());
     assert!(idx.search("unknown words", 10, None).unwrap().is_empty());
     assert!(idx.search("beta", 0, None).unwrap().is_empty());
+    // Huge k must not try to allocate k slots.
+    assert_eq!(idx.search("beta", usize::MAX, None).unwrap().len(), 2);
     let ids: Vec<DocId> = idx
       .search("beta gamma unknown", 10, None)
       .unwrap()
@@ -349,4 +351,104 @@ fn merge_rejects_bad_maps() {
   assert_eq!(idx.doc_freq("x").unwrap(), 0);
   assert_eq!(idx.doc_freq("y").unwrap(), 1);
   assert_eq!(idx.doc_freq("z").unwrap(), 1);
+}
+
+#[test]
+fn huge_k_on_both_search_paths() {
+  let mut m = MemTextIndex::new(Analyzer::default());
+  for i in 0..300 {
+    m.add(i, if i % 3 == 0 { "a b" } else { "a" }).unwrap();
+  }
+  let f = m.freeze().unwrap();
+  let stats = f.stats_for("a b").unwrap();
+  assert_eq!(
+    m.search_exhaustive("a b", usize::MAX, None, None)
+      .unwrap()
+      .len(),
+    300
+  );
+  assert_eq!(
+    f.search_exhaustive("a b", usize::MAX, None, None)
+      .unwrap()
+      .len(),
+    300
+  );
+  assert_eq!(
+    f.search_with_stats("a b", usize::MAX, None, &stats)
+      .unwrap()
+      .len(),
+    300
+  );
+}
+
+/// Review finding: dictionary block offsets were trusted, so a corrupt
+/// skip index overflowed (a panic in debug builds) and a corrupt
+/// postings offset read the wrong bytes.
+#[test]
+fn corrupt_dictionary_index_is_rejected() {
+  let mut m = MemTextIndex::new(Analyzer::default());
+  for i in 0..300 {
+    m.add(i, &format!("a w{}", i % 40)).unwrap();
+  }
+  let buf = bytes_of(&m);
+  let region = Region::new(buf.clone());
+  let base = region.bytes().as_ptr() as usize;
+  let c = Container::open(region).unwrap();
+  let idx = c.section(tag("dictidx")).unwrap();
+  let off = idx.bytes().as_ptr() as usize - base;
+  let skips = c.section(tag("skips")).unwrap().len() as u64 / 32;
+  let postings = c.section(tag("postings")).unwrap().len() as u64;
+  // Each dictionary block entry: dict offset, postings offset, skip index.
+  for (field, value) in [
+    (2, u64::MAX),
+    (2, u64::MAX - 1),
+    (2, skips + 1),
+    (1, u64::MAX),
+    (1, postings + 1),
+  ] {
+    let mut bad = buf.clone();
+    let at = off + field * 8;
+    bad.as_mut_slice()[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    let opened = TextIndex::open(Region::new(bad));
+    assert!(opened.is_err(), "field {field} = {value} accepted");
+  }
+  // A dictionary block that legitimately starts at the end of the skip
+  // records (only single-block terms follow) still opens.
+  TextIndex::open(Region::new(buf)).unwrap();
+}
+
+#[test]
+fn queries_with_too_many_distinct_terms_are_rejected() {
+  let mut m = MemTextIndex::new(Analyzer::default());
+  m.add(0, "w1 w2 w3").unwrap();
+  let f = m.freeze().unwrap();
+  let max = muninn_text::MAX_QUERY_TERMS;
+  let words = |n: usize| {
+    (0..n)
+      .map(|i| format!("w{i}"))
+      .collect::<Vec<_>>()
+      .join(" ")
+  };
+  let ok = words(max);
+  let too_many = format!("{} w1 w2", words(max + 1));
+  for idx in [&m as &dyn TextSearcher, &f] {
+    assert_eq!(idx.search(&ok, 5, None).unwrap().len(), 1);
+    let stats = idx.stats_for(&ok).unwrap();
+    assert_eq!(stats.terms.len(), max);
+    assert_eq!(
+      idx.search_with_stats(&ok, 5, None, &stats).unwrap().len(),
+      1
+    );
+    assert!(matches!(
+      idx.search(&too_many, 5, None),
+      Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+      idx.stats_for(&too_many),
+      Err(Error::InvalidArgument(_))
+    ));
+    // Repeating terms does not count against the limit.
+    let repeated = "w1 ".repeat(100_000);
+    assert_eq!(idx.search(&repeated, 5, None).unwrap().len(), 1);
+  }
 }

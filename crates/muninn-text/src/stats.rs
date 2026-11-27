@@ -1,5 +1,9 @@
 //! Corpus statistics for scoring across segments.
 
+use std::collections::HashMap;
+
+use crate::hash::FoldBuild;
+
 /// Document frequency of one analysed query term.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermDocFreq {
@@ -32,18 +36,28 @@ pub struct CorpusStats {
 impl CorpusStats {
   /// Adds `other` into `self`: document counts, lengths and per-term
   /// frequencies are summed; terms only in `other` are appended.
+  /// Linear in the number of terms of both.
   pub fn merge(&mut self, other: &CorpusStats) {
     self.doc_count += other.doc_count;
     self.total_doc_len += other.total_doc_len;
+    let mut pos: HashMap<String, usize, FoldBuild> =
+      HashMap::with_capacity_and_hasher(self.terms.len(), FoldBuild);
+    for (i, t) in self.terms.iter().enumerate() {
+      pos.entry(t.term.clone()).or_insert(i);
+    }
     for t in &other.terms {
-      match self.terms.iter_mut().find(|s| s.term == t.term) {
-        Some(s) => s.doc_freq += t.doc_freq,
-        None => self.terms.push(t.clone()),
+      match pos.get(t.term.as_str()) {
+        Some(&i) => self.terms[i].doc_freq += t.doc_freq,
+        None => {
+          pos.insert(t.term.clone(), self.terms.len());
+          self.terms.push(t.clone());
+        }
       }
     }
   }
 
-  /// Document frequency of `term`, if these statistics cover it.
+  /// Document frequency of `term`, if these statistics cover it. A
+  /// linear scan, fine for one lookup; the search builds a hash map.
   pub fn doc_freq(&self, term: &str) -> Option<u64> {
     self
       .terms
@@ -89,5 +103,31 @@ mod tests {
     assert_eq!(a.doc_freq("z"), Some(1));
     assert_eq!(a.doc_freq("w"), None);
     assert_eq!(a.avg_doc_len(), 8.0);
+  }
+
+  #[test]
+  fn merge_and_lookup_scale_to_many_terms() {
+    let n = 100_000u64;
+    let mk = |off: u64| CorpusStats {
+      doc_count: 1,
+      total_doc_len: 1,
+      terms: (0..n).map(|i| t(&format!("t{}", i + off), 1)).collect(),
+    };
+    let mut a = mk(0);
+    let b = mk(n / 2);
+    let start = std::time::Instant::now();
+    a.merge(&b);
+    // Quadratic merging takes minutes here; linear takes milliseconds.
+    assert!(
+      start.elapsed().as_secs() < 5,
+      "merge took {:?}",
+      start.elapsed()
+    );
+    assert_eq!(a.terms.len() as u64, n + n / 2);
+    assert_eq!(a.doc_freq("t0"), Some(1));
+    assert_eq!(a.doc_freq(&format!("t{}", n / 2)), Some(2));
+    assert_eq!(a.doc_freq(&format!("t{}", n + n / 2 - 1)), Some(1));
+    // Terms only in `other` keep their order after self's.
+    assert_eq!(a.terms[n as usize].term, format!("t{n}"));
   }
 }

@@ -28,17 +28,21 @@
 //!   least the final score bit for bit, with no rounding slack. Queries
 //!   with more than [`CANONICAL_MAX_TERMS`] distinct terms instead sum
 //!   bounds in any order and multiply by `1 + 2 (n + 4) eps`.
-//! * Per-term bounds are evaluated with the same arithmetic as scores, so
-//!   a document whose `(tf, norm)` is a frontier point scores exactly its
-//!   bound. The residual assumption is that a document strictly dominated
-//!   by a frontier point does not out-score it after `f32` rounding.
+//! * Per-term bounds are evaluated with the same arithmetic as scores,
+//!   and that arithmetic is monotonic under `f32` rounding in tf and in
+//!   length (see [`crate::bm25`]). So a document dominated by a frontier
+//!   point (no higher tf, no shorter) scores at most the point's bound,
+//!   bit for bit, and one equal to it scores exactly the bound.
 //! * The filter is checked before a candidate is scored, so filtered-out
 //!   documents never raise the threshold.
+
+use std::collections::HashMap;
 
 use muninn_core::{DocFilter, DocId, Error, Hit, Result, TopK};
 
 use crate::analyzer::{Analyzer, query_terms};
 use crate::bm25::{K1, LenNorms, avg_doc_len, contrib, idf};
+use crate::hash::FoldBuild;
 use crate::postings::{Cursor, END};
 use crate::stats::{CorpusStats, TermDocFreq};
 
@@ -55,7 +59,7 @@ pub(crate) trait Source {
 
 pub(crate) fn stats_for<S: Source>(s: &S, query: &str) -> Result<CorpusStats> {
   let mut terms = Vec::new();
-  for term in query_terms(s.analyzer(), query) {
+  for term in query_terms(s.analyzer(), query)? {
     let doc_freq = u64::from(s.doc_freq(&term)?);
     terms.push(TermDocFreq { term, doc_freq });
   }
@@ -74,18 +78,28 @@ pub(crate) fn search<S: Source>(
   stats: Option<&CorpusStats>,
   prune: bool,
 ) -> Result<Vec<Hit>> {
+  // More results than documents cannot exist; this also keeps a huge k
+  // from sizing the top-k heap.
+  let k = k.min(s.norms().len());
+  let terms = query_terms(s.analyzer(), query)?;
   if k == 0 {
     return Ok(Vec::new());
   }
-  let terms = query_terms(s.analyzer(), query);
+  let global: Option<HashMap<&str, u64, FoldBuild>> = stats.map(|st| {
+    let mut m = HashMap::with_capacity_and_hasher(st.terms.len(), FoldBuild);
+    for t in &st.terms {
+      m.entry(t.term.as_str()).or_insert(t.doc_freq);
+    }
+    m
+  });
   let (n, total) = match stats {
     Some(st) => (st.doc_count, st.total_doc_len),
     None => (s.doc_count(), s.total_doc_len()),
   };
   let mut cursors = Vec::with_capacity(terms.len());
   for (i, term) in terms.iter().enumerate() {
-    let global_df = match stats {
-      Some(st) => Some(st.doc_freq(term).ok_or_else(|| {
+    let global_df = match &global {
+      Some(g) => Some(g.get(term.as_str()).copied().ok_or_else(|| {
         Error::invalid(format!(
           "corpus statistics have no entry for query term {term:?}"
         ))

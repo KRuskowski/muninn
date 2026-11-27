@@ -41,10 +41,17 @@ pub use stats::{CorpusStats, TermDocFreq};
 
 use muninn_core::{DocFilter, Hit, Result};
 
+/// Most distinct analysed terms a query may have. Longer queries are
+/// rejected with `InvalidArgument`; repeated terms count once.
+pub const MAX_QUERY_TERMS: usize = 1024;
+
 /// A searchable full-text index over one text field.
 ///
 /// Queries are analysed with the index's analyzer; the distinct terms
-/// are OR-ed (a term repeated in the query counts once). Results are the
+/// are OR-ed (a term repeated in the query counts once). A query may have
+/// at most [`MAX_QUERY_TERMS`] distinct terms; longer ones are rejected
+/// with `InvalidArgument`. A `k` larger than [`TextSearcher::num_docs`]
+/// is treated as `num_docs`. Results are the
 /// `k` best documents by BM25 that pass the filter, best first, ties
 /// broken by smaller id. Pruned search returns exactly what scoring
 /// every matching document would.

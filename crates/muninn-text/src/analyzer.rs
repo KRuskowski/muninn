@@ -18,16 +18,18 @@
 //! 5. **Stop words** (optional): the English stop list Lucene uses.
 //! 6. **Stem** (optional): the built-in Porter stemmer for English, or a
 //!    custom [`Stemmer`]. The Porter stemmer only touches tokens made of
-//!    ASCII letters.
+//!    ASCII letters and at most 255 bytes long.
 //!
 //! [`AnalyzerConfig`] is stored in every index file, and opening a file
 //! restores the analyzer, so queries are always analysed like the text.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
 use muninn_core::{Error, Result};
 
+use crate::hash::FoldBuild;
 use crate::porter;
 
 /// Which stemmer an analyzer applies.
@@ -101,7 +103,9 @@ impl Stemmer for PorterStemmer {
   }
 
   fn stem(&self, word: &mut String) {
-    if word.bytes().all(|b| b.is_ascii_lowercase()) {
+    if word.len() <= porter::MAX_STEM_BYTES
+      && word.bytes().all(|b| b.is_ascii_lowercase())
+    {
       let mut bytes = std::mem::take(word).into_bytes();
       porter::stem(&mut bytes);
       // Porter only ever writes ASCII lowercase letters.
@@ -399,16 +403,27 @@ fn is_english_stop_word(t: &str) -> bool {
 }
 
 /// Analyses a query: its distinct terms in order of first occurrence.
-pub(crate) fn query_terms(analyzer: &Analyzer, query: &str) -> Vec<String> {
+/// Fails if there are more than [`crate::MAX_QUERY_TERMS`].
+pub(crate) fn query_terms(
+  analyzer: &Analyzer,
+  query: &str,
+) -> Result<Vec<String>> {
   let mut toks = Tokens::new();
   analyzer.analyze(query, &mut toks);
-  let mut out: Vec<String> = Vec::with_capacity(toks.len());
+  let mut seen: HashSet<&str, FoldBuild> = HashSet::with_hasher(FoldBuild);
+  let mut out: Vec<String> = Vec::new();
   for t in toks.iter() {
-    if !out.iter().any(|o| o == t) {
+    if seen.insert(t) {
+      if out.len() == crate::MAX_QUERY_TERMS {
+        return Err(Error::invalid(format!(
+          "query has more than {} distinct terms",
+          crate::MAX_QUERY_TERMS
+        )));
+      }
       out.push(t.to_string());
     }
   }
-  out
+  Ok(out)
 }
 
 /// Serialised form of an [`AnalyzerConfig`], stored in index files.
@@ -622,6 +637,31 @@ mod tests {
   #[test]
   fn query_terms_dedupe_in_order() {
     let a = Analyzer::default();
-    assert_eq!(query_terms(&a, "b a B c a"), ["b", "a", "c"]);
+    assert_eq!(query_terms(&a, "b a B c a").unwrap(), ["b", "a", "c"]);
+  }
+
+  #[test]
+  fn very_long_tokens_do_not_hang_or_overflow_the_stemmer() {
+    // Runs of 'y' made the Porter consonant test recurse once per 'y':
+    // quadratic time and a stack overflow on long tokens.
+    // The "ed" suffix makes step 1b test for a double consonant and
+    // measure the stem, both of which walk the run of 'y'. Both run
+    // parities flip which of the two paths is taken.
+    let start = std::time::Instant::now();
+    for n in [60_000, 60_001] {
+      let mut w = format!("a{}ed", "y".repeat(n));
+      PorterStemmer.stem(&mut w);
+      assert_eq!(w.len(), n + 3, "long tokens are left unstemmed");
+    }
+    let a = Analyzer::new(AnalyzerConfig {
+      max_token_bytes: u16::MAX,
+      ..AnalyzerConfig::english()
+    })
+    .unwrap();
+    let mut t = Tokens::new();
+    a.analyze(&format!("b{}ing running", "y".repeat(65_000)), &mut t);
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.get(1), "run");
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
   }
 }

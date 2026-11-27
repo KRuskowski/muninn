@@ -20,12 +20,20 @@ impl Stem<'_> {
   }
 
   /// Whether `b[i]` is a consonant.
+  ///
+  /// A `y` is a consonant at the start or after a vowel, and a vowel
+  /// after a consonant, so in a run of `y`s it alternates from the
+  /// character before the run. Computed without recursion.
   fn cons(&self, i: isize) -> bool {
-    match self.at(i) {
-      b'a' | b'e' | b'i' | b'o' | b'u' => false,
-      b'y' => i == 0 || !self.cons(i - 1),
-      _ => true,
+    let mut j = i;
+    while j > 0 && self.at(j) == b'y' {
+      j -= 1;
     }
+    let base = match self.at(j) {
+      b'a' | b'e' | b'i' | b'o' | b'u' => false,
+      _ => true, // Includes a `y` at position 0.
+    };
+    base ^ ((i - j) % 2 == 1)
   }
 
   /// The measure `m` of `b[0..=j]`: the number of VC sequences.
@@ -265,11 +273,16 @@ impl Stem<'_> {
   }
 }
 
+/// Longer words are left unstemmed: the algorithm is quadratic in the
+/// length of runs of `y`, and no English word comes close.
+pub(crate) const MAX_STEM_BYTES: usize = 255;
+
 /// Stems `word` in place. `word` must consist of lowercase ASCII letters;
-/// words of one or two letters are left alone.
+/// words of one or two letters, or over [`MAX_STEM_BYTES`], are left
+/// alone.
 pub(crate) fn stem(word: &mut Vec<u8>) {
   debug_assert!(word.iter().all(u8::is_ascii_lowercase));
-  if word.len() <= 2 {
+  if word.len() <= 2 || word.len() > MAX_STEM_BYTES {
     return;
   }
   let k = word.len() as isize - 1;
