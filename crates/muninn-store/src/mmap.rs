@@ -5,13 +5,25 @@
 //! keeps it alive for as long as any clone or slice of the region exists.
 //! Opening a file therefore costs one `mmap` call; pages are read lazily.
 //!
-//! Mapped files must not be modified or truncated while mapped. muninn
-//! never does that: files are written once under a temporary name and
-//! renamed into place (see [`crate::fs`]), and are only ever deleted.
-//! On Unix, deleting a mapped file leaves existing maps valid. On Windows
-//! a mapped file cannot be deleted or replaced until every map of it is
-//! dropped; [`crate::ManifestStore::gc`] leaves such files for a later
-//! run.
+//! The contract for every caller of [`map_file`]: bytes already in the
+//! map must not change and the file must not be truncated while any map
+//! of it is alive (truncation turns accesses into `SIGBUS`). Appending is
+//! fine, since a map covers only the length the file had when mapped.
+//! In muninn:
+//!
+//! - Segment, id-map, payload, tombstone and manifest files are written
+//!   once under a temporary name, renamed into place (see [`crate::fs`])
+//!   and afterwards only deleted.
+//! - WAL segments are mapped by recovery and by [`crate::Wal::replay`].
+//!   The active segment is appended to while replay may have it mapped,
+//!   which never touches mapped bytes. Recovery truncates or rewrites a
+//!   segment only after dropping its own map, before the `Wal` exists, so
+//!   no replay can hold one.
+//!
+//! On Unix, deleting a mapped file leaves existing maps valid. Windows
+//! may refuse to delete or replace a mapped file (older systems, or
+//! without POSIX delete semantics); [`crate::ManifestStore::gc`] then
+//! leaves it for a later run.
 
 use std::fs::File;
 use std::path::Path;
@@ -75,10 +87,10 @@ pub fn map_file(path: &Path) -> Result<Region> {
       path.display()
     )));
   }
-  // SAFETY: the map is read-only and muninn never modifies or truncates a
-  // file after publishing it (see module docs), so the mapped bytes stay
-  // valid and unchanged for the map's lifetime. The kernel keeps the pages
-  // valid even if the file is unlinked.
+  // SAFETY: the map is read-only, and per the module contract no muninn
+  // code changes mapped bytes or truncates a file while it is mapped (the
+  // active WAL segment only grows, beyond the mapped length). The kernel
+  // keeps the pages valid even if the file is unlinked.
   let map = unsafe { Mmap::map(&file)? };
   Ok(Region::new(MapOwner(map)))
 }

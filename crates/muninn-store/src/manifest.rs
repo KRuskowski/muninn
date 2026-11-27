@@ -177,6 +177,24 @@ impl Manifest {
   }
 }
 
+/// The segment id in a `seg-<id>...` file name (also temporary ones).
+fn segment_id_of(name: &str) -> Option<u64> {
+  let rest = name.strip_prefix(SEGMENT_PREFIX)?;
+  let end = rest.find('.').unwrap_or(rest.len());
+  let digits = &rest[..end];
+  if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  digits.parse().ok()
+}
+
+/// The process id in a temporary file name `<target>.<pid>.<n>.tmp`.
+fn temp_pid_of(name: &str) -> Option<u32> {
+  let mut parts = name.strip_suffix(TEMP_SUFFIX)?.rsplit('.');
+  let _n = parts.next()?;
+  parts.next()?.parse().ok()
+}
+
 /// True for errors meaning "another handle or map still uses the file",
 /// which only Windows reports on delete.
 fn in_use(e: &std::io::Error) -> bool {
@@ -214,7 +232,13 @@ impl ManifestStore {
   ///
   /// Corrupt or torn manifests are skipped in favour of older ones, and
   /// temporary files left by interrupted commits are ignored (remove them
-  /// with [`ManifestStore::gc`]). Returns `None` for a fresh directory.
+  /// with [`ManifestStore::gc`]). Returns `None` only for a directory
+  /// without manifest files.
+  ///
+  /// Errors: an I/O error reading a manifest is returned as is (it may be
+  /// transient, and skipping the newest manifest because of it would
+  /// silently roll the collection back); manifest files that are all
+  /// corrupt are an [`Error::Corrupt`], never an empty collection.
   pub fn open(dir: &Path) -> Result<(ManifestStore, Option<Manifest>)> {
     let mut found: Vec<u64> = Vec::new();
     for e in std::fs::read_dir(dir)? {
@@ -224,15 +248,25 @@ impl ManifestStore {
       }
     }
     found.sort_unstable_by(|a, b| b.cmp(a));
+    let has_any = !found.is_empty();
     let max_generation = found.first().copied().unwrap_or(0);
     let mut retained = Vec::new();
     for g in found {
       if retained.len() == KEEP_MANIFESTS {
         break;
       }
-      if let Ok(m) = read_manifest(&dir.join(manifest_file_name(g)), g) {
-        retained.push(m);
+      match read_manifest(&dir.join(manifest_file_name(g)), g) {
+        Ok(m) => retained.push(m),
+        Err(Error::Corrupt(_)) => continue,
+        Err(e) => return Err(e),
       }
+    }
+    if retained.is_empty() && has_any {
+      return Err(Error::corrupt(format!(
+        "{} holds manifest files but none is valid; refusing to open the \
+         collection as empty",
+        dir.display()
+      )));
     }
     retained.reverse();
     let current = retained.last().cloned();
@@ -260,7 +294,13 @@ impl ManifestStore {
   /// segment files are not touched (see [`ManifestStore::gc`]).
   pub fn commit(&mut self, manifest: &mut Manifest) -> Result<()> {
     manifest.validate()?;
-    let generation = self.max_generation + 1;
+    let generation = self.max_generation.checked_add(1).ok_or_else(|| {
+      Error::corrupt(format!(
+        "{} has a manifest with the largest possible generation; remove \
+         it to commit",
+        self.dir.display()
+      ))
+    })?;
     manifest.generation = generation;
     let bytes = manifest.encode()?;
     write_atomic(&self.dir.join(manifest_file_name(generation)), &bytes)?;
@@ -281,17 +321,35 @@ impl ManifestStore {
   /// Finds files in the directory that no retained manifest needs:
   /// `seg-*` files not referenced, manifests other than the retained
   /// generations, and `*.tmp` files. With `delete`, removes them and
-  /// fsyncs the directory. Returns the paths found.
+  /// fsyncs the directory. Returns the paths found (with `delete`, the
+  /// paths removed).
   ///
-  /// Call this from the thread that commits manifests, never while a
-  /// segment is being written: a segment file published but not yet named
-  /// by a committed manifest is, by definition, unreferenced.
+  /// Never collected, so gc may run while flushes and compactions write
+  /// new segments:
   ///
-  /// On Windows, a file that is still memory mapped (for example by a
-  /// reader holding an old snapshot) cannot be deleted; with `delete`,
-  /// such files are left in place, omitted from the result, and collected
-  /// by a later call.
-  pub fn gc(&self, delete: bool) -> Result<Vec<PathBuf>> {
+  /// - files of segments with id `>= next_segment_id` of the current
+  ///   manifest: the engine allocates new segment ids from the manifest, so
+  ///   these are output not yet committed;
+  /// - files of the segment ids in `pending`, for work that reuses an
+  ///   existing id (for example a new tombstone version being written);
+  /// - temporary files created by this process, which may still be in
+  ///   use. Other temporary files are left over from a process that died
+  ///   (the directory lock guarantees there is no other live writer);
+  /// - every `seg-*` file when no manifest was ever committed.
+  ///
+  /// Refuses (with an error) when manifest files exist that this store
+  /// has not loaded: everything would look unreferenced.
+  ///
+  /// A file the OS refuses to delete because it is in use (Windows without
+  /// POSIX delete semantics, for a file still mapped by a reader) is left
+  /// in place, omitted from the result, and collected by a later call.
+  pub fn gc(&self, delete: bool, pending: &[u64]) -> Result<Vec<PathBuf>> {
+    let next_id = self.current().map_or(0, |m| m.next_segment_id);
+    let own_pid = std::process::id();
+    let protected = |name: &str| {
+      segment_id_of(name)
+        .is_some_and(|id| id >= next_id || pending.contains(&id))
+    };
     let referenced: HashSet<&str> = self
       .retained
       .iter()
@@ -308,11 +366,20 @@ impl ManifestStore {
       let name = e.file_name();
       let Some(name) = name.to_str() else { continue };
       let is_garbage = if name.ends_with(TEMP_SUFFIX) {
-        true
+        temp_pid_of(name) != Some(own_pid) && !protected(name)
       } else if let Some(g) = parse_manifest_name(name) {
+        if self.retained.is_empty() {
+          return Err(Error::invalid(format!(
+            "gc refused: {} holds manifest {name}, which this store has not \
+             loaded",
+            self.dir.display()
+          )));
+        }
         !keep_gens.contains(&g)
       } else {
-        name.starts_with(SEGMENT_PREFIX) && !referenced.contains(name)
+        name.starts_with(SEGMENT_PREFIX)
+          && !referenced.contains(name)
+          && !protected(name)
       };
       if is_garbage {
         garbage.push(e.path());

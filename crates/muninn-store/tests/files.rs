@@ -323,16 +323,17 @@ fn manifest_survives_crash_between_temp_write_and_rename() {
   // before the rename.
   let mut next = manifest_with(&[1, 2]);
   next.generation = 2;
-  let target = d.path().join(manifest_file_name(2));
-  let tmp = temp_path_for(&target);
+  // The crashed process had another pid than this one.
+  let target = manifest_file_name(2);
+  let tmp = d.path().join(format!("{target}.4294967295.0{TEMP_SUFFIX}"));
   std::fs::write(&tmp, next.encode().unwrap()).unwrap();
   // And a half-written temp file from an earlier crash.
-  let tmp2 = temp_path_for(&target);
+  let tmp2 = d.path().join(format!("{target}.4294967294.7{TEMP_SUFFIX}"));
   std::fs::write(&tmp2, &next.encode().unwrap()[..40]).unwrap();
 
   let (store, loaded) = ManifestStore::open(d.path()).unwrap();
   assert_eq!(loaded.unwrap(), m);
-  let garbage = store.gc(true).unwrap();
+  let garbage = store.gc(true, &[]).unwrap();
   assert!(garbage.contains(&tmp) && garbage.contains(&tmp2));
   assert!(!tmp.exists() && !tmp2.exists());
 }
@@ -399,14 +400,16 @@ fn gc_removes_only_unreferenced_muninn_files() {
     touch(&segment_file_name(id, "payload"));
     touch(&tombstone_file_name(id, 1));
   }
-  touch(&segment_file_name(4, "idmap")); // orphan from a failed flush
+  // Left by a flush that died before committing: id 4 is not below
+  // next_segment_id yet, so it could still be in flight.
+  touch(&segment_file_name(4, "idmap"));
   touch(&tombstone_file_name(2, 0)); // superseded tombstones
   touch("seg-0000000003.idmap.123.0.tmp");
   touch("user-notes.txt");
   std::fs::create_dir(d.path().join("wal")).unwrap();
   let _lock = DirLock::acquire(d.path()).unwrap();
 
-  let found = store.gc(false).unwrap();
+  let found = store.gc(false, &[]).unwrap();
   let names: Vec<String> = found
     .iter()
     .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
@@ -416,17 +419,23 @@ fn gc_removes_only_unreferenced_muninn_files() {
     vec![
       "seg-0000000002.0000000000.tomb".to_string(),
       "seg-0000000003.idmap.123.0.tmp".to_string(),
-      "seg-0000000004.idmap".to_string(),
     ]
   );
   // Dry run deleted nothing.
   assert!(found.iter().all(|p| p.exists()));
   // Segment 1 is only in the previous manifest, which is retained as a
-  // fallback, so its files survive until the next commit.
+  // fallback, so its files survive until the next commit. That commit
+  // also moves next_segment_id past the dead flush's segment 4.
   let mut m3 = manifest_with(&[3]);
+  m3.next_segment_id = 5;
   store.commit(&mut m3).unwrap();
-  let found = store.gc(true).unwrap();
+  let found = store.gc(true, &[]).unwrap();
   assert!(found.iter().all(|p| !p.exists()));
+  assert!(
+    found
+      .iter()
+      .any(|p| p.ends_with(segment_file_name(4, "idmap")))
+  );
   let left: Vec<String> = std::fs::read_dir(d.path())
     .unwrap()
     .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -485,21 +494,21 @@ fn map_file_handles_empty_files_and_slices_outlive_the_region() {
   let r = map_file_with(&p, Advice::WillNeed).unwrap();
   let tail = r.slice(5000..10_000).unwrap();
   drop(r);
-  // The slice keeps the map alive after the region is gone and, on Unix,
-  // after the file is deleted. Windows refuses to delete a mapped file.
+  // The slice keeps the map alive after the region is gone and after the
+  // file is deleted. On Unix the delete always succeeds; on Windows it
+  // succeeds where std can use POSIX delete semantics (Windows 10 1709+,
+  // NTFS) and fails on older systems. Either way the mapped bytes stay.
+  let deleted = std::fs::remove_file(&p).is_ok();
   #[cfg(unix)]
-  std::fs::remove_file(&p).unwrap();
-  #[cfg(windows)]
-  assert!(std::fs::remove_file(&p).is_err());
+  assert!(deleted);
   assert_eq!(tail.bytes(), &data[5000..]);
   muninn_store::advise(&tail, Advice::Sequential).unwrap();
   drop(tail);
   // Unmapped, the file can be replaced and deleted on every platform.
-  #[cfg(windows)]
-  {
-    write_atomic(&p, b"replaced").unwrap();
-    std::fs::remove_file(&p).unwrap();
-  }
+  write_atomic(&p, b"replaced").unwrap();
+  assert_eq!(std::fs::read(&p).unwrap(), b"replaced");
+  std::fs::remove_file(&p).unwrap();
+  let _ = deleted;
 }
 
 #[test]
@@ -533,4 +542,180 @@ fn atomic_replace_keeps_old_contents_on_failure() {
     c.section(tag("b")).unwrap().cast::<u32>().unwrap(),
     &[1, 2, 3]
   );
+}
+
+// Regression tests from the PR #10 review.
+
+fn one_segment_manifest(dir: &std::path::Path) -> (ManifestStore, Manifest) {
+  std::fs::write(dir.join(segment_file_name(1, "idmap")), b"data").unwrap();
+  let (mut store, cur) = ManifestStore::open(dir).unwrap();
+  assert!(cur.is_none());
+  let mut m = manifest_with(&[1]);
+  store.commit(&mut m).unwrap();
+  (store, m)
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_open_propagates_io_errors() {
+  use std::os::unix::fs::PermissionsExt;
+  let d = TestDir::new("manifest-eacces");
+  let (_, m) = one_segment_manifest(d.path());
+  let mpath = d.path().join(manifest_file_name(m.generation));
+  // EACCES stands in for a transient EIO / EMFILE / ENOMEM.
+  std::fs::set_permissions(&mpath, std::fs::Permissions::from_mode(0o000))
+    .unwrap();
+  let r = ManifestStore::open(d.path());
+  std::fs::set_permissions(&mpath, std::fs::Permissions::from_mode(0o644))
+    .unwrap();
+  assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
+  // Readable again: the manifest loads and gc keeps the live segment.
+  let (store, cur) = ManifestStore::open(d.path()).unwrap();
+  assert_eq!(cur.unwrap(), m);
+  store.gc(true, &[]).unwrap();
+  assert!(d.path().join(segment_file_name(1, "idmap")).exists());
+}
+
+#[test]
+fn manifest_files_without_a_valid_one_are_an_error() {
+  let d = TestDir::new("manifest-none-valid");
+  let (_, m) = one_segment_manifest(d.path());
+  let mpath = d.path().join(manifest_file_name(m.generation));
+  let mut b = std::fs::read(&mpath).unwrap();
+  b[80] ^= 1;
+  std::fs::write(&mpath, &b).unwrap();
+  let r = ManifestStore::open(d.path());
+  assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+}
+
+#[test]
+fn gc_refuses_when_manifests_exist_but_none_is_retained() {
+  let src = TestDir::new("gc-refuse-src");
+  let (_, m) = one_segment_manifest(src.path());
+  let d = TestDir::new("gc-refuse");
+  let (store, _) = ManifestStore::open(d.path()).unwrap();
+  // A manifest this store has not loaded appears (another writer, or a
+  // restore): gc must not treat everything as garbage.
+  let name = manifest_file_name(m.generation);
+  std::fs::copy(src.path().join(&name), d.path().join(&name)).unwrap();
+  let seg = d.path().join(segment_file_name(1, "idmap"));
+  std::fs::write(&seg, b"data").unwrap();
+  assert!(store.gc(true, &[]).is_err());
+  assert!(seg.exists());
+  assert!(d.path().join(&name).exists());
+}
+
+#[test]
+fn gc_spares_in_flight_segments_and_own_temp_files() {
+  let d = TestDir::new("gc-in-flight");
+  let touch = |name: &str| std::fs::write(d.path().join(name), b"x").unwrap();
+  let (mut store, _) = ManifestStore::open(d.path()).unwrap();
+  let mut m = manifest_with(&[1]);
+  m.next_segment_id = 4;
+  store.commit(&mut m).unwrap();
+  for id in 1..=5 {
+    touch(&segment_file_name(id, "idmap"));
+  }
+  // Interrupted writes: one from this process (maybe still running), one
+  // from a process that is long gone.
+  let own = temp_path_for(&d.path().join(segment_file_name(1, "payload")));
+  std::fs::write(&own, b"x").unwrap();
+  touch("seg-0000000001.payload.4294967295.0.tmp");
+  // Segment 2 is being written by a flush the caller knows about; 4 and 5
+  // are at or above next_segment_id, so they are new output.
+  let found = store.gc(true, &[2]).unwrap();
+  let names: Vec<String> = found
+    .iter()
+    .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+    .collect();
+  assert_eq!(
+    names,
+    vec![
+      "seg-0000000001.payload.4294967295.0.tmp".to_string(),
+      "seg-0000000003.idmap".to_string(),
+    ]
+  );
+  for id in [1, 2, 4, 5] {
+    assert!(d.path().join(segment_file_name(id, "idmap")).exists());
+  }
+  assert!(own.exists());
+}
+
+#[test]
+fn idmap_huge_table_capacity_is_corrupt_not_a_panic() {
+  use muninn_core::container::ContainerWriter;
+  use muninn_store::{IDMAP_KIND, IDMAP_VERSION};
+  for meta in [
+    [0u64, 0, 0, 1 << 63, 0, 0, 0, 0],
+    [0, 0, 0, 0, 1 << 63, 0, 0, 0],
+    [4, 4, 0, 1 << 40, 0, 0, 0, 0],
+  ] {
+    let mut w =
+      ContainerWriter::new(Vec::new(), IDMAP_KIND, IDMAP_VERSION).unwrap();
+    w.pod_section(tag("meta"), &meta).unwrap();
+    let bytes = w.finish().unwrap();
+    let r = std::panic::catch_unwind(|| {
+      FrozenIdMap::open(Region::copy_from(&bytes)).map(|_| ())
+    });
+    let r = r.expect("panicked instead of returning an error");
+    assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+  }
+}
+
+#[test]
+fn manifest_generation_overflow_is_an_error() {
+  let d = TestDir::new("manifest-gen-max");
+  let (_, m) = one_segment_manifest(d.path());
+  std::fs::write(d.path().join(format!("MANIFEST-{}", u64::MAX)), b"junk")
+    .unwrap();
+  let (mut store, cur) = ManifestStore::open(d.path()).unwrap();
+  assert_eq!(cur.as_ref(), Some(&m));
+  let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut next = manifest_with(&[1, 2]);
+    store.commit(&mut next).map(|_| next.generation)
+  }));
+  let r = r.expect("panicked instead of returning an error");
+  assert!(r.is_err(), "{r:?}");
+  // The committed manifest is untouched.
+  assert_eq!(ManifestStore::open(d.path()).unwrap().1, Some(m));
+}
+
+/// Inverse of the MurmurHash3 finaliser the id map hashes with.
+fn unfmix(mut x: u64) -> u64 {
+  x ^= x >> 33;
+  x = x.wrapping_mul(0x9CB4_B2F8_1293_37DB);
+  x ^= x >> 33;
+  x = x.wrapping_mul(0x4F74_430C_22A5_4005);
+  x ^ (x >> 33)
+}
+
+#[test]
+fn idmap_build_is_fast_for_adversarial_ids() {
+  // Ids crafted so that, under the seed files used to be written with,
+  // every key lands in the same table slot.
+  const OLD_SEED: u64 = 0x6D75_6E69_6E6E_6964;
+  let mut m = IdMap::new();
+  for i in 0..150_000u64 {
+    m.insert(ExternalId::U64(unfmix(i << 32) ^ OLD_SEED))
+      .unwrap();
+  }
+  let t = std::time::Instant::now();
+  let buf = m.write_to(Vec::new()).unwrap();
+  let build = t.elapsed();
+  assert!(
+    build < std::time::Duration::from_secs(1),
+    "build took {build:?}"
+  );
+  let f = FrozenIdMap::open(Region::copy_from(&buf)).unwrap();
+  assert_eq!(f.get_u64(unfmix(7 << 32) ^ OLD_SEED), Some(7));
+}
+
+#[test]
+fn idmap_seeded_writes_are_reproducible() {
+  let m = mixed_map(300);
+  let a = m.write_to_with_seed(Vec::new(), 42).unwrap();
+  let b = m.write_to_with_seed(Vec::new(), 42).unwrap();
+  assert_eq!(a, b);
+  let f = FrozenIdMap::open(Region::copy_from(&a)).unwrap();
+  assert_eq!(f.get_u64(1_000_003), Some(1));
 }

@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use muninn_core::{Error, Result};
 
-use crate::fs::sync_dir;
+use crate::fs::{parent_dir, rename, sync_dir};
 use crate::mmap::map_file;
 pub use format::MAX_RECORD_LEN;
 use format::{
@@ -58,6 +58,11 @@ use format::{
 /// Log sequence number. The first record ever appended gets 1; 0 means
 /// "nothing".
 pub type Lsn = u64;
+
+/// Largest LSN a log may reach. Far beyond any real log, and low enough
+/// that LSN arithmetic never overflows; segment names or options beyond
+/// it are rejected.
+pub const MAX_LSN: Lsn = 1 << 62;
 
 /// File-name suffix of WAL segment files.
 pub const SEGMENT_SUFFIX: &str = ".wal";
@@ -74,14 +79,15 @@ pub enum Durability {
   /// Concurrent appends share fsyncs (group commit).
   SyncEachWrite,
   /// An append returns after its record reached the OS; a background
-  /// thread fsyncs the log every `max_delay`, while appends continue. An OS crash or power loss loses at
+  /// thread fsyncs the log every `max_delay`, while appends continue.
+  /// A zero `max_delay` means [`Durability::SyncEachWrite`]. An OS crash or power loss loses at
   /// most the records of the last `max_delay` (plus one fsync).
   SyncBatch {
     /// Longest time a record may stay written but not fsynced.
     max_delay: Duration,
   },
-  /// Never fsync unless [`Wal::sync`] is called. Survives process crashes
-  /// only.
+  /// Never fsync unless [`Wal::sync`] is called (which then syncs every
+  /// segment written since the last sync). Survives process crashes only.
   NoSync,
 }
 
@@ -155,6 +161,8 @@ pub struct WalStats {
   pub syncs: u64,
   /// Segment files created since open.
   pub segments_created: u64,
+  /// Directory fsyncs, including those made while opening.
+  pub dir_syncs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +177,22 @@ struct Active {
   /// writes.
   file: Arc<File>,
   len: u64,
+  /// Segments rotated out without an fsync (`NoSync`), synced by the next
+  /// sync round before the active one.
+  unsynced: Vec<Arc<File>>,
+  /// A segment file was created without syncing the directory.
+  dir_dirty: bool,
+}
+
+impl Active {
+  fn new(file: File, len: u64) -> Self {
+    Self {
+      file: Arc::new(file),
+      len,
+      unsynced: Vec::new(),
+      dir_dirty: false,
+    }
+  }
 }
 
 struct State {
@@ -194,7 +218,27 @@ struct Counters {
   writes: AtomicU64,
   syncs: AtomicU64,
   segments_created: AtomicU64,
+  dir_syncs: AtomicU64,
 }
+
+impl Counters {
+  fn sync_dir(&self, dir: &Path) -> Result<()> {
+    sync_dir(dir)?;
+    self.dir_syncs.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+  }
+}
+
+/// Where an fsync of a segment file came from (fault-injection tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncSite {
+  Leader,
+  Syncer,
+}
+
+#[cfg(test)]
+type SyncHook =
+  Box<dyn Fn(&Shared, SyncSite) -> std::io::Result<()> + Send + Sync>;
 
 struct Shared {
   dir: PathBuf,
@@ -207,6 +251,13 @@ struct Shared {
   active: Mutex<Active>,
   segments: Mutex<Vec<SegmentInfo>>,
   counters: Counters,
+  /// Serialises fsyncs of segment files. Linux reports a writeback error
+  /// to only one fsync caller; with one caller at a time, whoever sees it
+  /// records it before anyone else can claim success.
+  sync_lock: Mutex<()>,
+  /// Runs after each segment fsync and can turn it into a failure.
+  #[cfg(test)]
+  sync_hook: Mutex<Option<SyncHook>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -233,6 +284,12 @@ fn list_segments(dir: &Path) -> Result<Vec<SegmentInfo>> {
     let e = e?;
     if let Some(first_lsn) = e.file_name().to_str().and_then(parse_segment_name)
     {
+      if first_lsn == 0 || first_lsn > MAX_LSN {
+        return Err(Error::corrupt(format!(
+          "WAL segment {} has an impossible first LSN",
+          e.path().display()
+        )));
+      }
       v.push(SegmentInfo {
         first_lsn,
         path: e.path(),
@@ -248,6 +305,7 @@ fn create_segment(
   dir: &Path,
   header: SegmentHeader,
   sync: bool,
+  counters: &Counters,
 ) -> Result<(File, PathBuf)> {
   let path = segment_path(dir, header.first_lsn);
   let mut file = OpenOptions::new()
@@ -258,7 +316,7 @@ fn create_segment(
   file.write_all(&encode_header(header))?;
   if sync {
     file.sync_data()?;
-    sync_dir(dir)?;
+    counters.sync_dir(dir)?;
   }
   Ok((file, path))
 }
@@ -325,6 +383,12 @@ impl Shared {
         st.spare = buf;
       }
       match res {
+        // Another fsync caller may have seen (and consumed) a writeback
+        // error during this round: then nothing here is durable either.
+        Ok(()) if st.failed.is_some() => {
+          self.io_done.notify_all();
+          return Err(poisoned(st.failed.as_deref().unwrap_or_default()));
+        }
         Ok(()) => {
           st.written = last;
           if do_sync {
@@ -333,7 +397,7 @@ impl Shared {
           self.io_done.notify_all();
         }
         Err(e) => {
-          st.failed = Some(e.to_string());
+          st.failed.get_or_insert_with(|| e.to_string());
           self.io_done.notify_all();
           return Err(e);
         }
@@ -359,8 +423,15 @@ impl Shared {
         .fetch_add(buf.len() as u64, Ordering::Relaxed);
     }
     if sync {
-      a.file.sync_data()?;
-      self.counters.syncs.fetch_add(1, Ordering::Relaxed);
+      // Older segments first: a record is durable only when everything
+      // before it is.
+      for f in std::mem::take(&mut a.unsynced) {
+        self.fsync(&f, SyncSite::Leader)?;
+      }
+      if std::mem::take(&mut a.dir_dirty) {
+        self.counters.sync_dir(&self.dir)?;
+      }
+      self.fsync(&a.file, SyncSite::Leader)?;
     }
     Ok(())
   }
@@ -371,18 +442,19 @@ impl Shared {
   fn rotate(&self, a: &mut Active, first: Lsn) -> Result<()> {
     let sync = self.sync_on_rotate();
     if sync {
-      a.file.sync_data()?;
-      self.counters.syncs.fetch_add(1, Ordering::Relaxed);
+      self.fsync(&a.file, SyncSite::Leader)?;
     }
     let header = SegmentHeader {
       first_lsn: first,
       prev_lsn: first - 1,
     };
-    let (file, path) = create_segment(&self.dir, header, sync)?;
-    *a = Active {
-      file: Arc::new(file),
-      len: HEADER_LEN as u64,
-    };
+    let (file, path) = create_segment(&self.dir, header, sync, &self.counters)?;
+    let old = std::mem::replace(&mut a.file, Arc::new(file));
+    a.len = HEADER_LEN as u64;
+    if !sync {
+      a.unsynced.push(old);
+      a.dir_dirty = true;
+    }
     lock(&self.segments).push(SegmentInfo {
       first_lsn: first,
       path,
@@ -392,6 +464,42 @@ impl Shared {
       .segments_created
       .fetch_add(1, Ordering::Relaxed);
     Ok(())
+  }
+
+  #[cfg(test)]
+  fn run_hook(&self, site: SyncSite) -> std::io::Result<()> {
+    match &*lock(&self.sync_hook) {
+      Some(h) => h(self, site),
+      None => Ok(()),
+    }
+  }
+
+  /// Fsyncs a segment file under `sync_lock`, counting it. A failure
+  /// poisons the WAL before the lock is released.
+  fn fsync(&self, f: &File, site: SyncSite) -> Result<()> {
+    let _one_at_a_time = lock(&self.sync_lock);
+    let res = f.sync_data();
+    #[cfg(test)]
+    let res = res.and_then(|()| self.run_hook(site));
+    #[cfg(not(test))]
+    let _ = site;
+    match res {
+      Ok(()) => {
+        self.counters.syncs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+      }
+      Err(e) => {
+        self.mark_failed(e.to_string());
+        Err(e.into())
+      }
+    }
+  }
+
+  /// Poisons the WAL (first error wins) and wakes every waiter.
+  fn mark_failed(&self, msg: String) {
+    let mut st = lock(&self.state);
+    st.failed.get_or_insert(msg);
+    self.io_done.notify_all();
   }
 
   fn syncer(self: Arc<Self>, max_delay: Duration) {
@@ -418,20 +526,13 @@ impl Shared {
       }
       drop(st);
       let file = lock(&self.active).file.clone();
-      let res = file.sync_data();
+      // A failure poisons the WAL inside `fsync`; appenders report it.
+      let res = self.fsync(&file, SyncSite::Syncer);
       st = lock(&self.state);
-      match res {
-        Ok(()) => {
-          self.counters.syncs.fetch_add(1, Ordering::Relaxed);
-          st.synced = st.synced.max(target);
-        }
-        Err(e) => {
-          // Poisons the WAL; appenders report it.
-          st.failed = Some(e.to_string());
-          self.io_done.notify_all();
-          return;
-        }
+      if res.is_err() || st.failed.is_some() {
+        return;
       }
+      st.synced = st.synced.max(target);
     }
   }
 }
@@ -454,15 +555,26 @@ impl std::fmt::Debug for Wal {
 
 impl Wal {
   /// Opens (creating if needed) the WAL in `dir` without replaying it.
-  /// Only the last segment is read, to find where the log ends.
+  /// Every segment is read and verified, exactly as by
+  /// `Wal::recover(dir, opts, 0, ..)`, so both agree on where the log
+  /// ends even if a record in the middle is damaged.
   pub fn open(dir: &Path, opts: WalOptions) -> Result<Wal> {
-    Ok(Self::recover(dir, opts, Lsn::MAX, |_, _| Ok(()))?.0)
+    Ok(Self::recover(dir, opts, 0, |_, _| Ok(()))?.0)
   }
 
   /// Opens (creating if needed) the WAL in `dir`, passing every valid
   /// record with LSN `>= from` to `replay` in LSN order, and repairs a
   /// torn or corrupt tail (see the module docs). An error from `replay`
   /// aborts the open and is returned.
+  ///
+  /// Segments holding only records below `from` are not read: they are
+  /// already checkpointed, so damage there cannot matter, and the engine
+  /// deletes them with [`Wal::truncate_before`].
+  /// [`Recovery::scan_start_lsn`] says where reading began.
+  ///
+  /// Before returning, every remaining segment and the directory are
+  /// fsynced, so [`Wal::durable_lsn`] starts at the true end of the log
+  /// even if the previous run left it only in the page cache.
   pub fn recover<F>(
     dir: &Path,
     opts: WalOptions,
@@ -472,7 +584,20 @@ impl Wal {
   where
     F: FnMut(Lsn, &[u8]) -> Result<()>,
   {
-    std::fs::create_dir_all(dir)?;
+    let mut opts = opts;
+    if let Durability::SyncBatch { max_delay } = opts.durability
+      && max_delay.is_zero()
+    {
+      opts.durability = Durability::SyncEachWrite;
+    }
+    if opts.min_next_lsn > MAX_LSN {
+      return Err(Error::invalid(format!(
+        "min_next_lsn {} exceeds the LSN limit {MAX_LSN}",
+        opts.min_next_lsn
+      )));
+    }
+    let counters = Counters::default();
+    create_dir_durably(dir, &counters)?;
     let mut report = Recovery::default();
     let mut segs = list_segments(dir)?;
     let mut active: Option<(Active, Lsn)> = None;
@@ -568,10 +693,10 @@ impl Wal {
           let mut aside = s.path.clone().into_os_string();
           aside.push(DISCARDED_SUFFIX);
           let aside = PathBuf::from(aside);
-          std::fs::rename(&s.path, &aside)?;
+          rename(&s.path, &aside)?;
           report.discarded.push(aside);
         }
-        sync_dir(dir)?;
+        counters.sync_dir(dir)?;
       }
       let (gi, end, next) = good.expect("at least one segment scanned");
       let mut file = OpenOptions::new()
@@ -579,13 +704,17 @@ impl Wal {
         .write(true)
         .open(&segs[gi].path)?;
       file.seek(SeekFrom::Start(end))?;
-      active = Some((
-        Active {
-          file: Arc::new(file),
-          len: end,
-        },
-        next,
-      ));
+      // The previous run may have left data only in the page cache.
+      for (i, s) in segs.iter().enumerate() {
+        if i == gi {
+          file.sync_data()?;
+        } else {
+          OpenOptions::new().write(true).open(&s.path)?.sync_data()?;
+        }
+        counters.syncs.fetch_add(1, Ordering::Relaxed);
+      }
+      counters.sync_dir(dir)?;
+      active = Some((Active::new(file, end), next));
     }
 
     let min_next = opts.min_next_lsn.max(1);
@@ -598,15 +727,12 @@ impl Wal {
           first_lsn: min_next,
           prev_lsn: prev_end,
         };
-        let (file, path) = create_segment(dir, header, true)?;
+        let (file, path) = create_segment(dir, header, true, &counters)?;
         segs.push(SegmentInfo {
           first_lsn: min_next,
           path,
         });
-        let a = Active {
-          file: Arc::new(file),
-          len: HEADER_LEN as u64,
-        };
+        let a = Active::new(file, HEADER_LEN as u64);
         if report.segments_scanned == 0 {
           report.scan_start_lsn = min_next;
         }
@@ -633,7 +759,10 @@ impl Wal {
       syncer_wake: Condvar::new(),
       active: Mutex::new(active),
       segments: Mutex::new(segs),
-      counters: Counters::default(),
+      counters,
+      sync_lock: Mutex::new(()),
+      #[cfg(test)]
+      sync_hook: Mutex::new(None),
     });
     let syncer = match opts.durability {
       Durability::SyncBatch { max_delay } => {
@@ -685,6 +814,9 @@ impl Wal {
     let first = st.next_lsn;
     if payloads.is_empty() {
       return Ok(first..first);
+    }
+    if MAX_LSN - (first - 1) < payloads.len() as u64 {
+      return Err(Error::invalid("WAL has reached the LSN limit"));
     }
     st.buf.reserve(bytes);
     for (h, p) in headers.iter().zip(payloads) {
@@ -741,6 +873,7 @@ impl Wal {
       writes: c.writes.load(Ordering::Relaxed),
       syncs: c.syncs.load(Ordering::Relaxed),
       segments_created: c.segments_created.load(Ordering::Relaxed),
+      dir_syncs: c.dir_syncs.load(Ordering::Relaxed),
     }
   }
 
@@ -768,7 +901,12 @@ impl Wal {
       if seg.first_lsn > end {
         break;
       }
-      let expected_last = next_first.map_or(end, |n| (n - 1).min(end));
+      // The next segment's header records where this one ended, which is
+      // below its first LSN when the log skipped ahead.
+      let expected_last = match segs.get(i + 1) {
+        Some(next) => read_header(&next.path)?.prev_lsn.min(end),
+        None => end,
+      };
       let region = map_file(&seg.path)?;
       let bytes = region.bytes();
       decode_header(bytes)
@@ -799,24 +937,37 @@ impl Wal {
   /// files deleted.
   pub fn truncate_before(&self, lsn: Lsn) -> Result<usize> {
     let victims: Vec<SegmentInfo> = {
-      let mut segs = lock(&self.shared.segments);
+      let segs = lock(&self.shared.segments);
       let n = segs
         .windows(2)
         .take_while(|w| w[1].first_lsn <= lsn)
         .count();
-      segs.drain(..n).collect()
+      segs[..n].to_vec()
     };
+    // Delete oldest first and forget only what is gone, so a failure
+    // leaves the log describing exactly the files still on disk.
+    let mut deleted = 0;
+    let mut failure = None;
     for v in &victims {
       match std::fs::remove_file(&v.path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        Ok(()) => deleted += 1,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => deleted += 1,
+        Err(e) => {
+          failure = Some(e);
+          break;
+        }
       }
     }
-    if !victims.is_empty() {
-      sync_dir(&self.shared.dir)?;
+    if deleted > 0 {
+      let gone: Vec<Lsn> =
+        victims[..deleted].iter().map(|v| v.first_lsn).collect();
+      lock(&self.shared.segments).retain(|s| !gone.contains(&s.first_lsn));
+      self.shared.counters.sync_dir(&self.shared.dir)?;
     }
-    Ok(victims.len())
+    match failure {
+      Some(e) => Err(e.into()),
+      None => Ok(deleted),
+    }
   }
 
   /// Flushes and, unless the mode is `NoSync`, syncs outstanding records,
@@ -852,6 +1003,36 @@ impl Drop for Wal {
   }
 }
 
+/// Reads and checks the header of a segment file.
+fn read_header(path: &Path) -> Result<SegmentHeader> {
+  use std::io::Read;
+  let mut b = Vec::with_capacity(HEADER_LEN);
+  File::open(path)?
+    .take(HEADER_LEN as u64)
+    .read_to_end(&mut b)?;
+  decode_header(&b)
+    .map_err(|r| Error::corrupt(format!("{}: {r}", path.display())))
+}
+
+/// Creates `dir` and any missing parents, fsyncing each new entry into
+/// its parent so the directory itself survives a crash.
+fn create_dir_durably(dir: &Path, counters: &Counters) -> Result<()> {
+  let mut missing = Vec::new();
+  let mut at = dir;
+  while !at.is_dir() {
+    missing.push(at);
+    match at.parent() {
+      Some(p) if !p.as_os_str().is_empty() => at = p,
+      _ => break,
+    }
+  }
+  std::fs::create_dir_all(dir)?;
+  for d in missing.iter().rev() {
+    counters.sync_dir(parent_dir(d))?;
+  }
+  Ok(())
+}
+
 /// Rewrites a segment as just its header.
 fn reinit_segment(path: &Path, first_lsn: Lsn, prev_lsn: Lsn) -> Result<()> {
   let mut f = OpenOptions::new().write(true).open(path)?;
@@ -864,9 +1045,79 @@ fn reinit_segment(path: &Path, first_lsn: Lsn, prev_lsn: Lsn) -> Result<()> {
   Ok(())
 }
 
+impl Wal {
+  #[cfg(test)]
+  fn set_sync_hook(&self, hook: Option<SyncHook>) {
+    *lock(&self.shared.sync_hook) = hook;
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A fresh directory under the workspace target dir, never `/tmp`.
+  fn test_dir(name: &str) -> PathBuf {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("../../target/unit-tmp")
+      .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+  }
+
+  fn nosync() -> WalOptions {
+    WalOptions {
+      durability: Durability::NoSync,
+      ..WalOptions::default()
+    }
+  }
+
+  /// Linux reports a writeback error to only one of the callers that
+  /// fsync a file. If another caller (here simulated by the hook) records
+  /// the failure while this fsync "succeeds", the records must not be
+  /// reported durable.
+  #[test]
+  fn fsync_failure_seen_by_another_caller_is_not_reported_as_durable() {
+    let dir = test_dir("wal-fsync-race-leader");
+    let wal = Wal::open(&dir, nosync()).unwrap();
+    wal.append(b"a").unwrap();
+    wal.set_sync_hook(Some(Box::new(|sh, site| {
+      if site == SyncSite::Leader {
+        sh.mark_failed("injected: EIO reported to the other caller".into());
+      }
+      Ok(())
+    })));
+    assert!(wal.sync().is_err());
+    assert_eq!(wal.durable_lsn(), 0);
+    assert!(wal.append(b"b").is_err());
+    drop(wal);
+    let _ = std::fs::remove_dir_all(dir);
+  }
+
+  #[test]
+  fn syncer_does_not_advance_after_a_failure_reported_elsewhere() {
+    let dir = test_dir("wal-fsync-race-syncer");
+    let opts = WalOptions {
+      durability: Durability::SyncBatch {
+        max_delay: Duration::from_millis(2),
+      },
+      ..WalOptions::default()
+    };
+    let wal = Wal::open(&dir, opts).unwrap();
+    wal.set_sync_hook(Some(Box::new(|sh, site| {
+      if site == SyncSite::Syncer {
+        sh.mark_failed("injected: EIO reported to the other caller".into());
+      }
+      Ok(())
+    })));
+    wal.append(b"a").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(wal.durable_lsn(), 0);
+    assert!(wal.append(b"b").is_err());
+    drop(wal);
+    let _ = std::fs::remove_dir_all(dir);
+  }
 
   #[test]
   fn segment_names() {

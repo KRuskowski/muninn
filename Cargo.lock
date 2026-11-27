@@ -242,6 +242,7 @@ dependencies = [
  "muninn-core",
  "serde",
  "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

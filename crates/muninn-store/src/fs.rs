@@ -7,13 +7,14 @@
 //! final name, never a mix; at worst a stray `*.tmp` file remains, which
 //! [`crate::ManifestStore::gc`] removes.
 //!
-//! On Windows, [`std::fs::rename`] replaces the target atomically
-//! (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`) and NTFS journals the
-//! directory change itself, so there is no directory fsync step (and no
-//! way to open a directory for one); [`sync_dir`] is a no-op there. A
-//! file cannot be replaced or deleted on Windows while it is memory
-//! mapped, which is why manifests and tombstones are read into memory and
-//! unmapped before anything replaces them.
+//! On Windows the rename is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING
+//! | MOVEFILE_WRITE_THROUGH` (see [`rename`]), which replaces the target
+//! atomically and returns once the change is on disk; there is no way to
+//! open a directory for fsync there, so [`sync_dir`] is a no-op. The file
+//! itself is flushed with `sync_all` (`FlushFileBuffers`) before the
+//! rename. A file that is memory mapped may not be replaceable on
+//! Windows, which is why manifests and tombstones are copied out of their
+//! maps and unmapped before anything replaces them.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -39,6 +40,47 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
   #[cfg(not(unix))]
   let _ = dir;
   Ok(())
+}
+
+/// Renames `from` to `to`, replacing `to` atomically if it exists.
+///
+/// On Windows this is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and
+/// `MOVEFILE_WRITE_THROUGH`, so the call returns only once the rename is
+/// on disk (there is no directory fsync there). Elsewhere it is
+/// [`std::fs::rename`]; follow it with [`sync_dir`].
+pub fn rename(from: &Path, to: &Path) -> Result<()> {
+  #[cfg(windows)]
+  {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+      MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let wide = |p: &Path| -> Vec<u16> {
+      p.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+    };
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: both arguments are NUL-terminated UTF-16 strings that live
+    // until the call returns; MoveFileExW does not keep them.
+    let ok = unsafe {
+      MoveFileExW(
+        f.as_ptr(),
+        t.as_ptr(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+      )
+    };
+    if ok == 0 {
+      return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+  }
+  #[cfg(not(windows))]
+  {
+    std::fs::rename(from, to)?;
+    Ok(())
+  }
 }
 
 /// The directory a path lives in; `.` for a bare file name.
@@ -91,7 +133,7 @@ where
   file.sync_all()?;
   let len = file.metadata()?.len();
   drop(file);
-  std::fs::rename(&tmp, path)?;
+  rename(&tmp, path)?;
   guard.0 = None;
   sync_dir(parent_dir(path))?;
   Ok(len)

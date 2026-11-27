@@ -124,6 +124,10 @@ pub(crate) fn scan_records<E>(
   let mut lsn = first_lsn;
   let mut stop = None;
   while off < bytes.len() && lsn <= max_lsn {
+    if lsn > super::MAX_LSN {
+      stop = Some(format!("record at offset {off} is past the LSN limit"));
+      break;
+    }
     let rest = &bytes[off..];
     if rest.len() < RECORD_HEADER_LEN {
       stop = Some(format!("incomplete record header at offset {off}"));

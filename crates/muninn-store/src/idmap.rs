@@ -45,9 +45,6 @@ pub const IDMAP_KIND: [u8; 8] = tag("idmap");
 /// Current id-map format version.
 pub const IDMAP_VERSION: u32 = 1;
 
-/// Hash seed written into new files. Fixed so that building the same map
-/// twice yields identical bytes; stored per file so it can change.
-const FILE_SEED: u64 = 0x6D75_6E69_6E6E_6964;
 const EMPTY_U64: u64 = u64::MAX;
 const EMPTY_U32: u32 = u32::MAX;
 
@@ -186,7 +183,19 @@ impl IdMap {
   }
 
   /// Writes the frozen form as an `idmap` container into `out`.
+  ///
+  /// The tables are hashed with a fresh random seed (stored in the file),
+  /// so nobody can choose ids that all collide: with a known seed,
+  /// colliding ids make building the table quadratic. Use
+  /// [`IdMap::write_to_with_seed`] for byte-identical output.
   pub fn write_to<W: Write>(&self, out: W) -> Result<W> {
+    self.write_to_with_seed(out, random_seed())
+  }
+
+  /// [`IdMap::write_to`] with a caller-chosen hash seed, for reproducible
+  /// files in tests. Production files should use a random seed, so that
+  /// ids cannot be chosen to collide.
+  pub fn write_to_with_seed<W: Write>(&self, out: W, seed: u64) -> Result<W> {
     let n = self.ids.len();
     let n_str = self
       .ids
@@ -196,7 +205,6 @@ impl IdMap {
     let n_u64 = n - n_str;
     let u64_cap = table_capacity(self.by_u64.len());
     let str_cap = table_capacity(self.by_str.len());
-    let seed = FILE_SEED;
     let mut w = ContainerWriter::new(out, IDMAP_KIND, IDMAP_VERSION)?;
     let meta: [u64; 8] = [
       n as u64,
@@ -304,6 +312,16 @@ impl IdMap {
   }
 }
 
+/// A seed from the standard library's per-process random keys, mixed
+/// with a counter so successive files differ.
+fn random_seed() -> u64 {
+  use std::hash::BuildHasher;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static N: AtomicU64 = AtomicU64::new(0);
+  std::collections::hash_map::RandomState::new()
+    .hash_one(N.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Smallest power of two holding `keys` at a load factor of at most 3/4.
 fn table_capacity(keys: usize) -> usize {
   if keys == 0 {
@@ -368,11 +386,19 @@ fn optional<T: muninn_core::Pod>(
   }
 }
 
-fn checked_cap(v: u64) -> Result<usize> {
-  let cap =
-    usize::try_from(v).map_err(|_| Error::corrupt("idmap table too large"))?;
-  if cap != 0 && !cap.is_power_of_two() {
-    return Err(Error::corrupt("idmap table capacity not a power of two"));
+/// The table capacity a writer uses for `keys` keys, checked against the
+/// stored value. Bounding it this way (keys never exceed docs, which are
+/// fewer than 2^32) keeps every size computed from it far from overflow.
+fn checked_cap(stored: u64, keys: u64, n: usize) -> Result<usize> {
+  let keys = usize::try_from(keys)
+    .ok()
+    .filter(|&k| k <= n)
+    .ok_or_else(|| Error::corrupt("idmap key count out of range"))?;
+  let cap = table_capacity(keys);
+  if stored != cap as u64 {
+    return Err(Error::corrupt(format!(
+      "idmap table capacity {stored} does not match {keys} keys"
+    )));
   }
   Ok(cap)
 }
@@ -393,15 +419,12 @@ impl FrozenIdMap {
       .filter(|&n| n < DocId::MAX as usize)
       .ok_or_else(|| Error::corrupt("idmap doc count out of range"))?;
     let (u64_keys, str_keys) = (meta[1], meta[2]);
-    let live = usize::try_from(u64_keys.saturating_add(str_keys))
-      .map_err(|_| Error::corrupt("idmap key count out of range"))?;
-    let u64_cap = checked_cap(meta[3])?;
-    let str_cap = checked_cap(meta[4])?;
-    if (u64_keys as usize) > u64_cap.saturating_mul(3) / 4 + 1
-      || (str_keys as usize) > str_cap.saturating_mul(3) / 4 + 1
-      || live > n
-    {
-      return Err(Error::corrupt("idmap key counts do not fit the tables"));
+    let u64_cap = checked_cap(meta[3], u64_keys, n)?;
+    let str_cap = checked_cap(meta[4], str_keys, n)?;
+    // Both counts are at most n < 2^32, so the sum cannot overflow.
+    let live = (u64_keys + str_keys) as usize;
+    if live > n {
+      return Err(Error::corrupt("idmap key counts exceed the doc count"));
     }
     let has_u64 = c.try_section(tag("fwd_u64")).is_some();
     let has_str = c.try_section(tag("str_off")).is_some();
@@ -585,8 +608,8 @@ mod tests {
       a.insert(format!("s{i}").into()).unwrap();
       b.insert(format!("s{i}").into()).unwrap();
     }
-    let x = a.write_to(Vec::new()).unwrap();
-    let y = b.write_to(Vec::new()).unwrap();
+    let x = a.write_to_with_seed(Vec::new(), 7).unwrap();
+    let y = b.write_to_with_seed(Vec::new(), 7).unwrap();
     assert_eq!(x, y);
   }
 

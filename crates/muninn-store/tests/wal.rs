@@ -480,3 +480,175 @@ fn replay_callback_error_aborts_open() {
   });
   assert!(matches!(r, Err(Error::InvalidArgument(_))));
 }
+
+// Regression tests from the PR #10 review.
+
+#[test]
+fn replay_handles_lsn_skips() {
+  let d = TestDir::new("wal-replay-skip");
+  {
+    let wal = Wal::open(d.path(), opts(Durability::NoSync)).unwrap();
+    for _ in 0..3 {
+      wal.append(b"x").unwrap();
+    }
+  }
+  let mut o = opts(Durability::NoSync);
+  o.min_next_lsn = 1000;
+  let wal = Wal::open(d.path(), o).unwrap();
+  wal.append(b"y").unwrap();
+  let mut got = Vec::new();
+  wal
+    .replay(1, |l, _| {
+      got.push(l);
+      Ok(())
+    })
+    .unwrap();
+  assert_eq!(got, vec![1, 2, 3, 1000]);
+}
+
+#[test]
+fn reopen_does_not_claim_durability_without_fsync() {
+  let d = TestDir::new("wal-reopen-durable");
+  {
+    let wal = Wal::open(d.path(), opts(Durability::NoSync)).unwrap();
+    for _ in 0..5 {
+      wal.append(b"x").unwrap();
+    }
+    assert_eq!(wal.durable_lsn(), 0);
+  }
+  let wal = Wal::open(d.path(), opts(Durability::SyncEachWrite)).unwrap();
+  // The tail may still be only in the page cache: reporting it durable
+  // requires an fsync during open.
+  assert_eq!(wal.durable_lsn(), 5);
+  assert!(wal.stats().syncs > 0, "{:?}", wal.stats());
+}
+
+#[test]
+fn no_sync_sync_covers_rotated_segments() {
+  let d = TestDir::new("wal-nosync-rotated");
+  let wal =
+    Wal::open(d.path(), small_segments(Durability::NoSync, 4096)).unwrap();
+  for _ in 0..100 {
+    wal.append(&[7u8; 200]).unwrap();
+  }
+  assert!(wal.segment_count() > 3);
+  let before = wal.stats();
+  assert_eq!(before.syncs, 0);
+  wal.sync().unwrap();
+  let after = wal.stats();
+  // Every segment rotated out unsynced, plus the active one, plus the
+  // directory entries of the new segments.
+  assert_eq!(after.syncs as usize, wal.segment_count(), "{after:?}");
+  assert!(after.dir_syncs > before.dir_syncs, "{after:?}");
+  assert_eq!(wal.durable_lsn(), 100);
+  // Nothing left to do on a second sync.
+  wal.sync().unwrap();
+  assert_eq!(wal.stats().syncs, after.syncs);
+}
+
+#[test]
+fn segment_named_zero_is_corrupt_not_a_panic() {
+  let d = TestDir::new("wal-seg-zero");
+  std::fs::write(d.path().join("00000000000000000000.wal"), b"garbage")
+    .unwrap();
+  let r = std::panic::catch_unwind(|| {
+    Wal::open(d.path(), opts(Durability::NoSync)).map(|_| ())
+  });
+  let r = r.expect("panicked instead of returning an error");
+  assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+}
+
+#[test]
+fn segment_named_max_lsn_is_rejected() {
+  let d = TestDir::new("wal-seg-max");
+  std::fs::write(d.path().join(format!("{}.wal", u64::MAX)), b"garbage")
+    .unwrap();
+  let r = std::panic::catch_unwind(|| {
+    let wal = Wal::open(d.path(), opts(Durability::NoSync))?;
+    wal.append(b"x").map(|_| ())
+  });
+  let r = r.expect("panicked instead of returning an error");
+  assert!(r.is_err());
+}
+
+#[test]
+fn new_wal_dir_parent_is_synced() {
+  let d = TestDir::new("wal-parent-sync");
+  // Existing directory: only the first segment's entry is synced.
+  let wal = Wal::open(d.path(), opts(Durability::NoSync)).unwrap();
+  assert_eq!(wal.stats().dir_syncs, 1);
+  drop(wal);
+  // New directory: its entry in the parent is synced too.
+  let new = d.path().join("wal");
+  let wal = Wal::open(&new, opts(Durability::NoSync)).unwrap();
+  assert_eq!(wal.stats().dir_syncs, 2);
+  drop(wal);
+  // Two new levels: each new directory's entry in its parent.
+  let nested = d.path().join("collection").join("wal");
+  let wal = Wal::open(&nested, opts(Durability::NoSync)).unwrap();
+  assert_eq!(wal.stats().dir_syncs, 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn truncate_before_keeps_segments_it_could_not_delete() {
+  use std::os::unix::fs::PermissionsExt;
+  let d = TestDir::new("wal-trunc-fail");
+  let wal =
+    Wal::open(d.path(), small_segments(Durability::NoSync, 1000)).unwrap();
+  for i in 1..=50u64 {
+    wal.append(&[i as u8; 92]).unwrap();
+  }
+  let before = wal.segment_count();
+  std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o555))
+    .unwrap();
+  let r = wal.truncate_before(Lsn::MAX);
+  std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755))
+    .unwrap();
+  assert!(r.is_err());
+  // The log still knows every file that is still on disk.
+  assert_eq!(wal.segment_count(), segment_files(d.path()).len());
+  assert_eq!(wal.segment_count(), before);
+  assert_eq!(wal.replay(1, |_, _| Ok(())).unwrap(), 50);
+  // And a retry works.
+  assert_eq!(wal.truncate_before(Lsn::MAX).unwrap(), before - 1);
+}
+
+#[test]
+fn sync_batch_zero_delay_acts_as_sync_each_write() {
+  let d = TestDir::new("wal-batch-zero");
+  let wal = Wal::open(
+    d.path(),
+    opts(Durability::SyncBatch {
+      max_delay: Duration::ZERO,
+    }),
+  )
+  .unwrap();
+  for i in 0..200u64 {
+    let lsn = wal.append(&payload(i)).unwrap();
+    assert!(wal.durable_lsn() >= lsn, "record {lsn} not durable");
+  }
+}
+
+#[test]
+fn open_and_recover_agree_on_mid_log_corruption() {
+  let d = TestDir::new("wal-open-agree");
+  let o = small_segments(Durability::NoSync, 600);
+  {
+    let wal = Wal::open(d.path(), o.clone()).unwrap();
+    for i in 1..=30u64 {
+      wal.append(&[i as u8; 92]).unwrap();
+    }
+  }
+  let segs = segment_files(d.path());
+  let mut b = std::fs::read(&segs[0]).unwrap();
+  b[32 + 8 + 5] ^= 1; // first record
+  std::fs::write(&segs[0], &b).unwrap();
+  let lsn = {
+    let wal = Wal::open(d.path(), o.clone()).unwrap();
+    wal.append(b"after open").unwrap()
+  };
+  // Whatever open() decided, recovery must keep what was appended after.
+  let (_, got, _) = recover_all(d.path(), o, 1);
+  assert_eq!(got.last().unwrap(), &(lsn, b"after open".to_vec()));
+}
