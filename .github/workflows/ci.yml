@@ -14,8 +14,18 @@ jobs:
       fail-fast: false
       matrix:
         # x86-64 Linux and Windows, AArch64 macOS (NEON paths).
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # `require_isa` makes the muninn-simd tests fail if that SIMD path
+        # is unavailable, so a job can never pass by testing scalar only.
+        include:
+          - os: ubuntu-latest
+            require_isa: avx2
+          - os: windows-latest
+            require_isa: avx2
+          - os: macos-latest
+            require_isa: neon
     runs-on: ${{ matrix.os }}
+    env:
+      MUNINN_TEST_REQUIRE_ISA: ${{ matrix.require_isa }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.0
