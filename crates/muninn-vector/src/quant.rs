@@ -73,8 +73,8 @@ impl Quantization {
   pub fn default_rerank(self, k: usize) -> usize {
     match self {
       Self::None => k,
-      Self::Sq8 => 4 * k,
-      Self::Binary => 16 * k,
+      Self::Sq8 => k.saturating_mul(4),
+      Self::Binary => k.saturating_mul(16),
     }
   }
 }
@@ -146,7 +146,11 @@ impl Quantizer {
     metric: Metric,
     data: &[f32],
   ) -> Option<Self> {
-    let n = data.len().checked_div(dim).unwrap_or(0);
+    if dim == 0 {
+      // Nothing to encode; a zero-dimensional index scans exactly.
+      return None;
+    }
+    let n = data.len() / dim;
     let mut q = match kind {
       Quantization::None => return None,
       Quantization::Sq8 => {
@@ -161,7 +165,10 @@ impl Quantizer {
         let step: Vec<f32> = lo
           .iter()
           .zip(&hi)
-          .map(|(&l, &h)| if h > l { (h - l) / 255.0 } else { 0.0 })
+          // `h / 255 - l / 255` rather than `(h - l) / 255`: the
+          // difference of two finite floats can overflow to infinity,
+          // and an infinite step turns `inf * 0` into NaN.
+          .map(|(&l, &h)| if h > l { h / 255.0 - l / 255.0 } else { 0.0 })
           .collect();
         let lo = lo
           .into_iter()
@@ -278,7 +285,7 @@ impl Quantizer {
     data: &[f32],
     trained_on: usize,
   ) -> usize {
-    let n = data.len() / dim;
+    let n = data.len().checked_div(dim).unwrap_or(0);
     if trained_on < RETRAIN_BELOW && n >= 2 * trained_on.max(1) {
       if let Some(q) = Self::train(self.kind(), dim, metric, data) {
         *self = q;
@@ -363,6 +370,9 @@ impl Quantizer {
           row_bytes: b.words * 8,
           lut,
           base: *base,
+          // Byte `j` of a little-endian `u64` row holds bits 8j..8j+8,
+          // which the table layout relies on; muninn-core refuses to
+          // compile for big-endian targets.
           bytes: muninn_core::as_bytes(b.bits.as_slice()),
         })
       }
@@ -555,6 +565,26 @@ pub(crate) fn dot_f32_u8(w: &[f32], c: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Review item 7: a dimension spanning more than `f32::MAX` must still
+  /// get a finite step (an infinite one turns `inf * 0` into NaN).
+  #[test]
+  fn sq8_step_is_finite_for_huge_ranges() {
+    let data = [-f32::MAX, 1.0, f32::MAX, 2.0, 0.0, 3.0];
+    let qz =
+      Quantizer::train(Quantization::Sq8, 2, Metric::L2, &data).expect("sq8");
+    let Quantizer::Sq8(s) = &qz else {
+      unreachable!()
+    };
+    assert!(s.step.as_slice().iter().all(|d| d.is_finite()), "{s:?}");
+    assert!(s.sq.as_slice().iter().all(|x| !x.is_nan()));
+    // The middle row decodes near zero in the huge dimension (decoded in
+    // f64: `step * code` alone exceeds f32 there).
+    let c = s.codes.as_slice()[4] as f64;
+    let step = s.step.as_slice()[0] as f64;
+    let deq = s.min.as_slice()[0] as f64 + step * c;
+    assert!(deq.abs() <= step, "{deq} {step}");
+  }
 
   fn rows(n: usize, dim: usize) -> Vec<f32> {
     (0..n * dim)

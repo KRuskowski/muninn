@@ -33,6 +33,44 @@ impl Builder<'_> {
     muninn_simd::distance(self.metric, self.row(a), self.row(b))
   }
 
+  /// Writes the new node `q`'s list at `level`: `selected` merged with
+  /// any back-links other threads added meanwhile (they can reach `q` as
+  /// a search entry from the level above before `q`'s own insert gets
+  /// here), re-pruned with the heuristic if the union overflows. A plain
+  /// overwrite would silently drop those edges.
+  fn set_merged(&self, q: DocId, level: usize, selected: &[DocId]) {
+    let _g = self.view.lock(q);
+    let Some((rec, cap)) = self.view.record(q, level) else {
+      return;
+    };
+    let mut ids = Vec::with_capacity(cap + selected.len());
+    read_record(rec, cap, self.data.len() / self.dim, &mut ids);
+    if ids.is_empty() {
+      write_record(rec, cap, selected);
+      return;
+    }
+    for &s in selected {
+      if !ids.contains(&s) {
+        ids.push(s);
+      }
+    }
+    if ids.len() <= cap {
+      write_record(rec, cap, &ids);
+      return;
+    }
+    let mut cands: Vec<(DocId, f32)> =
+      ids.iter().map(|&x| (x, self.d(q, x))).collect();
+    cands.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut keep = Vec::with_capacity(cap);
+    self.select(&cands, cap, &mut keep);
+    write_record(rec, cap, &keep);
+  }
+
+  /// Whether `q` is the current entry point.
+  pub(crate) fn is_entry(&self, q: DocId) -> bool {
+    self.entry.lock().unwrap_or_else(|e| e.into_inner()).0 == q
+  }
+
   /// Links node `q` (already stored, with its level assigned and empty
   /// records) into the graph.
   pub(crate) fn insert(&self, q: DocId) {
@@ -70,7 +108,7 @@ impl Builder<'_> {
       let mut w = found.top.into_sorted_vec();
       w.retain(|&(id, _)| id != q);
       self.select(&w, self.view.m, &mut selected);
-      self.view.set(q, lc, &selected);
+      self.set_merged(q, lc, &selected);
       for &e in &selected {
         self.connect(e, q, lc);
       }
@@ -117,13 +155,13 @@ impl Builder<'_> {
 
   /// Adds the back-link `e -> q` at `level`, re-pruning `e`'s list with
   /// the heuristic when it is full.
-  fn connect(&self, e: DocId, q: DocId, level: usize) {
+  pub(crate) fn connect(&self, e: DocId, q: DocId, level: usize) {
     let _g = self.view.lock(e);
     let Some((rec, cap)) = self.view.record(e, level) else {
       return;
     };
     let mut ids = Vec::with_capacity(cap + 1);
-    read_record(rec, cap, &mut ids);
+    read_record(rec, cap, self.data.len() / self.dim, &mut ids);
     if ids.contains(&q) {
       return;
     }

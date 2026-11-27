@@ -255,29 +255,32 @@ impl VectorIndex for FlatIndex {
     filter: Option<&dyn DocFilter>,
   ) -> Result<Vec<Hit>> {
     check_dim(self.dim, query)?;
-    if params.k == 0 || self.is_empty() {
+    // No search can return more than every vector: clamping keeps absurd
+    // `k`/`rerank` values from sizing allocations.
+    let n = self.len();
+    let k = params.k.min(n);
+    if k == 0 {
       return Ok(Vec::new());
     }
     let q = prepare_query(self.metric, query);
     let data = self.data.as_slice();
     let top = match &self.quant {
-      None => exact_search(self.metric, self.dim, data, &q, params.k, filter),
+      None => exact_search(self.metric, self.dim, data, &q, k, filter),
       Some(qz) => {
         let r = match params.rerank {
-          0 => qz.kind().default_rerank(params.k),
+          0 => qz.kind().default_rerank(k),
           r => r,
         }
-        .max(params.k);
+        .clamp(k, n);
         let qc = qz.prepare(self.metric, &q);
         let cd = qz.dist(&qc);
-        let n = self.len();
         let cands = with_code_dist!(cd, |d| {
           par_scan(n, r, n * self.dim / 4, |range, top| {
             scan_dist(&d, range, filter, top)
           })
         });
         let ids = cands.iter().map(|(id, _)| id);
-        rerank(self.metric, self.dim, data, &q, ids, params.k)
+        rerank(self.metric, self.dim, data, &q, ids, k)
       }
     };
     Ok(top.into_hits(self.metric))
