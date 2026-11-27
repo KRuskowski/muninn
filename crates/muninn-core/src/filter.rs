@@ -140,10 +140,10 @@ impl BitSet {
 
   fn clear_tail(&mut self) {
     let rem = self.len % 64;
-    if rem != 0 {
-      if let Some(last) = self.words.last_mut() {
-        *last &= (1u64 << rem) - 1;
-      }
+    if rem != 0
+      && let Some(last) = self.words.last_mut()
+    {
+      *last &= (1u64 << rem) - 1;
     }
   }
 }
@@ -203,7 +203,7 @@ mod tests {
 
   #[test]
   fn closures_are_filters() {
-    let even = |id: DocId| id % 2 == 0;
+    let even = |id: DocId| id.is_multiple_of(2);
     assert!(even.matches(4) && !even.matches(5));
   }
 }

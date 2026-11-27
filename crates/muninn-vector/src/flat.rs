@@ -209,7 +209,7 @@ pub(crate) fn check_rows(dim: usize, vectors: &[f32]) -> Result<usize> {
       })
     };
   }
-  if vectors.len() % dim != 0 {
+  if !vectors.len().is_multiple_of(dim) {
     return Err(Error::DimensionMismatch {
       expected: dim,
       got: vectors.len() % dim,

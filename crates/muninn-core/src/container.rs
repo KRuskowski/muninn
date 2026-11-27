@@ -198,6 +198,9 @@ impl Container {
     let kind: [u8; 8] = b[8..16].try_into().unwrap();
     let version = region.read::<u32>(16)?.to_le();
     let foot = n - FOOTER_LEN;
+    if b[foot + 16..n - 8].iter().any(|&x| x != 0) {
+      return Err(Error::corrupt("footer padding is not zero"));
+    }
     let table_offset = u64::from_le(region.read::<u64>(foot)?) as usize;
     let count = u32::from_le(region.read::<u32>(foot + 8)?) as usize;
     let crc = u32::from_le(region.read::<u32>(foot + 12)?);
@@ -218,7 +221,7 @@ impl Container {
         .ok_or_else(|| {
           Error::corrupt(format!("section {} out of bounds", tag_str(&tag)))
         })?;
-      if off % ALIGN != 0 {
+      if !off.is_multiple_of(ALIGN) {
         return Err(Error::corrupt("misaligned section"));
       }
       sections.push((tag, region.slice(off..end)?));
@@ -338,6 +341,12 @@ mod tests {
     bad.as_mut_slice()[70] ^= 1;
     let c = Container::open(Region::new(bad)).unwrap();
     assert!(c.verify_checksum().is_err());
+    // The footer is outside the checksum, so its padding is checked on
+    // open instead.
+    let mut pad = buf.clone();
+    let at = pad.len() - 30;
+    pad.as_mut_slice()[at] = 1;
+    assert!(Container::open(Region::new(pad)).is_err());
     let truncated = Region::copy_from(&buf.as_slice()[..buf.len() - 1]);
     assert!(Container::open(truncated).is_err());
   }
