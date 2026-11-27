@@ -7,8 +7,11 @@
 //!
 //! Mapped files must not be modified or truncated while mapped. muninn
 //! never does that: files are written once under a temporary name and
-//! renamed into place (see [`crate::fs`]), and are only ever deleted,
-//! which leaves existing maps valid.
+//! renamed into place (see [`crate::fs`]), and are only ever deleted.
+//! On Unix, deleting a mapped file leaves existing maps valid. On Windows
+//! a mapped file cannot be deleted or replaced until every map of it is
+//! dropped; [`crate::ManifestStore::gc`] leaves such files for a later
+//! run.
 
 use std::fs::File;
 use std::path::Path;
@@ -16,7 +19,8 @@ use std::path::Path;
 use memmap2::Mmap;
 use muninn_core::{AlignedBuf, Error, Region, Result};
 
-/// Access-pattern hints for mapped regions, passed to `madvise`.
+/// Access-pattern hints for mapped regions, passed to `madvise` on Unix
+/// and ignored elsewhere.
 ///
 /// Only non-destructive hints are offered, so advising any region (even
 /// one backed by heap memory rather than a map) never changes its bytes.
@@ -33,6 +37,7 @@ pub enum Advice {
   WillNeed,
 }
 
+#[cfg(unix)]
 impl Advice {
   fn to_libc(self) -> libc::c_int {
     match self {
@@ -89,7 +94,21 @@ pub fn map_file_with(path: &Path, advice: Advice) -> Result<Region> {
 ///
 /// Works on any sub-region (for example one container section). The range
 /// is widened to whole pages, which is harmless because every hint offered
-/// is non-destructive. Empty regions are a no-op.
+/// is non-destructive. Empty regions, and every region on non-Unix
+/// platforms, are a no-op.
+#[cfg(not(unix))]
+pub fn advise(region: &Region, advice: Advice) -> Result<()> {
+  let _ = (region, advice);
+  Ok(())
+}
+
+/// Gives the kernel an access-pattern hint for the pages under `region`.
+///
+/// Works on any sub-region (for example one container section). The range
+/// is widened to whole pages, which is harmless because every hint offered
+/// is non-destructive. Empty regions, and every region on non-Unix
+/// platforms, are a no-op.
+#[cfg(unix)]
 pub fn advise(region: &Region, advice: Advice) -> Result<()> {
   let bytes = region.bytes();
   if bytes.is_empty() {
@@ -111,6 +130,7 @@ pub fn advise(region: &Region, advice: Advice) -> Result<()> {
   Ok(())
 }
 
+#[cfg(unix)]
 fn page_size() -> usize {
   // SAFETY: sysconf has no preconditions and only reads system state.
   let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

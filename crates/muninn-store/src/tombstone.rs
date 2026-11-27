@@ -126,10 +126,10 @@ pub fn latest_tombstones(
   let mut found: Vec<(u64, String)> = Vec::new();
   for e in std::fs::read_dir(dir)? {
     let name = e?.file_name();
-    if let Some(name) = name.to_str() {
-      if let Some(v) = parse_name(name, segment_id) {
-        found.push((v, name.to_string()));
-      }
+    if let Some(name) = name.to_str()
+      && let Some(v) = parse_name(name, segment_id)
+    {
+      found.push((v, name.to_string()));
     }
   }
   found.sort_unstable_by(|a, b| b.cmp(a));

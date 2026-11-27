@@ -521,22 +521,22 @@ impl Wal {
             break;
           }
         };
-        if let Some(pe) = prev_end {
-          if header.prev_lsn != pe {
-            // The previous segment lost records this one follows.
-            report.truncated = Some(Truncation {
-              segment: segs[i - 1].path.clone(),
-              offset: good.unwrap().1,
-              dropped_bytes: 0,
-              reason: format!(
-                "{} continues from LSN {}, but the log ends at {pe}",
-                seg.path.display(),
-                header.prev_lsn
-              ),
-            });
-            cut_after = Some(i - 1);
-            break;
-          }
+        if let Some(pe) = prev_end
+          && header.prev_lsn != pe
+        {
+          // The previous segment lost records this one follows.
+          report.truncated = Some(Truncation {
+            segment: segs[i - 1].path.clone(),
+            offset: good.unwrap().1,
+            dropped_bytes: 0,
+            reason: format!(
+              "{} continues from LSN {}, but the log ends at {pe}",
+              seg.path.display(),
+              header.prev_lsn
+            ),
+          });
+          cut_after = Some(i - 1);
+          break;
         }
         let end = scan_records(bytes, seg.first_lsn, Lsn::MAX, |lsn, p| {
           if lsn >= from {

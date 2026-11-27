@@ -6,6 +6,14 @@
 //! any point leaves either the old file or the complete new one under the
 //! final name, never a mix; at worst a stray `*.tmp` file remains, which
 //! [`crate::ManifestStore::gc`] removes.
+//!
+//! On Windows, [`std::fs::rename`] replaces the target atomically
+//! (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`) and NTFS journals the
+//! directory change itself, so there is no directory fsync step (and no
+//! way to open a directory for one); [`sync_dir`] is a no-op there. A
+//! file cannot be replaced or deleted on Windows while it is memory
+//! mapped, which is why manifests and tombstones are read into memory and
+//! unmapped before anything replaces them.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -24,9 +32,12 @@ pub const TEMP_SUFFIX: &str = ".tmp";
 const WRITE_BUF: usize = 1 << 20;
 
 /// Fsyncs a directory so that entries created, renamed or removed in it
-/// survive a crash.
+/// survive a crash. A no-op on non-Unix platforms (see module docs).
 pub fn sync_dir(dir: &Path) -> Result<()> {
+  #[cfg(unix)]
   File::open(dir)?.sync_all()?;
+  #[cfg(not(unix))]
+  let _ = dir;
   Ok(())
 }
 

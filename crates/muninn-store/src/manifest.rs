@@ -177,6 +177,12 @@ impl Manifest {
   }
 }
 
+/// True for errors meaning "another handle or map still uses the file",
+/// which only Windows reports on delete.
+fn in_use(e: &std::io::Error) -> bool {
+  cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
 /// Reads one manifest file and checks it is the generation its name says.
 fn read_manifest(path: &Path, generation: u64) -> Result<Manifest> {
   let m = Manifest::decode(map_file(path)?)?;
@@ -280,6 +286,11 @@ impl ManifestStore {
   /// Call this from the thread that commits manifests, never while a
   /// segment is being written: a segment file published but not yet named
   /// by a committed manifest is, by definition, unreferenced.
+  ///
+  /// On Windows, a file that is still memory mapped (for example by a
+  /// reader holding an old snapshot) cannot be deleted; with `delete`,
+  /// such files are left in place, omitted from the result, and collected
+  /// by a later call.
   pub fn gc(&self, delete: bool) -> Result<Vec<PathBuf>> {
     let referenced: HashSet<&str> = self
       .retained
@@ -309,14 +320,17 @@ impl ManifestStore {
     }
     garbage.sort();
     if delete && !garbage.is_empty() {
-      for p in &garbage {
-        match std::fs::remove_file(p) {
-          Ok(()) => {}
+      let mut removed = Vec::with_capacity(garbage.len());
+      for p in garbage {
+        match std::fs::remove_file(&p) {
+          Ok(()) => removed.push(p),
           Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+          Err(e) if in_use(&e) => {}
           Err(e) => return Err(e.into()),
         }
       }
       sync_dir(&self.dir)?;
+      return Ok(removed);
     }
     Ok(garbage)
   }

@@ -3,16 +3,19 @@ name = "muninn-store"
 description = "Durable storage for muninn: WAL, memory-mapped segments, payloads."
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# std File::try_lock (DirLock) needs 1.89.
+rust-version = "1.89"
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
 muninn-core.workspace = true
-libc = "0.2"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = [

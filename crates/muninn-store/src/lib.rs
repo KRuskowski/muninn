@@ -16,11 +16,11 @@
 //! <dir>/seg-<id>.<version>.tomb    tombstones
 //! ```
 //!
-//! The durability primitives (directory fsync, `flock`, `madvise`) are
-//! implemented for Unix only.
-
-#[cfg(not(unix))]
-compile_error!("muninn-store currently supports Unix targets only");
+//! Portable to Unix and Windows. Platform differences: directory fsync
+//! and `madvise` hints exist on Unix only and are no-ops elsewhere (see
+//! [`fs`] and [`advise`]); on Windows a memory-mapped file cannot be
+//! deleted until it is unmapped, so [`ManifestStore::gc`] skips files that
+//! are still in use there.
 
 pub mod fs;
 mod hash;

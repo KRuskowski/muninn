@@ -450,6 +450,8 @@ fn lock_contention_returns_an_error() {
   }
   let msg = err.to_string();
   assert!(msg.contains("already open"), "{msg}");
+  // Other handles can read a locked file only where locks are advisory.
+  #[cfg(unix)]
   assert!(msg.contains(&std::process::id().to_string()), "{msg}");
   // Released on drop.
   drop(first);
@@ -469,7 +471,7 @@ fn lock_contention_across_threads() {
 }
 
 #[test]
-fn map_file_handles_empty_files_and_outlives_unlink() {
+fn map_file_handles_empty_files_and_slices_outlive_the_region() {
   let d = TestDir::new("mmap");
   let empty = d.path().join("empty");
   std::fs::write(&empty, b"").unwrap();
@@ -483,10 +485,21 @@ fn map_file_handles_empty_files_and_outlives_unlink() {
   let r = map_file_with(&p, Advice::WillNeed).unwrap();
   let tail = r.slice(5000..10_000).unwrap();
   drop(r);
+  // The slice keeps the map alive after the region is gone and, on Unix,
+  // after the file is deleted. Windows refuses to delete a mapped file.
+  #[cfg(unix)]
   std::fs::remove_file(&p).unwrap();
-  // The slice keeps the map alive after the region and the file are gone.
+  #[cfg(windows)]
+  assert!(std::fs::remove_file(&p).is_err());
   assert_eq!(tail.bytes(), &data[5000..]);
   muninn_store::advise(&tail, Advice::Sequential).unwrap();
+  drop(tail);
+  // Unmapped, the file can be replaced and deleted on every platform.
+  #[cfg(windows)]
+  {
+    write_atomic(&p, b"replaced").unwrap();
+    std::fs::remove_file(&p).unwrap();
+  }
 }
 
 #[test]
