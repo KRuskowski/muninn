@@ -1,0 +1,7 @@
+# Competitor engines and dataset tooling for the benchmark harness.
+# Pinned so that reruns compare against the same versions.
+numpy==2.4.6
+h5py==3.16.0
+hnswlib==0.8.0
+faiss-cpu==1.16.0
+usearch==2.26.6
