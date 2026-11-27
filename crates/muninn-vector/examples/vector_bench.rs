@@ -119,6 +119,11 @@ fn run(
   f: Option<&dyn DocFilter>,
 ) -> (Vec<Vec<Hit>>, f64, f64) {
   let qs: Vec<&[f32]> = queries.chunks_exact(dim).collect();
+  // Untimed warm-up so every configuration starts with the same cache
+  // state (otherwise whichever runs first after a flat scan looks slow).
+  qs.par_iter().for_each(|q| {
+    idx.search(q, &p, f).unwrap();
+  });
   let t = Instant::now();
   let res: Vec<Vec<Hit>> =
     qs.iter().map(|q| idx.search(q, &p, f).unwrap()).collect();

@@ -543,10 +543,10 @@ impl HnswIndex {
     dist: &D,
     ef: usize,
     filter: Option<&dyn DocFilter>,
+    adaptive: bool,
   ) -> Beam {
     let g = self.view();
-    let auto = self.params.filter == FilterStrategy::Auto;
-    let abort = filter.filter(|_| auto).map(|_| Abort {
+    let abort = adaptive.then_some(Abort {
       n: self.len(),
       ef,
       min_visits: ABORT_MIN_VISITS,
@@ -591,13 +591,20 @@ impl VectorIndex for HnswIndex {
       ef => ef,
     }
     .max(k);
+    // With a selectivity hint, Auto decides up front; without one it
+    // judges the filter from the pass rate seen during traversal.
+    let mut adaptive = false;
     if let Some(f) = filter {
       let exact = match self.params.filter {
         FilterStrategy::Exact => true,
         FilterStrategy::Graph => false,
-        FilterStrategy::Auto => f
-          .selectivity_hint()
-          .is_some_and(|s| prefer_exact(self.len(), s, ef)),
+        FilterStrategy::Auto => match f.selectivity_hint() {
+          Some(s) => prefer_exact(self.len(), s, ef),
+          None => {
+            adaptive = true;
+            false
+          }
+        },
       };
       if exact {
         return Ok(self.exact(&q, k, filter).into_hits(self.metric));
@@ -612,7 +619,7 @@ impl VectorIndex for HnswIndex {
           query: &q,
           data,
         };
-        let b = self.graph_search(&dist, ef, filter);
+        let b = self.graph_search(&dist, ef, filter, adaptive);
         if b.aborted || b.top.len() < k {
           self.exact(&q, k, filter)
         } else {
@@ -631,7 +638,7 @@ impl VectorIndex for HnswIndex {
         .max(k);
         let qc = qz.prepare(self.metric, &q);
         let b = with_code_dist!(qz.dist(&qc), |d| {
-          self.graph_search(&d, ef.max(r), filter)
+          self.graph_search(&d, ef.max(r), filter, adaptive)
         });
         if b.aborted || b.top.len() < k {
           self.exact(&q, k, filter)

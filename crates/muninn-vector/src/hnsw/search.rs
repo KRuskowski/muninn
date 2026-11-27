@@ -145,6 +145,12 @@ pub(crate) fn prefer_exact(n: usize, s: f32, ef: usize) -> bool {
 /// Stop rule for filtered graph search without a selectivity hint: once
 /// `min_visits` nodes were scored, estimate the selectivity from how many
 /// passed and give up on the graph if [`prefer_exact`] says so.
+///
+/// The estimate is pessimistic (about two standard deviations above the
+/// observed pass rate). The rule is re-checked after every expansion, so
+/// with the raw rate, sampling noise near the crossover sent a few
+/// percent of queries to a needless exact scan (measured: 10% slower at
+/// 10% selectivity than graph-only search).
 #[derive(Clone, Copy)]
 pub(crate) struct Abort {
   pub n: usize,
@@ -221,7 +227,8 @@ pub(crate) fn beam<G: Neighbors, D: Dist>(
       }
     }
     if let Some(a) = abort {
-      let s = passes as f32 / visits as f32;
+      let p = passes as f32;
+      let s = (p + 2.0 * p.sqrt() + 1.0) / visits as f32;
       if visits >= a.min_visits && prefer_exact(a.n, s, a.ef) {
         return Beam { top, aborted: true };
       }
