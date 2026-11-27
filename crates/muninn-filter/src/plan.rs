@@ -376,7 +376,8 @@ fn int_lower_of_f64(f: f64, excl: bool) -> Option<i64> {
   if c >= TWO_POW_63 {
     return None;
   }
-  if c < -TWO_POW_63 {
+  // -2^63 as a float is below every integer (see `exact_i64`).
+  if c <= -TWO_POW_63 {
     return Some(i64::MIN);
   }
   let i = c as i64;
@@ -390,7 +391,8 @@ fn int_lower_of_f64(f: f64, excl: bool) -> Option<i64> {
 /// Largest integer satisfying `x < f` (`excl`) or `x <= f`, if any.
 fn int_upper_of_f64(f: f64, excl: bool) -> Option<i64> {
   let c = f.floor();
-  if c < -TWO_POW_63 {
+  // -2^63 as a float is below every integer (see `exact_i64`).
+  if c <= -TWO_POW_63 {
     return None;
   }
   if c >= TWO_POW_63 {

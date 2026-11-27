@@ -241,3 +241,39 @@ fn and_short_circuits_and_is_ordered_by_selectivity() {
   let f = Filter::eq("k", "a") | Filter::eq("i", 5);
   assert_eq!(hits(&ix, &f).len(), 1000);
 }
+
+#[test]
+fn numbers_below_i64_min_are_out_of_range() {
+  // serde_json parses integers below i64::MIN as floats, which round to
+  // exactly -2^63; they must not alias i64::MIN.
+  let docs: Vec<Json> = [
+    r#"{"i": -9223372036854775808}"#,
+    r#"{"i": -9223372036854775809}"#,
+    r#"{"i": -9223372036854776000}"#,
+    r#"{"i": -9223372036854775807}"#,
+  ]
+  .iter()
+  .map(|t| serde_json::from_str(t).unwrap())
+  .collect();
+  let ix = indexes(&docs);
+  assert_eq!(hits(&ix, &Filter::exists("i")), [0, 3]);
+  assert_eq!(hits(&ix, &Filter::eq("i", i64::MIN)), [0]);
+  let q = |t: &str| Filter::parse(t).unwrap();
+  let below = "-9223372036854775809";
+  assert!(hits(&ix, &q(&format!(r#"{{"eq":{{"i":{below}}}}}"#))).is_empty());
+  assert!(
+    hits(
+      &ix,
+      &q(&format!(r#"{{"range":{{"i":{{"lte":{below}}}}}}}"#))
+    )
+    .is_empty()
+  );
+  assert!(
+    hits(&ix, &q(&format!(r#"{{"range":{{"i":{{"lt":{below}}}}}}}"#)))
+      .is_empty()
+  );
+  for op in ["gt", "gte"] {
+    let t = format!(r#"{{"range":{{"i":{{"{op}":{below}}}}}}}"#);
+    assert_eq!(hits(&ix, &q(&t)), [0, 3], "{t}");
+  }
+}

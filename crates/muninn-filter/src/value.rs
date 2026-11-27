@@ -107,11 +107,17 @@ pub(crate) fn norm_f64(f: f64) -> f64 {
   if f == 0.0 { 0.0 } else { f }
 }
 
-/// The whole number `f` as an `i64`, if `f` is one and fits.
+/// The whole number `f` as an `i64`, if `f` is one and lies strictly
+/// between -2^63 and 2^63.
+///
+/// -2^63 itself is excluded although it equals `i64::MIN`: JSON integers
+/// below `i64::MIN` are parsed as floats and round to exactly -2^63, so
+/// as a float it stands for "below every integer", just as 2^63 stands
+/// for "above every integer". `i64::MIN` written as a JSON integer is
+/// parsed as an integer and is unaffected.
 #[inline]
 pub(crate) fn exact_i64(f: f64) -> Option<i64> {
-  (f.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&f))
-    .then_some(f as i64)
+  (f.fract() == 0.0 && f > -TWO_POW_63 && f < TWO_POW_63).then_some(f as i64)
 }
 
 /// The integer value of a JSON number, if it is a whole number that fits
@@ -219,7 +225,17 @@ mod tests {
     assert_eq!(exact_i64(-0.0), Some(0));
     assert_eq!(exact_i64(3.5), None);
     assert_eq!(exact_i64(TWO_POW_63), None);
-    assert_eq!(exact_i64(-TWO_POW_63), Some(i64::MIN));
+    assert_eq!(exact_i64(-TWO_POW_63), None);
+    assert_eq!(
+      exact_i64(-9_223_372_036_854_774_784.0),
+      Some(i64::MIN + 1024)
+    );
+    let n: serde_json::Number =
+      serde_json::from_str("-9223372036854775809").unwrap();
+    assert_eq!(json_i64(&n), None);
+    let n: serde_json::Number =
+      serde_json::from_str("-9223372036854775808").unwrap();
+    assert_eq!(json_i64(&n), Some(i64::MIN));
     assert_eq!(exact_i64(f64::INFINITY), None);
     assert_eq!(exact_i64(f64::NAN), None);
     let n: serde_json::Number = serde_json::from_str("3e0").unwrap();

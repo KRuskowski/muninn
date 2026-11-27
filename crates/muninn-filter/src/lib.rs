@@ -36,7 +36,10 @@
 //! - **Integer fields** hold JSON numbers that are whole and fit in an
 //!   `i64` (`3`, `3.0` and `3e0` are all 3; `3.5` and `2^64` are
 //!   skipped). A float filter value compares exactly: `eq 3.0` matches 3,
-//!   `eq 3.5` matches nothing, `gt 2.5` means `>= 3`.
+//!   `eq 3.5` matches nothing, `gt 2.5` means `>= 3`. JSON integers
+//!   below `i64::MIN` arrive as floats rounded to exactly -2^63, so a
+//!   float -2^63 counts as below every integer (as 2^63 counts as above
+//!   every integer); `i64::MIN` written as an integer is unaffected.
 //! - **Float fields** hold any JSON number as an `f64` (integers above
 //!   2^53 round to the nearest float). `eq` on a float field is exact
 //!   equality after that conversion, with `-0.0 == 0.0`; use a `range`
