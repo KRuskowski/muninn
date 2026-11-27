@@ -57,6 +57,14 @@ impl Bits {
     self.clear_tail();
   }
 
+  /// ORs in raw words; bits past `len` are dropped.
+  pub(crate) fn or_words64(&mut self, words: &[u64]) {
+    for (w, o) in self.words.iter_mut().zip(words) {
+      *w |= o;
+    }
+    self.clear_tail();
+  }
+
   pub(crate) fn or_with(&mut self, other: &Bits) {
     for (w, o) in self.words.iter_mut().zip(&other.words) {
       *w |= o;

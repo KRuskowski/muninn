@@ -222,3 +222,22 @@ fn merge_of_merged_indexes() {
     assert_eq!(ids(&merged, &f, n), brute(&schema, &f, &fresh, n), "{f:?}");
   }
 }
+
+#[test]
+fn large_index_with_dense_postings_equals_brute_force() {
+  // Enough documents for memtable postings to switch to bitsets.
+  let schema = schema();
+  let mut r = Rng::new(0xD15E);
+  let docs = docs(&mut r, 6000);
+  let mem = build(&schema, &docs);
+  let frozen = freeze(&mem);
+  let max = mem.num_docs();
+  for _ in 0..150 {
+    let f = filter(&mut r, 4, false);
+    for num_docs in [max, max + 100, max / 3] {
+      let want = brute(&schema, &f, &docs, num_docs);
+      assert_eq!(ids(&mem, &f, num_docs), want, "mem {f:?} n={num_docs}");
+      assert_eq!(ids(&frozen, &f, num_docs), want, "frozen {f:?}");
+    }
+  }
+}

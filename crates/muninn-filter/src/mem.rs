@@ -113,20 +113,105 @@ fn merge_sorted(a: &[(i64, DocId)], b: &[(i64, DocId)]) -> Vec<(i64, DocId)> {
   out
 }
 
+/// Postings shorter than this always stay lists.
+const MIN_BITSET: usize = 1024;
+
+/// The docs of one term, bool value or exists set. Starts as a sorted id
+/// list and turns into a growable bitset once it holds more than one id
+/// in 32, so dense postings evaluate as a word-wise OR.
+#[derive(Debug)]
+enum Posting {
+  List(Vec<DocId>),
+  Bits { words: Vec<u64>, count: usize },
+}
+
+impl Default for Posting {
+  fn default() -> Self {
+    Self::List(Vec::new())
+  }
+}
+
+impl Posting {
+  /// Adds `doc`, which is at least every id added before.
+  fn push(&mut self, doc: DocId) {
+    let i = doc as usize;
+    match self {
+      Self::List(v) => {
+        if v.last() == Some(&doc) {
+          return;
+        }
+        v.push(doc);
+        if v.len() >= MIN_BITSET && v.len() * 32 > i + 1 {
+          let mut words = vec![0u64; (i >> 6) + 1];
+          for &d in v.iter() {
+            words[(d >> 6) as usize] |= 1 << (d & 63);
+          }
+          *self = Self::Bits {
+            words,
+            count: v.len(),
+          };
+        }
+      }
+      Self::Bits { words, count } => {
+        if words.len() <= i >> 6 {
+          words.resize((i >> 6) + 1, 0);
+        }
+        let bit = 1u64 << (i & 63);
+        if words[i >> 6] & bit == 0 {
+          words[i >> 6] |= bit;
+          *count += 1;
+        }
+      }
+    }
+  }
+
+  fn len(&self) -> usize {
+    match self {
+      Self::List(v) => v.len(),
+      Self::Bits { count, .. } => *count,
+    }
+  }
+
+  fn fill(&self, bits: &mut Bits) {
+    match self {
+      Self::List(v) => bits.set_sorted(v),
+      Self::Bits { words, .. } => bits.or_words64(words),
+    }
+  }
+
+  /// The ids, sorted.
+  fn docs(&self) -> Cow<'_, [DocId]> {
+    match self {
+      Self::List(v) => Cow::Borrowed(v),
+      Self::Bits { words, count } => {
+        let mut out = Vec::with_capacity(*count);
+        for (wi, &w) in words.iter().enumerate() {
+          let mut w = w;
+          while w != 0 {
+            out.push(wi as u32 * 64 + w.trailing_zeros());
+            w &= w - 1;
+          }
+        }
+        Cow::Owned(out)
+      }
+    }
+  }
+}
+
 #[derive(Debug)]
 enum Column {
-  /// Term to sorted, unique doc ids.
-  Keyword(HashMap<Box<str>, Vec<DocId>>),
+  /// Term to its docs.
+  Keyword(HashMap<Box<str>, Posting>),
   /// Integer values, or floats mapped through `f64_key`.
   Number(Runs),
   /// Docs holding `false` (0) and `true` (1).
-  Bool([Vec<DocId>; 2]),
+  Bool([Posting; 2]),
 }
 
 #[derive(Debug)]
 struct MemField {
   /// Docs holding at least one value of the field's type.
-  exists: Vec<DocId>,
+  exists: Posting,
   column: Column,
 }
 
@@ -150,13 +235,13 @@ impl MemIndex {
       .fields()
       .iter()
       .map(|f| MemField {
-        exists: Vec::new(),
+        exists: Posting::default(),
         column: match f.field_type() {
           FieldType::Keyword => Column::Keyword(HashMap::new()),
           FieldType::Integer | FieldType::Float => {
             Column::Number(Runs::default())
           }
-          FieldType::Bool => Column::Bool([Vec::new(), Vec::new()]),
+          FieldType::Bool => Column::Bool(Default::default()),
         },
       })
       .collect();
@@ -206,13 +291,9 @@ impl MemIndex {
           if let Scalar::Str(t) = s {
             any = true;
             match map.get_mut(t) {
-              Some(list) => {
-                if list.last() != Some(&doc) {
-                  list.push(doc);
-                }
-              }
+              Some(posting) => posting.push(doc),
               None => {
-                map.insert(t.into(), vec![doc]);
+                map.insert(t.into(), Posting::List(vec![doc]));
               }
             }
           }
@@ -275,7 +356,7 @@ impl MemIndex {
     write_index(self, out)
   }
 
-  fn keyword(&self, field: usize) -> Option<&HashMap<Box<str>, Vec<DocId>>> {
+  fn keyword(&self, field: usize) -> Option<&HashMap<Box<str>, Posting>> {
     match &self.fields[field].column {
       Column::Keyword(m) => Some(m),
       _ => None,
@@ -316,11 +397,11 @@ impl Source for MemIndex {
   fn fill(&self, field: usize, pred: &Pred, bits: &mut Bits) {
     let f = &self.fields[field];
     match (pred, &f.column) {
-      (Pred::Exists, _) => bits.set_sorted(&f.exists),
+      (Pred::Exists, _) => f.exists.fill(bits),
       (Pred::Terms(ts), Column::Keyword(m)) => {
         for t in ts {
-          if let Some(list) = m.get(*t) {
-            bits.set_sorted(list);
+          if let Some(posting) = m.get(*t) {
+            posting.fill(bits);
           }
         }
       }
@@ -341,7 +422,7 @@ impl Source for MemIndex {
       (Pred::Bools(w), Column::Bool(l)) => {
         for b in 0..2 {
           if w[b] {
-            bits.set_sorted(&l[b]);
+            l[b].fill(bits);
           }
         }
       }
@@ -360,12 +441,12 @@ impl WriteSource for MemIndex {
   }
 
   fn exists(&self, field: usize) -> Result<Cow<'_, [DocId]>> {
-    Ok(Cow::Borrowed(&self.fields[field].exists))
+    Ok(self.fields[field].exists.docs())
   }
 
   fn bools(&self, field: usize, value: bool) -> Result<Cow<'_, [DocId]>> {
     Ok(match &self.fields[field].column {
-      Column::Bool(l) => Cow::Borrowed(&l[usize::from(value)]),
+      Column::Bool(l) => l[usize::from(value)].docs(),
       _ => Cow::Borrowed(&[]),
     })
   }
@@ -374,11 +455,11 @@ impl WriteSource for MemIndex {
     let Some(map) = self.keyword(field) else {
       return Ok(());
     };
-    let mut terms: Vec<(&str, &Vec<DocId>)> =
-      map.iter().map(|(t, l)| (&**t, l)).collect();
+    let mut terms: Vec<(&str, &Posting)> =
+      map.iter().map(|(t, p)| (&**t, p)).collect();
     terms.sort_unstable_by_key(|e| e.0);
-    for (t, l) in terms {
-      visit(t.as_bytes(), l)?;
+    for (t, p) in terms {
+      visit(t.as_bytes(), &p.docs())?;
     }
     Ok(())
   }
@@ -426,6 +507,31 @@ mod tests {
       docs.dedup();
       assert_eq!(b.into_bitset().iter().collect::<Vec<_>>(), docs);
     }
+  }
+
+  #[test]
+  fn postings_turn_dense_into_bitsets() {
+    let mut p = Posting::default();
+    let mut want = Vec::new();
+    for d in (0..200_000u32).filter(|d| d % 7 == 0 || d % 1000 == 1) {
+      p.push(d);
+      p.push(d);
+      want.push(d);
+    }
+    assert!(matches!(p, Posting::Bits { .. }));
+    assert_eq!(p.len(), want.len());
+    assert_eq!(&*p.docs(), want.as_slice());
+    let mut b = Bits::new(1000);
+    p.fill(&mut b);
+    let got: Vec<u32> = b.into_bitset().iter().collect();
+    let cut: Vec<u32> = want.iter().copied().filter(|&d| d < 1000).collect();
+    assert_eq!(got, cut);
+    // Sparse postings stay lists.
+    let mut q = Posting::default();
+    for d in (0..2_000_000u32).step_by(100) {
+      q.push(d);
+    }
+    assert!(matches!(q, Posting::List(_)));
   }
 
   #[test]

@@ -171,6 +171,12 @@ fn bench(c: &mut Criterion) {
     g.bench_function(name, |b| b.iter(|| frozen.estimate(black_box(&f), N)));
   }
   g.finish();
+  // Peak resident memory, where the OS reports it (Linux).
+  if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+    for line in status.lines().filter(|l| l.starts_with("VmHWM")) {
+      eprintln!("peak memory {line}");
+    }
+  }
 }
 
 criterion_group!(benches, bench);
