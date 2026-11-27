@@ -1,0 +1,2 @@
+# Parallel workstreams each add lines under "Unreleased"; keep both sides.
+CHANGELOG.md merge=union
