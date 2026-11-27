@@ -1,0 +1,11 @@
+[package]
+name = "muninn-core"
+description = "Shared types for muninn: ids, hits, top-k, filters, errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "muninn-vector"
+description = "Approximate and exact nearest-neighbour indexes for muninn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+muninn-core.workspace = true
+muninn-simd.workspace = true
+
+[lints]
+workspace = true
