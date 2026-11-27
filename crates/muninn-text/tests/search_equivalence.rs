@@ -228,7 +228,7 @@ fn pruned_equals_exhaustive_long_queries() {
   let frozen = mem.freeze().unwrap();
   let reference = Reference::new(&analyzer, &corpus.docs);
   let mut rng = Rng::new(12);
-  let half = |id: DocId| id % 2 == 0;
+  let half = |id: DocId| id.is_multiple_of(2);
   for qi in 0..60 {
     let n = [20, 33, 40, 80][qi % 4];
     let query: Vec<String> = (0..n)

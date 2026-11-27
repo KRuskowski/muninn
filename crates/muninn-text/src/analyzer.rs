@@ -301,11 +301,9 @@ fn push_normalised(text: &mut String, c: char, fold: bool, start: usize) {
     }
     return;
   }
-  if fold {
-    if let Some(s) = fold_latin(c) {
-      text.push_str(s);
-      return;
-    }
+  if fold && let Some(s) = fold_latin(c) {
+    text.push_str(s);
+    return;
   }
   text.push(c);
 }

@@ -140,12 +140,7 @@ fn every_single_byte_corruption_is_survivable() {
         continue;
       };
       opened += 1;
-      // The container footer's reserved zero padding (bytes 16..56 of
-      // the last 64) is neither checksummed nor validated by core.
-      let footer_pad = buf.len() - 48..buf.len() - 8;
-      if !footer_pad.contains(&at) {
-        assert!(idx.verify_checksum().is_err(), "flip at {at} undetected");
-      }
+      assert!(idx.verify_checksum().is_err(), "flip at {at} undetected");
       for q in &queries {
         let _ = idx.search(q, 10, None);
         let _ = idx.search_exhaustive(q, 10, None, None);
