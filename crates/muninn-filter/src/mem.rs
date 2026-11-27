@@ -82,6 +82,53 @@ impl Runs {
     }
   }
 
+  /// Entries whose key is in `keys` (sorted, unique): per run either one
+  /// merge pass (many keys) or a narrowing binary search per key (few
+  /// keys), then one pass over the tail. Never one tail scan per key.
+  fn for_each_in_set(&self, keys: &[i64], mut f: impl FnMut(DocId)) {
+    for run in &self.runs {
+      if keys.len().saturating_mul(8) >= run.len() {
+        let (mut i, mut j) = (0, 0);
+        while i < run.len() && j < keys.len() {
+          match run[i].0.cmp(&keys[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+              f(run[i].1);
+              i += 1;
+            }
+          }
+        }
+      } else {
+        let mut lo = 0;
+        for &k in keys {
+          let rest = &run[lo..];
+          let s = rest.partition_point(|e| e.0 < k);
+          let e = rest.partition_point(|e| e.0 <= k);
+          for &(_, d) in &rest[s..e] {
+            f(d);
+          }
+          lo += e;
+        }
+      }
+    }
+    for &(k, d) in &self.tail {
+      if keys.binary_search(&k).is_ok() {
+        f(d);
+      }
+    }
+  }
+
+  fn count_in_set(&self, keys: &[i64]) -> u64 {
+    let mut n = 0;
+    self.for_each_in_set(keys, |_| n += 1);
+    n
+  }
+
+  fn fill_in_set(&self, keys: &[i64], bits: &mut Bits) {
+    self.for_each_in_set(keys, |d| bits.set(d));
+  }
+
   /// Every entry, sorted by `(key, doc)`.
   fn sorted(&self) -> Vec<(i64, DocId)> {
     let mut all: Vec<(i64, DocId)> = Vec::with_capacity(
@@ -94,6 +141,12 @@ impl Runs {
     all.sort_unstable();
     all
   }
+}
+
+/// Keys of floats sorted in total order (as `Pred::Floats` is), which
+/// come out sorted too.
+fn float_keys(vs: &[f64]) -> Vec<i64> {
+  vs.iter().map(|&v| f64_key(v)).collect()
 }
 
 fn merge_sorted(a: &[(i64, DocId)], b: &[(i64, DocId)]) -> Vec<(i64, DocId)> {
@@ -377,12 +430,8 @@ impl Source for MemIndex {
         .iter()
         .map(|t| m.get(*t).map_or(0, |l| l.len() as u64))
         .sum(),
-      (Pred::Ints(vs), Column::Number(r)) => {
-        vs.iter().map(|&v| r.count(v, v)).sum()
-      }
-      (Pred::Floats(vs), Column::Number(r)) => {
-        vs.iter().map(|&v| r.count(f64_key(v), f64_key(v))).sum()
-      }
+      (Pred::Ints(vs), Column::Number(r)) => r.count_in_set(vs),
+      (Pred::Floats(vs), Column::Number(r)) => r.count_in_set(&float_keys(vs)),
       (Pred::IntRange(lo, hi), Column::Number(r)) => r.count(*lo, *hi),
       (Pred::FloatRange(lo, hi), Column::Number(r)) => {
         r.count(f64_key(*lo), f64_key(*hi))
@@ -405,15 +454,9 @@ impl Source for MemIndex {
           }
         }
       }
-      (Pred::Ints(vs), Column::Number(r)) => {
-        for &v in vs {
-          r.fill(v, v, bits);
-        }
-      }
+      (Pred::Ints(vs), Column::Number(r)) => r.fill_in_set(vs, bits),
       (Pred::Floats(vs), Column::Number(r)) => {
-        for &v in vs {
-          r.fill(f64_key(v), f64_key(v), bits);
-        }
+        r.fill_in_set(&float_keys(vs), bits)
       }
       (Pred::IntRange(lo, hi), Column::Number(r)) => r.fill(*lo, *hi, bits),
       (Pred::FloatRange(lo, hi), Column::Number(r)) => {
@@ -493,6 +536,24 @@ mod tests {
     assert!(r.runs.len() <= 4, "{} runs", r.runs.len());
     all.sort_unstable();
     assert_eq!(r.sorted(), all);
+    for keys in [
+      vec![],
+      vec![-1000, 3, 999],
+      (-1000..1000).step_by(3).collect(),
+    ] {
+      let want: Vec<(i64, u32)> = all
+        .iter()
+        .copied()
+        .filter(|e| keys.contains(&e.0))
+        .collect();
+      assert_eq!(r.count_in_set(&keys), want.len() as u64);
+      let mut b = Bits::new(10_000);
+      r.fill_in_set(&keys, &mut b);
+      let mut docs: Vec<u32> = want.iter().map(|e| e.1).collect();
+      docs.sort_unstable();
+      docs.dedup();
+      assert_eq!(b.into_bitset().iter().collect::<Vec<_>>(), docs);
+    }
     for (lo, hi) in [(-1000, 1000), (0, 0), (-5, 17), (999, 2000)] {
       let want = all.iter().filter(|e| e.0 >= lo && e.0 <= hi).count();
       assert_eq!(r.count(lo, hi), want as u64);

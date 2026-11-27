@@ -63,7 +63,8 @@ pub(crate) fn evaluate<S: Source>(
   num_docs: usize,
 ) -> Result<BitSet> {
   let plan = compile(src.schema(), filter)?;
-  Ok(eval(src, &plan, num_docs).into_bitset())
+  let est = annotate(src, &plan, num_docs);
+  Ok(eval(src, &plan, &est, num_docs).into_bitset())
 }
 
 pub(crate) fn estimate<S: Source>(
@@ -72,31 +73,57 @@ pub(crate) fn estimate<S: Source>(
   num_docs: usize,
 ) -> f32 {
   match compile(src.schema(), filter) {
-    Ok(plan) => est(src, &plan, num_docs),
+    Ok(plan) => annotate(src, &plan, num_docs).value,
     Err(_) => 1.0,
   }
 }
 
-fn est<S: Source>(src: &S, plan: &Plan, n: usize) -> f32 {
+/// Estimated selectivity of every plan node, mirroring the plan's shape
+/// (`kids[i]` belongs to child `i`; `Not` has one kid). Computed once per
+/// evaluation, so each leaf is counted once however deep it sits.
+struct Est {
+  value: f32,
+  kids: Vec<Est>,
+}
+
+fn annotate<S: Source>(src: &S, plan: &Plan, n: usize) -> Est {
+  let leaf = |value| Est {
+    value,
+    kids: Vec::new(),
+  };
   match plan {
-    Plan::All => 1.0,
-    Plan::Empty => 0.0,
-    Plan::Leaf(f, p) => {
-      if n == 0 {
-        0.0
-      } else {
-        (src.count(*f, p) as f64 / n as f64).min(1.0) as f32
+    Plan::All => leaf(1.0),
+    Plan::Empty => leaf(0.0),
+    Plan::Leaf(f, p) => leaf(if n == 0 {
+      0.0
+    } else {
+      (src.count(*f, p) as f64 / n as f64).min(1.0) as f32
+    }),
+    Plan::And(c) => {
+      let kids: Vec<Est> = c.iter().map(|p| annotate(src, p, n)).collect();
+      Est {
+        value: kids.iter().map(|k| k.value).product(),
+        kids,
       }
     }
-    Plan::And(c) => c.iter().map(|p| est(src, p, n)).product(),
     Plan::Or(c) => {
-      1.0 - c.iter().map(|p| 1.0 - est(src, p, n)).product::<f32>()
+      let kids: Vec<Est> = c.iter().map(|p| annotate(src, p, n)).collect();
+      Est {
+        value: 1.0 - kids.iter().map(|k| 1.0 - k.value).product::<f32>(),
+        kids,
+      }
     }
-    Plan::Not(c) => 1.0 - est(src, c, n),
+    Plan::Not(c) => {
+      let kid = annotate(src, c, n);
+      Est {
+        value: 1.0 - kid.value,
+        kids: vec![kid],
+      }
+    }
   }
 }
 
-fn eval<S: Source>(src: &S, plan: &Plan, n: usize) -> Bits {
+fn eval<S: Source>(src: &S, plan: &Plan, est: &Est, n: usize) -> Bits {
   match plan {
     Plan::All => Bits::full(n),
     Plan::Empty => Bits::new(n),
@@ -106,38 +133,39 @@ fn eval<S: Source>(src: &S, plan: &Plan, n: usize) -> Bits {
       b
     }
     Plan::Not(c) => {
-      let mut b = eval(src, c, n);
+      let mut b = eval(src, c, &est.kids[0], n);
       b.negate();
       b
     }
     Plan::And(children) => {
       // Most selective first, so the running set shrinks fastest and an
       // empty intersection stops the work early.
-      let mut order: Vec<(f32, &Plan)> =
-        children.iter().map(|c| (est(src, c, n), c)).collect();
-      order.sort_by(|a, b| a.0.total_cmp(&b.0));
-      let mut acc = eval(src, order[0].1, n);
-      for &(_, child) in &order[1..] {
+      let mut order: Vec<usize> = (0..children.len()).collect();
+      order.sort_by(|&a, &b| est.kids[a].value.total_cmp(&est.kids[b].value));
+      let first = order[0];
+      let mut acc = eval(src, &children[first], &est.kids[first], n);
+      for &i in &order[1..] {
         if acc.is_empty() {
           break;
         }
-        match child {
-          Plan::Not(inner) => acc.and_not(&eval(src, inner, n)),
-          _ => acc.and_with(&eval(src, child, n)),
+        match &children[i] {
+          Plan::Not(inner) => {
+            acc.and_not(&eval(src, inner, &est.kids[i].kids[0], n))
+          }
+          child => acc.and_with(&eval(src, child, &est.kids[i], n)),
         }
       }
       acc
     }
     Plan::Or(children) => {
       // Least selective first, so a full set stops the work early.
-      let mut order: Vec<(f32, &Plan)> =
-        children.iter().map(|c| (est(src, c, n), c)).collect();
-      order.sort_by(|a, b| b.0.total_cmp(&a.0));
+      let mut order: Vec<usize> = (0..children.len()).collect();
+      order.sort_by(|&a, &b| est.kids[b].value.total_cmp(&est.kids[a].value));
       let mut acc = Bits::new(n);
-      for &(_, child) in &order {
-        match child {
+      for &i in &order {
+        match &children[i] {
           Plan::Leaf(f, p) => src.fill(*f, p, &mut acc),
-          _ => acc.or_with(&eval(src, child, n)),
+          child => acc.or_with(&eval(src, child, &est.kids[i], n)),
         }
         if acc.is_full() {
           break;
