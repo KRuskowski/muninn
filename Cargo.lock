@@ -229,6 +229,7 @@ version = "0.1.0"
 name = "muninn-simd"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "muninn-core",
 ]
 
