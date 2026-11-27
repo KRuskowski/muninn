@@ -244,6 +244,8 @@ dependencies = [
  "muninn-store",
  "muninn-text",
  "muninn-vector",
+ "rayon",
+ "serde_json",
 ]
 
 [[package]]
