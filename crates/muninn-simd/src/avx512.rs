@@ -171,12 +171,20 @@ fn l2sq_u8_bw(a: &[u8], b: &[u8]) -> u32 {
 
 fn hamming_vpopcntdq(a: &[u64], b: &[u64]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
+  if a.len().min(b.len()) < 8 {
+    // SAFETY: CPU features confirmed, POPCNT among them (see above).
+    return unsafe { hamming_short(a, b) };
+  }
   // SAFETY: CPU features confirmed, including VPOPCNTDQ (see above).
   unsafe { hamming_vpopcntdq_impl(a, b) }
 }
 
 fn hamming_bw(a: &[u64], b: &[u64]) -> u32 {
   debug_assert_eq!(a.len(), b.len());
+  if a.len().min(b.len()) < 8 {
+    // SAFETY: CPU features confirmed, POPCNT among them (see above).
+    return unsafe { hamming_short(a, b) };
+  }
   // SAFETY: CPU features confirmed (see above).
   unsafe { hamming_bw_impl(a, b) }
 }
@@ -617,13 +625,17 @@ unsafe fn load_xor(
   }
 }
 
-#[target_feature(enable = "avx512f,avx512vpopcntdq,popcnt")]
+/// Hamming distance of short inputs (under one zmm) with scalar POPCNT.
+/// Checked before entering the AVX-512 functions, whose prologue alone
+/// costs more than the whole computation at this size.
+#[target_feature(enable = "popcnt")]
+fn hamming_short(a: &[u64], b: &[u64]) -> u32 {
+  a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
 fn hamming_vpopcntdq_impl(a: &[u64], b: &[u64]) -> u32 {
   let n = a.len().min(b.len());
-  if n < 8 {
-    // Below one zmm of data, scalar POPCNT is faster than a masked load.
-    return a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum();
-  }
   let (pa, pb) = (a.as_ptr(), b.as_ptr());
   let mut acc0 = _mm512_setzero_si512();
   let mut acc1 = _mm512_setzero_si512();
@@ -647,13 +659,9 @@ fn hamming_vpopcntdq_impl(a: &[u64], b: &[u64]) -> u32 {
 
 /// Hamming distance without VPOPCNTDQ: nibble lookup table per byte, then
 /// `vpsadbw` into 64-bit lanes.
-#[target_feature(enable = "avx512f,avx512bw,popcnt")]
+#[target_feature(enable = "avx512f,avx512bw")]
 fn hamming_bw_impl(a: &[u64], b: &[u64]) -> u32 {
   let n = a.len().min(b.len());
-  if n < 8 {
-    // Below one zmm of data, scalar POPCNT is faster than a masked load.
-    return a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum();
-  }
   let (pa, pb) = (a.as_ptr(), b.as_ptr());
   let lut = _mm512_broadcast_i32x4(_mm_setr_epi8(
     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
