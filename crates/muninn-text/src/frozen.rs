@@ -118,7 +118,7 @@ impl<W: Write> Writer<W> {
     let data_len = f.head.len() + f.tail_block.len();
     let data_len = u32::try_from(data_len)
       .map_err(|_| Error::invalid("postings of one term exceed 4 GiB"))?;
-    if self.num_terms % DICT_BLOCK == 0 {
+    if self.num_terms.is_multiple_of(DICT_BLOCK) {
       self.dictidx.extend_from_slice(&[
         self.dict.len() as u64,
         self.post_pos,
@@ -267,7 +267,10 @@ impl BlockReader<'_> {
     };
     self.post_off = self.post_off.saturating_add(data_len);
     if single.is_none() {
-      self.skip_idx += (df as u64).div_ceil(BLOCK as u64);
+      self.skip_idx = self
+        .skip_idx
+        .checked_add((df as u64).div_ceil(BLOCK as u64))
+        .ok_or_else(Self::bad)?;
     }
     Ok(Some(meta))
   }
@@ -378,11 +381,19 @@ impl TextIndex {
     }
     let idx = dictidx.cast::<u64>()?;
     let mut prev = 0u64;
+    let (mut prev_post, mut prev_skip) = (0u64, 0u64);
     for b in idx.chunks_exact(3) {
-      if b[0] < prev || b[0] >= dict.len() as u64 {
+      let (d, post, skip) = (b[0], b[1], b[2]);
+      if d < prev
+        || d >= dict.len() as u64
+        || post < prev_post
+        || post > postings.len() as u64
+        || skip < prev_skip
+        || skip > num_skips
+      {
         return bad("dictidx");
       }
-      prev = b[0];
+      (prev, prev_post, prev_skip) = (d, post, skip);
     }
     Ok(Self {
       container: c,
@@ -698,10 +709,10 @@ impl<'a> DictIter<'a> {
 
   fn next(&mut self) -> Result<Option<TermMeta>> {
     loop {
-      if let Some(r) = &mut self.reader {
-        if let Some(m) = r.next()? {
-          return Ok(Some(m));
-        }
+      if let Some(r) = &mut self.reader
+        && let Some(m) = r.next()?
+      {
+        return Ok(Some(m));
       }
       if self.block >= self.index.idx_slice().len() / 3 {
         self.reader = None;

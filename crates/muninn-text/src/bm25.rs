@@ -4,8 +4,8 @@
 //! query count once), the score of document `d` is
 //!
 //! ```text
-//! score(d) = sum over i with tf_i(d) > 0 of
-//!              w_i * tf_i / (tf_i + k1 * (1 - b + b * len(d) / avgdl))
+//! score(d) = sum over i with tf_i(d) > 0 of  w_i / (1 + K(d) / tf_i)
+//! K(d)     = k1 * (1 - b + b * len(d) / avgdl)
 //! w_i      = idf(df_i) * (k1 + 1)
 //! idf(df)  = ln(1 + (N - df + 0.5) / (df + 0.5)),  df clamped to <= N
 //! ```
@@ -15,6 +15,12 @@
 //! `len(d)` the document length after the one-byte quantisation in
 //! [`crate::norm`]. Terms are summed in query order in `f32`, so equal
 //! inputs give bit-identical scores and ties are broken by smaller id.
+//!
+//! `w / (1 + K / tf)` equals the textbook `w * tf / (tf + K)`, but unlike
+//! it is monotonic under `f32` rounding: every operation is monotonic in
+//! its operand, so the contribution never decreases with `tf`, never
+//! increases with `K` (document length), and never exceeds `w`. The
+//! search's block bounds depend on exactly that.
 //!
 //! `N`, `avgdl` and `df` come from the index itself, or from
 //! [`crate::CorpusStats`] supplied by the caller so that scores from
@@ -65,8 +71,9 @@ impl LenNorms {
 /// One term's contribution. `kc` is `LenNorms::kc[norm]`.
 #[inline(always)]
 pub(crate) fn contrib(w: f32, tf: u32, kc: f32) -> f32 {
-  let tf = tf as f32;
-  w * tf / (tf + kc)
+  // Not `w * tf / (tf + kc)`: that is not monotonic in tf after
+  // rounding (see the module docs).
+  w / (1.0 + kc / tf as f32)
 }
 
 /// Upper bound of [`contrib`] over a block with these impacts.
@@ -108,15 +115,34 @@ mod tests {
 
   #[test]
   fn contribution_monotonic_in_tf_and_len() {
-    let norms = LenNorms::new(7.3);
-    let w = 3.1;
-    for n in 0..255usize {
-      assert!(norms.kc[n] <= norms.kc[n + 1]);
-      for tf in 1..300 {
-        assert!(contrib(w, tf, norms.kc[n]) <= contrib(w, tf + 1, norms.kc[n]));
-        assert!(contrib(w, tf, norms.kc[n + 1]) <= contrib(w, tf, norms.kc[n]));
+    // Block bounds rely on exact (not approximate) monotonicity: a
+    // document with lower tf or a longer length must never score above
+    // the frontier point that dominates it, after f32 rounding, for any
+    // supplied statistics. And no contribution may exceed `w`, which is
+    // the bound used for saturated tf.
+    let mut row = vec![0f32; 65536];
+    for avgdl in [0.3f32, 1.0, 7.3, 120.0, 1.0e4, 1.0e7, 3.0e9] {
+      let norms = LenNorms::new(avgdl);
+      for w in [0.0123f32, 3.1, 47.9] {
+        for n in 0..256usize {
+          if n > 0 {
+            assert!(norms.kc[n - 1] <= norms.kc[n]);
+          }
+          let kc = norms.kc[n];
+          let mut prev = 0f32;
+          for tf in 1..=65535u32 {
+            let c = contrib(w, tf, kc);
+            assert!(c >= prev, "tf {tf} avgdl {avgdl} norm {n} w {w}");
+            assert!(c <= w, "above w: tf {tf} avgdl {avgdl} norm {n}");
+            if n > 0 {
+              assert!(c <= row[tf as usize], "len: tf {tf} avgdl {avgdl}");
+            }
+            row[tf as usize] = c;
+            prev = c;
+          }
+          assert!(contrib(w, u32::MAX, kc) <= w);
+        }
       }
     }
-    assert!(contrib(w, u32::MAX, norms.kc[0]) <= w);
   }
 }

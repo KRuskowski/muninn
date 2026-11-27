@@ -250,8 +250,7 @@ impl Reference {
       let mut any = false;
       for (t, &w) in terms.iter().zip(&weights) {
         if let Some(&tf) = tfs.get(t) {
-          let tf = tf as f32;
-          score += w * tf / (tf + kc);
+          score += w / (1.0 + kc / tf as f32);
           any = true;
         }
       }
