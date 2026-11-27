@@ -207,13 +207,13 @@ impl Region {
   pub fn cast<T: Pod>(&self) -> Result<&[T]> {
     let bytes = self.bytes();
     let size = std::mem::size_of::<T>();
-    if bytes.len() % size != 0 {
+    if !bytes.len().is_multiple_of(size) {
       return Err(Error::corrupt(format!(
         "{} bytes is not a whole number of {size}-byte values",
         bytes.len()
       )));
     }
-    if (bytes.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<T>()) {
       return Err(Error::corrupt("misaligned array in region"));
     }
     // SAFETY: length and alignment were checked above, T is Pod so any

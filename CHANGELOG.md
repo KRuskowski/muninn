@@ -14,3 +14,4 @@ All notable changes to muninn are recorded here, written for people who use muni
 - Text indexes are stored compactly on disk (about 2 bytes per word in our tests), open instantly, and are checked for corruption. Indexes can be combined into one, with deleted documents removed.
 - A search may contain up to 1024 different words; longer searches are refused with a clear error. Repeating a word does not count against the limit.
 - Current limitation: languages written without spaces between words (Chinese, Japanese, Thai) are not yet split into words, so searching them only finds exact runs of text.
+- Index files with damaged trailing bytes are now always rejected, and asking for an extremely large number of results no longer exhausts memory.
