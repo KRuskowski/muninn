@@ -97,7 +97,7 @@ impl Bits {
   pub(crate) fn is_full(&self) -> bool {
     let full = self.len / 64;
     self.words[..full].iter().all(|&w| w == u64::MAX)
-      && (self.len % 64 == 0
+      && (self.len.is_multiple_of(64)
         || self.words[full] == (1u64 << (self.len % 64)) - 1)
   }
 
@@ -107,10 +107,10 @@ impl Bits {
 
   fn clear_tail(&mut self) {
     let rem = self.len % 64;
-    if rem != 0 {
-      if let Some(last) = self.words.last_mut() {
-        *last &= (1u64 << rem) - 1;
-      }
+    if rem != 0
+      && let Some(last) = self.words.last_mut()
+    {
+      *last &= (1u64 << rem) - 1;
     }
   }
 }

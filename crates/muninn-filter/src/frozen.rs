@@ -524,10 +524,10 @@ impl Merge<'_> {
   ) -> Vec<DocId> {
     let mut out = Vec::new();
     for ((input, map), fmap) in self.inputs.iter().zip(&self.maps) {
-      if let Some(j) = fmap[field] {
-        if let Some(p) = pick(input, j) {
-          input.for_each_doc(j, p, |d| out.extend(remap(map, d)));
-        }
+      if let Some(j) = fmap[field]
+        && let Some(p) = pick(input, j)
+      {
+        input.for_each_doc(j, p, |d| out.extend(remap(map, d)));
       }
     }
     finish(out)
