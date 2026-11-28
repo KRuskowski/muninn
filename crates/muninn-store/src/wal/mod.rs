@@ -178,8 +178,10 @@ struct Active {
   file: Arc<File>,
   len: u64,
   /// Segments rotated out without an fsync (`NoSync`), synced by the next
-  /// sync round before the active one.
-  unsynced: Vec<Arc<File>>,
+  /// sync round before the active one. Kept by path, not as open files,
+  /// so a log that rotates often without ever syncing holds one file
+  /// handle, not one per segment (see [`Shared::fsync_path`]).
+  unsynced: Vec<PathBuf>,
   /// A segment file was created without syncing the directory.
   dir_dirty: bool,
 }
@@ -425,8 +427,8 @@ impl Shared {
     if sync {
       // Older segments first: a record is durable only when everything
       // before it is.
-      for f in std::mem::take(&mut a.unsynced) {
-        self.fsync(&f, SyncSite::Leader)?;
+      for p in std::mem::take(&mut a.unsynced) {
+        self.fsync_path(&p)?;
       }
       if std::mem::take(&mut a.dir_dirty) {
         self.counters.sync_dir(&self.dir)?;
@@ -449,10 +451,13 @@ impl Shared {
       prev_lsn: first - 1,
     };
     let (file, path) = create_segment(&self.dir, header, sync, &self.counters)?;
-    let old = std::mem::replace(&mut a.file, Arc::new(file));
+    // The old file is closed here (the background syncer may still hold
+    // a clone for a moment); unsynced, it is remembered by path.
+    drop(std::mem::replace(&mut a.file, Arc::new(file)));
     a.len = HEADER_LEN as u64;
     if !sync {
-      a.unsynced.push(old);
+      let old = lock(&self.segments).last().map(|s| s.path.clone());
+      a.unsynced.extend(old);
       a.dir_dirty = true;
     }
     lock(&self.segments).push(SegmentInfo {
@@ -493,6 +498,28 @@ impl Shared {
         Err(e.into())
       }
     }
+  }
+
+  /// Fsyncs a closed segment file by path (see [`Active::unsynced`]).
+  /// A file that is gone was deleted by [`Wal::truncate_before`], which
+  /// the caller may only use for records it has checkpointed elsewhere,
+  /// so there is nothing left to make durable.
+  ///
+  /// An fsync through a new handle flushes the file's dirty pages like
+  /// one through the handle that wrote them. Linux (4.14 and later)
+  /// reports a writeback error that no one has seen yet to handles opened
+  /// after it, so an earlier failure is not missed.
+  fn fsync_path(&self, path: &Path) -> Result<()> {
+    // Write access: Windows needs it to flush a file's buffers.
+    let f = match OpenOptions::new().write(true).open(path) {
+      Ok(f) => f,
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(e) => {
+        self.mark_failed(e.to_string());
+        return Err(e.into());
+      }
+    };
+    self.fsync(&f, SyncSite::Leader)
   }
 
   /// Poisons the WAL (first error wins) and wakes every waiter.
