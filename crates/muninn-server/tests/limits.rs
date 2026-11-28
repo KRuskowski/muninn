@@ -419,3 +419,46 @@ fn shutdown_is_bounded_and_the_database_still_closes() {
   let st = db.collection("c").unwrap().stats().unwrap();
   assert_eq!((st.live_docs, st.memtable_docs), (1, 0));
 }
+
+/// A request refused before its body is read (here by its Content-Length)
+/// still gets its error response: the server reads and discards what the
+/// client already sent before closing, instead of closing with unread data,
+/// which makes the kernel reset the connection and can destroy the
+/// response before the client reads it.
+#[test]
+fn early_refusals_reach_clients_that_sent_the_body() {
+  let dir = TestDir::new("linger");
+  let s = Server::start(
+    &dir,
+    ServerConfig {
+      body_limit: 1000,
+      ..ServerConfig::default()
+    },
+  );
+  create(s.addr, "c");
+  let body = format!(r#"{{"text": "{}"}}"#, "x".repeat(64 << 10));
+  for _ in 0..20 {
+    let mut t = TcpStream::connect(s.addr).unwrap();
+    write!(
+      t,
+      "POST /v1/collections/c/search HTTP/1.1\r\nHost: {}\r\n\
+       Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+      s.addr,
+      body.len()
+    )
+    .unwrap();
+    // The server answers from the headers alone; the body arrives after.
+    std::thread::sleep(Duration::from_millis(50));
+    // The body may be cut short by the server closing: that is fine.
+    let _ = t.write_all(body.as_bytes());
+    // Let the response, and any reset, arrive before reading.
+    std::thread::sleep(Duration::from_millis(100));
+    let mut resp = Vec::new();
+    if let Err(e) = t.read_to_end(&mut resp) {
+      panic!("reading the response: {e} (got {} bytes)", resp.len());
+    }
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 413 "), "{resp}");
+    assert!(resp.contains("payload_too_large"), "{resp}");
+  }
+}
