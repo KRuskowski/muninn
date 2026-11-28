@@ -78,15 +78,28 @@ pub struct ApiError {
   pub code: ErrorCode,
   /// What went wrong, for people.
   pub message: String,
+  /// Send `Retry-After: 1` with a 503: the condition is transient (too
+  /// much in flight). False for a collection that refuses writes until
+  /// the server restarts, where retrying cannot help.
+  retry_after: bool,
 }
 
 impl ApiError {
-  /// An error of kind `code`.
+  /// An error of kind `code`. A 503 `unavailable` error made here is
+  /// transient and carries `Retry-After`.
   pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
     Self {
       code,
       message: message.into(),
+      retry_after: code == ErrorCode::Unavailable,
     }
+  }
+
+  /// Whether the response carries `Retry-After`: true for a transient
+  /// 503 `unavailable` (too much in flight), false for a collection that
+  /// refuses writes until the server restarts, and for other codes.
+  pub fn retry_after(&self) -> bool {
+    self.retry_after && self.code == ErrorCode::Unavailable
   }
 
   /// A 400 `invalid_argument` error.
@@ -123,7 +136,14 @@ impl From<muninn::Error> for ApiError {
       E::AlreadyExists(m) => {
         Self::new(ErrorCode::AlreadyExists, format!("{m} already exists"))
       }
-      e @ (E::Io(_) | E::Corrupt(_)) => Self::internal(e.to_string()),
+      // A collection that stopped accepting writes after a background
+      // failure; reopening (a server restart) recovers it.
+      E::Unavailable(m) => Self {
+        retry_after: false,
+        ..Self::new(ErrorCode::Unavailable, m)
+      },
+      // Disk errors, corrupt data, and kinds added later.
+      e => Self::internal(e.to_string()),
     }
   }
 }
@@ -147,11 +167,35 @@ impl IntoResponse for ApiError {
       ErrorCode::Unauthenticated => {
         h.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
       }
-      ErrorCode::Unavailable => {
+      ErrorCode::Unavailable if self.retry_after() => {
         h.insert(RETRY_AFTER, HeaderValue::from_static("1"));
       }
       _ => {}
     }
     resp
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Transient 503s (request, body and bulk caps) tell clients when to
+  /// retry; a collection refusing writes until the server restarts does
+  /// not, since retrying cannot help.
+  #[test]
+  fn retry_after_only_for_transient_unavailable() {
+    let busy = ApiError::new(ErrorCode::Unavailable, "too many requests")
+      .into_response();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy.headers()[RETRY_AFTER], "1");
+    let refused: ApiError =
+      muninn::Error::Unavailable("refuses writes".into()).into();
+    assert!(!refused.retry_after());
+    assert!(ApiError::new(ErrorCode::Unavailable, "busy").retry_after());
+    assert!(!ApiError::invalid("bad").retry_after());
+    let refused = refused.into_response();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(refused.headers().get(RETRY_AFTER).is_none());
   }
 }

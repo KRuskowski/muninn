@@ -28,10 +28,27 @@
 //! segment, persists changed tombstones of every segment, commits a
 //! manifest with the new segment and checkpoint, swaps the frozen
 //! memtable for the segment in a new version (same doc ids, same
-//! tombstones, so searches see no gap and no duplicates), and deletes WAL
-//! files below the *previous* manifest's checkpoint: the manifest store
-//! falls back to the previous manifest if the newest is unreadable, and
-//! that one needs the log from its own checkpoint on.
+//! tombstones, so searches see no gap and no duplicates), commits the
+//! manifest a second time, unchanged, and only then deletes WAL files
+//! below the checkpoint. The manifest store keeps two generations and
+//! falls back to the older one if the newest is unreadable; until the
+//! second commit that older one is the state before the flush, which
+//! needs the log from its own checkpoint on. Merges commit twice too, so
+//! the segments they replace are deleted as soon as the merge is done.
+//! Disk use is therefore bounded by the live segments, the log since the
+//! last flush (at most the memtables in memory), and the output of a
+//! merge in progress. (On Windows a file still mapped by a running search
+//! cannot be deleted; gc skips it, and the next flush, merge or open
+//! removes it.)
+//!
+//! While writes outpace the worker (more frozen memtables wait, or the
+//! collection already ends with such segments), a flush in a collection
+//! with an HNSW schema writes its segment with a flat index: its vectors
+//! are about to be inserted into a larger graph by a merge anyway (see
+//! [`pick_fold`] and `segment::write_merged`, which extends the graph of
+//! a merge's first segment instead of rebuilding it). A bulk load then
+//! puts every vector into a graph about once, instead of once per flush
+//! plus once per merge level.
 //!
 //! Persisted tombstones may include deletes logged after the checkpoint.
 //! Replaying those records again is harmless: deleting an already deleted
@@ -69,8 +86,8 @@ use muninn_text::DELETED;
 
 use crate::codec::{self, Op};
 use crate::memtable::{MemInner, Memtable, read, write};
-use crate::options::{Durability, Failpoint, Options};
-use crate::schema::Schema;
+use crate::options::{Failpoint, Options};
+use crate::schema::{IndexKind, Schema};
 use crate::segment::{self, Segment};
 use crate::types::{CollectionStats, Document, Id, SegmentStats};
 use crate::version::{Source, Version, View};
@@ -81,6 +98,10 @@ pub(crate) const WAL_DIR: &str = "wal";
 /// Marker file left by a recovery that found the log damaged before its
 /// end; the collection refuses to open while it exists.
 pub(crate) const WAL_DAMAGED: &str = "WAL-DAMAGED";
+
+/// Shortest wait between checks for a pause in writes (see
+/// [`Options::merge_idle_delay`]).
+const MIN_IDLE_CHECK: Duration = Duration::from_millis(1);
 
 /// How long the worker waits before retrying after a failed job.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -112,6 +133,11 @@ pub(crate) struct State {
   compact_failed: u64,
   compact_error: Option<String>,
   auto_compact_pending: bool,
+  /// Segments without a graph wait at the end of the collection for a
+  /// merge that builds one (see [`pick_fold`]); the applied LSN when the
+  /// worker last looked. If no write arrives for
+  /// [`Options::merge_idle_delay`], they are merged anyway.
+  fold_waiting: Option<Lsn>,
   next_mem_id: u64,
   /// Writes are refused: an earlier write or the worker failed in a way
   /// that left memory and log out of step.
@@ -204,10 +230,10 @@ impl Drop for DirRemover {
 }
 
 fn poisoned_err(msg: &str) -> Error {
-  Error::Io(std::io::Error::other(format!(
+  Error::Unavailable(format!(
     "collection refuses writes after an earlier failure ({msg}); reopen \
      the database to recover"
-  )))
+  ))
 }
 
 fn publish(current: &RwLock<Arc<Version>>, st: &mut State, v: Version) {
@@ -217,13 +243,14 @@ fn publish(current: &RwLock<Arc<Version>>, st: &mut State, v: Version) {
 }
 
 /// Applies one WAL record to the memtable and publishes the result.
-/// Shared by live writes and recovery.
+/// Shared by live writes and recovery. Returns how many live documents
+/// the record deleted or replaced.
 fn apply_record(
   schema: &Schema,
   current: &RwLock<Arc<Version>>,
   st: &mut State,
   rec: &[u8],
-) -> Result<()> {
+) -> Result<usize> {
   let op = codec::decode(rec, schema)?;
   let v = st.version.clone();
   let n = v.views.len();
@@ -246,14 +273,14 @@ fn apply_record(
     };
     if let Some(d) = g.ids.remove(id.as_borrowed()) {
       mark(n - 1, d, &mut tombs);
-      return;
+      return true;
     }
     for (i, fg) in frozen.iter().rev() {
       if let Some(d) = fg.ids.get(id.as_borrowed())
         && !dead(*i, d, &tombs)
       {
         mark(*i, d, &mut tombs);
-        return;
+        return true;
       }
     }
     for i in (0..v.nseg).rev() {
@@ -262,29 +289,31 @@ fn apply_record(
         && !dead(i, d, &tombs)
       {
         mark(i, d, &mut tombs);
-        return;
+        return true;
       }
     }
+    false
   };
-  let res = (|| -> Result<()> {
+  let res = (|| -> Result<usize> {
+    let mut killed = 0;
     match &op {
       Op::Upsert(docs) => {
         for d in docs {
-          kill(&d.id, &mut g);
+          killed += usize::from(kill(&d.id, &mut g));
           active.insert(&mut g, d)?;
         }
       }
       Op::Delete(ids) => {
         for id in ids {
-          kill(id, &mut g);
+          killed += usize::from(kill(id, &mut g));
         }
       }
     }
-    Ok(())
+    Ok(killed)
   })();
   // Publish even a partial batch's rows only together with the error
   // path poisoning the collection; on success, everything at once.
-  res?;
+  let killed = res?;
   active.publish(&g);
   let mut nv = (*v).clone();
   for (i, t) in tombs.into_iter().enumerate() {
@@ -297,7 +326,7 @@ fn apply_record(
   drop(frozen);
   publish(current, st, nv);
   drop(g);
-  Ok(())
+  Ok(killed)
 }
 
 /// Freezes the active memtable and starts a new one.
@@ -363,18 +392,152 @@ fn remove_uncommitted(dir: &Path, next_id: u64) -> Result<()> {
   Ok(())
 }
 
-/// Picks segments to merge in the background: a contiguous range of
-/// `segs` (live, total docs per segment).
-fn pick_merge(
-  segs: &[(u64, u64)],
+/// Above this many segments, background merging first merges the
+/// smallest neighbours, and gets turns even while writers wait for
+/// flushes.
+fn max_segments(opts: &Options) -> usize {
+  3 * opts.merge_factor + 8
+}
+
+/// What the merge policy knows about a segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegSize {
+  live: u64,
+  total: u64,
+  /// It has an HNSW graph.
+  graph: bool,
+}
+
+/// A fold may rewrite a graph segment up to this many times the size of
+/// the documents it adds to it. Rewriting is sequential I/O, cheap next
+/// to the graph inserts it saves, but not free.
+const FOLD_MAX_REWRITE: u64 = 16;
+
+/// Whether `segs` ends with segments that have no graph (in a collection
+/// whose schema asks for one), waiting for [`pick_fold`].
+fn has_trailing_flats(segs: &[SegSize]) -> bool {
+  segs.last().is_some_and(|s| !s.graph)
+}
+
+/// The merge that gives segments flushed without a graph one. Such
+/// segments form runs; normally one run at the end of the collection,
+/// but a merge by another rule can leave part of a run between graph
+/// segments. A run is merged into the graph segment before it when that
+/// is cheap (its graph is extended, see `segment::write_merged`),
+/// otherwise its oldest segments are merged into a segment of their own,
+/// never above `max_merge_docs` documents.
+///
+/// The run at the end waits until it is worth it: `merge_factor`
+/// segments, or at least a memtable's worth and a `merge_factor`th of
+/// the graph segment, so that bulk loads insert every vector into a graph
+/// once instead of building a graph per flush and rebuilding it per
+/// merge. With `quiet` (no writes for a while) it is merged whatever its
+/// size, so searches do not keep scanning it exactly. A run left between
+/// graph segments no longer grows, so it is handled at once.
+fn pick_fold(
+  segs: &[SegSize],
   opts: &Options,
+  quiet: bool,
 ) -> Option<std::ops::Range<usize>> {
+  let n = segs.len();
+  let mut i = 0;
+  while i < n {
+    if segs[i].graph {
+      i += 1;
+      continue;
+    }
+    let end = segs[i..].iter().position(|s| s.graph).map_or(n, |e| i + e);
+    if let Some(r) = fold_run(segs, i..end, end == n, opts, quiet) {
+      return Some(r);
+    }
+    i = end;
+  }
+  None
+}
+
+/// [`pick_fold`] for the graphless run `run`; `tail` if it ends the
+/// collection.
+fn fold_run(
+  segs: &[SegSize],
+  run: std::ops::Range<usize>,
+  tail: bool,
+  opts: &Options,
+  quiet: bool,
+) -> Option<std::ops::Range<usize>> {
+  let (start, end) = (run.start, run.end);
+  let run_docs: u64 = segs[run.clone()].iter().map(|s| s.live).sum();
+  let run_len = end - start;
+  let base = start.checked_sub(1).map(|i| segs[i]);
+  let f = opts.merge_factor as u64;
+  let unit = opts.memtable_max_docs as u64;
+  let cap = opts.max_merge_docs as u64;
+  let urgent = !tail
+    || run_len as u64 >= f
+    || run_docs >= unit.max(base.map_or(0, |b| b.live / f));
+  if !urgent && !quiet {
+    return None;
+  }
+  // Extending the graph before the run rewrites that whole segment, so
+  // it is done only while the rewrite stays proportionate to the
+  // documents added (a stranded run included: rewriting millions of
+  // documents for a few dozen is not worth it).
+  if let Some(b) = base
+    && b.live == b.total
+    && b.live + run_docs <= cap
+    && b.live <= FOLD_MAX_REWRITE * run_docs
+  {
+    return Some(start - 1..end);
+  }
+  // Otherwise a segment of their own: the oldest group of neighbouring
+  // segments that fits under the cap and is worth a rewrite (two or more
+  // segments, or one large enough for a graph; a single segment may be
+  // larger than the cap, its graph is no larger than the segment). A
+  // small segment that fits with neither neighbour is skipped, so it
+  // never holds up the segments after it.
+  let mut i = start;
+  while i < end {
+    let mut stop = i;
+    let mut docs = 0;
+    while stop < end && (stop == i || docs + segs[stop].live <= cap) {
+      docs += segs[stop].live;
+      stop += 1;
+    }
+    if docs >= opts.hnsw_min_docs as u64 || stop - i >= 2 {
+      return Some(i..stop);
+    }
+    i = stop;
+  }
+  None
+}
+
+/// Picks segments to merge in the background: a contiguous range of
+/// `segs`. `lazy` says flushes may leave graphs to merges (see
+/// [`pick_fold`]); `quiet` that no write arrived for a while.
+fn pick_merge(
+  segs: &[SegSize],
+  opts: &Options,
+  lazy: bool,
+  quiet: bool,
+) -> Option<std::ops::Range<usize>> {
+  // 0. Drop segments whose documents are all deleted: nearly free, and
+  // under heavy writes the rules below could otherwise keep them around.
+  if let Some(i) = segs.iter().position(|s| s.live == 0) {
+    let end = segs[i..]
+      .iter()
+      .position(|s| s.live > 0)
+      .map_or(segs.len(), |e| i + e);
+    return Some(i..end);
+  }
+  if lazy && let Some(r) = pick_fold(segs, opts, quiet) {
+    return Some(r);
+  }
+  let segs: Vec<(u64, u64)> = segs.iter().map(|s| (s.live, s.total)).collect();
   let n = segs.len();
   let base = opts.memtable_max_docs.max(1) as u64;
   let f = opts.merge_factor;
   let cap = opts.max_merge_docs as u64;
   // 1. Bound the number of segments: merge the smallest neighbours.
-  if n > 3 * f + 8 {
+  if n > max_segments(opts) {
     let best = (0..n - 1)
       .map(|i| (segs[i].0 + segs[i + 1].0, i))
       .filter(|&(s, _)| s <= cap)
@@ -414,10 +577,31 @@ fn pick_merge(
   None
 }
 
+fn seg_size(s: &Segment, deleted: usize) -> SegSize {
+  SegSize {
+    live: u64::from(s.len) - deleted as u64,
+    total: u64::from(s.len),
+    graph: matches!(s.vectors, Some(segment::VecIndex::Hnsw(_))),
+  }
+}
+
+/// The merge policy's view of a version's segments.
+fn seg_sizes(v: &Version) -> Vec<SegSize> {
+  v.views[..v.nseg]
+    .iter()
+    .map(|w| seg_size(w.segment().expect("segment"), w.deleted))
+    .collect()
+}
+
 #[derive(Clone, Copy)]
 enum Job {
   Flush(Frozen),
-  Compact { full: bool, req: u64 },
+  /// `quiet`: no write arrived for [`Options::merge_idle_delay`].
+  Compact {
+    full: bool,
+    req: u64,
+    quiet: bool,
+  },
 }
 
 impl Core {
@@ -452,7 +636,7 @@ impl Core {
     let m = m.ok_or_else(|| {
       Error::corrupt(format!("{} has no manifest", dir.display()))
     })?;
-    let schema = Schema::from_json(&m.schema)?;
+    let schema = Schema::from_stored(&m.schema)?;
     remove_uncommitted(dir, m.next_segment_id)?;
     store.gc(true, &[])?;
     let mut views = Vec::with_capacity(m.segments.len() + 1);
@@ -503,6 +687,7 @@ impl Core {
       compact_failed: 0,
       compact_error: None,
       auto_compact_pending: true,
+      fold_waiting: None,
       next_mem_id: 2,
       poisoned: None,
       bg_error: None,
@@ -649,8 +834,9 @@ impl Core {
     *self.remover.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
   }
 
-  /// Validates, logs and applies one batch.
-  fn write(&self, rec: Vec<u8>) -> Result<()> {
+  /// Validates, logs and applies one batch. Returns how many live
+  /// documents it deleted or replaced.
+  fn write(&self, rec: Vec<u8>) -> Result<usize> {
     self.check_live()?;
     if rec.len() > MAX_RECORD_LEN {
       return Err(Error::invalid(format!(
@@ -699,30 +885,35 @@ impl Core {
       }
       st = self.wait(st)?;
     }
-    if let Err(e) = apply_record(&self.schema, &self.current, &mut st, &rec) {
-      st.poisoned = Some(format!("applying LSN {lsn}: {e}"));
-      self.cv.notify_all();
-      return Err(e);
-    }
+    let killed = match apply_record(&self.schema, &self.current, &mut st, &rec)
+    {
+      Ok(k) => k,
+      Err(e) => {
+        st.poisoned = Some(format!("applying LSN {lsn}: {e}"));
+        self.cv.notify_all();
+        return Err(e);
+      }
+    };
     st.applied_lsn = lsn;
     if is_full(&self.opts, &st) {
       freeze(&self.schema, &self.current, &mut st)?;
       self.worker_cv.notify_one();
     }
     self.cv.notify_all();
-    Ok(())
+    Ok(killed)
   }
 
   pub(crate) fn upsert(&self, docs: &[Document]) -> Result<()> {
     if docs.is_empty() {
       return Ok(());
     }
-    self.write(codec::encode_upsert(&self.schema, docs)?)
+    self.write(codec::encode_upsert(&self.schema, docs)?)?;
+    Ok(())
   }
 
-  pub(crate) fn delete(&self, ids: &[Id]) -> Result<()> {
+  pub(crate) fn delete(&self, ids: &[Id]) -> Result<usize> {
     if ids.is_empty() {
-      return Ok(());
+      return Ok(0);
     }
     self.write(codec::encode_delete(ids)?)
   }
@@ -841,19 +1032,25 @@ impl Core {
             Some(Job::Compact {
               full: true,
               req: st.compact_req,
+              quiet: false,
             })
           } else if self.opts.auto_compact && st.auto_compact_pending {
             Some(Job::Compact {
               full: false,
               req: 0,
+              quiet: false,
             })
           } else {
             None
           };
           // Flushes first, but under sustained writes alternate with
           // compaction so merges (and explicit compact calls) are not
-          // starved; writers blocked on the flush backlog always win.
-          let blocked = st.frozen.len() > self.opts.max_pending_flushes;
+          // starved; writers blocked on the flush backlog win, unless
+          // segments pile up: every flush adds one, and each write and
+          // flush costs a little per segment, so letting flushes win
+          // then would only slow them down further.
+          let blocked = st.frozen.len() > self.opts.max_pending_flushes
+            && st.version.nseg <= max_segments(&self.opts);
           match (st.frozen.front(), compaction) {
             (Some(f), Some(c)) => {
               if blocked || !flushed_last {
@@ -864,6 +1061,40 @@ impl Core {
             (Some(f), None) => break Job::Flush(*f),
             (None, Some(c)) => break c,
             (None, None) => {}
+          }
+          // Segments waiting for a graph: merge them once writes pause
+          // (at once with a zero delay; checking again at most every
+          // millisecond otherwise, so the worker never spins).
+          if let Some(lsn) = st.fold_waiting {
+            let delay = self.opts.merge_idle_delay;
+            if delay.is_zero() {
+              st.fold_waiting = None;
+              break Job::Compact {
+                full: false,
+                req: 0,
+                quiet: true,
+              };
+            }
+            let (g, timeout) = match self
+              .worker_cv
+              .wait_timeout(st, delay.max(MIN_IDLE_CHECK))
+            {
+              Ok(r) => r,
+              Err(_) => return,
+            };
+            st = g;
+            if timeout.timed_out() && st.fold_waiting.is_some() {
+              if st.applied_lsn == lsn && st.frozen.is_empty() {
+                st.fold_waiting = None;
+                break Job::Compact {
+                  full: false,
+                  req: 0,
+                  quiet: true,
+                };
+              }
+              st.fold_waiting = Some(st.applied_lsn);
+            }
+            continue;
           }
           st = match self.worker_cv.wait(st) {
             Ok(g) => g,
@@ -878,8 +1109,8 @@ impl Core {
       let res =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
           Job::Flush(f) => self.flush_one(f).map(|_| None),
-          Job::Compact { full, req } => self
-            .compact_once(full)
+          Job::Compact { full, req, quiet } => self
+            .compact_once(full, quiet)
             .map(|merged| Some((full, req, merged))),
         }));
       let res = match res {
@@ -909,7 +1140,7 @@ impl Core {
           }
         }
         (Ok(None), _) => {}
-        (Err(e), Job::Compact { full, req }) => {
+        (Err(e), Job::Compact { full, req, .. }) => {
           // Not retried: an explicit compact() reports the failure to its
           // caller; background merging tries again after the next flush.
           if full {
@@ -967,12 +1198,6 @@ impl Core {
   /// Writes the oldest frozen memtable as a segment and publishes it.
   fn flush_one(&self, f: Frozen) -> Result<()> {
     self.with_wal(Wal::rotate)?;
-    if self.opts.durability == Durability::NoSync {
-      // Without syncs the WAL keeps every rotated-out segment file open
-      // until the next `Wal::sync`; one rotation per flush would leak a
-      // file handle per flush. One fsync per flush releases them.
-      self.with_wal(Wal::sync)?;
-    }
     match self.opts.failpoint {
       Some(Failpoint::SlowFlush) => {
         std::thread::sleep(Duration::from_millis(300))
@@ -990,6 +1215,14 @@ impl Core {
       .ok_or_else(|| Error::invalid("frozen memtable vanished"))?;
     drop(v);
     let seg_id = disk.manifest.next_segment_id;
+    // While writes outpace the worker (more memtables wait behind this
+    // one, or earlier flushes already left their graphs to a merge), the
+    // segment gets no graph: a merge soon inserts its vectors into a
+    // larger graph, so building one now would be work thrown away.
+    let graph = !self.lazy_graph() || {
+      let st = self.lock()?;
+      st.frozen.len() <= 1 && !has_trailing_flats(&seg_sizes(&st.version))
+    };
     let seg = {
       let g = read(&mem.inner);
       if g.docs > 0 {
@@ -1000,6 +1233,7 @@ impl Core {
           &g,
           &self.schema,
           &self.opts,
+          graph,
         )?;
         Some(Arc::new(Segment::open(&self.dir, &entry, &self.schema)?))
       } else {
@@ -1094,21 +1328,54 @@ impl Core {
         }
       }
       st.frozen.pop_front();
-      st.flushed_seq = f.seq;
       st.checkpoint_lsn = f.checkpoint.max(st.checkpoint_lsn);
       st.auto_compact_pending = true;
       publish(&self.current, &mut st, nv);
+      self.note_waiting_flats(&mut st);
       self.cv.notify_all();
     }
-    // Cleanup only: the flush is complete and visible. A failure here
-    // leaves extra files that the next flush removes.
-    if let Err(e) = self.with_wal(|w| w.truncate_before(prev_checkpoint + 1)) {
+    self.seal(&mut disk)?;
+    self.tidy(&disk);
+    // Only now does `flush()` return: the log is short again.
+    self.lock()?.flushed_seq = f.seq;
+    self.cv.notify_all();
+    Ok(())
+  }
+
+  /// Commits the current manifest once more, unchanged. The store keeps
+  /// the two newest generations and falls back to the older one if the
+  /// newest is unreadable, so until this second commit the generation
+  /// before the change stays in charge of its files and of the log from
+  /// its checkpoint on. Afterwards both retained generations describe the
+  /// same state, so [`Core::tidy`] can release everything the change made
+  /// obsolete: merged-away segments right after a compaction, the log
+  /// right after a flush. A manifest is a few kilobytes, so this costs two
+  /// small fsyncs per flush or merge.
+  fn seal(&self, disk: &mut Disk) -> Result<()> {
+    let mut m = disk.manifest.clone();
+    self.commit(disk, &mut m)?;
+    disk.manifest = m;
+    Ok(())
+  }
+
+  /// Deletes log files below the oldest retained manifest's checkpoint
+  /// and segment files no retained manifest names. Cleanup only: the
+  /// change is already durable and visible, and a failure leaves extra
+  /// files that the next flush or merge removes.
+  fn tidy(&self, disk: &Disk) {
+    let oldest = disk
+      .store
+      .retained()
+      .iter()
+      .map(|m| m.wal_checkpoint_lsn)
+      .min()
+      .unwrap_or(0);
+    if let Err(e) = self.with_wal(|w| w.truncate_before(oldest + 1)) {
       self.warn(&format!("WAL truncation failed: {e}"));
     }
     if let Err(e) = disk.store.gc(true, &[]) {
       self.warn(&format!("removing obsolete files failed: {e}"));
     }
-    Ok(())
   }
 
   /// Commits a manifest. Any error is fatal: once the commit has started
@@ -1135,9 +1402,35 @@ impl Core {
     st.bg_error = Some(msg.to_string());
   }
 
+  /// Whether flushes may leave a segment's graph to a later merge: the
+  /// schema asks for HNSW and background merging is on.
+  fn lazy_graph(&self) -> bool {
+    self.opts.auto_compact
+      && self
+        .schema
+        .vector
+        .as_ref()
+        .is_some_and(|f| matches!(f.index, IndexKind::Hnsw { .. }))
+  }
+
+  /// Arms the quiet-period merge of segments waiting for a graph (see
+  /// [`pick_fold`]) if there is one to do, else disarms it.
+  fn note_waiting_flats(&self, st: &mut State) {
+    let sizes = seg_sizes(&st.version);
+    if self.lazy_graph()
+      && has_trailing_flats(&sizes)
+      && pick_fold(&sizes, &self.opts, true).is_some()
+    {
+      let lsn = st.applied_lsn;
+      st.fold_waiting.get_or_insert(lsn);
+    } else {
+      st.fold_waiting = None;
+    }
+  }
+
   /// One merge (all segments if `full`, else what the policy picks).
   /// Returns whether anything was merged.
-  fn compact_once(&self, full: bool) -> Result<bool> {
+  fn compact_once(&self, full: bool, quiet: bool) -> Result<bool> {
     let mut disk = self.disk.lock().map_err(|_| poisoned_err("disk lock"))?;
     let v = self.snapshot();
     let segs: Vec<(Arc<Segment>, Arc<BitSet>, usize)> = v.views[..v.nseg]
@@ -1158,13 +1451,15 @@ impl Core {
         return Ok(false);
       }
     } else {
-      let sizes: Vec<(u64, u64)> = segs
-        .iter()
-        .map(|(s, _, d)| (u64::from(s.len) - *d as u64, u64::from(s.len)))
-        .collect();
-      match pick_merge(&sizes, &self.opts) {
+      let sizes: Vec<SegSize> =
+        segs.iter().map(|(s, _, d)| seg_size(s, *d)).collect();
+      match pick_merge(&sizes, &self.opts, self.lazy_graph(), quiet) {
         Some(r) => r,
-        None => return Ok(false),
+        None => {
+          let mut st = self.lock()?;
+          self.note_waiting_flats(&mut st);
+          return Ok(false);
+        }
       }
     };
     let run = &segs[range.clone()];
@@ -1254,11 +1549,12 @@ impl Core {
       nv.views.splice(range.clone(), new_view);
       nv.nseg = nv.nseg + added - removed;
       publish(&self.current, &mut st, nv);
+      self.note_waiting_flats(&mut st);
       self.cv.notify_all();
     }
-    if let Err(e) = disk.store.gc(true, &[]) {
-      self.warn(&format!("removing obsolete files failed: {e}"));
-    }
+    self.failpoint(Failpoint::AfterCompactionCommit)?;
+    self.seal(&mut disk)?;
+    self.tidy(&disk);
     Ok(true)
   }
 
@@ -1381,6 +1677,15 @@ impl Collection {
   /// Deletes documents by id, atomically like [`Collection::upsert`].
   /// Unknown ids are ignored.
   pub fn delete(&self, ids: &[Id]) -> Result<()> {
+    self.h.core.delete(ids)?;
+    Ok(())
+  }
+
+  /// Like [`Collection::delete`], and returns how many of `ids` named a
+  /// document that existed (an id listed twice counts once). The count
+  /// is exact even with concurrent writers: it is taken when the batch is
+  /// applied, in log order.
+  pub fn delete_counted(&self, ids: &[Id]) -> Result<usize> {
     self.h.core.delete(ids)
   }
 
@@ -1428,19 +1733,42 @@ mod tests {
     }
   }
 
+  /// Graph segments of (live, total) docs.
+  fn g(s: &[(u64, u64)]) -> Vec<SegSize> {
+    s.iter()
+      .map(|&(live, total)| SegSize {
+        live,
+        total,
+        graph: true,
+      })
+      .collect()
+  }
+
+  fn flat(live: u64) -> SegSize {
+    SegSize {
+      live,
+      total: live,
+      graph: false,
+    }
+  }
+
+  fn pick(s: &[(u64, u64)], o: &Options) -> Option<std::ops::Range<usize>> {
+    pick_merge(&g(s), o, false, false)
+  }
+
   #[test]
   fn policy_bounds_count_then_tiers_then_deletes() {
     let o = opts();
-    assert_eq!(pick_merge(&[(100, 100), (10, 100)], &o), Some(1..2));
+    assert_eq!(pick(&[(100, 100), (10, 100)], &o), Some(1..2));
     // A tier window wins over a segment with many deletes.
     let s = [(10, 100), (90, 90), (100, 100), (50, 50), (80, 80)];
-    assert_eq!(pick_merge(&s, &o), Some(0..4));
-    assert_eq!(pick_merge(&[(100, 100); 3], &o), None);
+    assert_eq!(pick(&s, &o), Some(0..4));
+    assert_eq!(pick(&[(100, 100); 3], &o), None);
     let s = [(1000, 1000), (90, 90), (100, 100), (50, 50), (80, 80)];
-    assert_eq!(pick_merge(&s, &o), Some(1..5));
+    assert_eq!(pick(&s, &o), Some(1..5));
     // A different tier in the window blocks it.
     let s = [(90, 90), (1000, 1000), (100, 100), (50, 50), (80, 80)];
-    assert_eq!(pick_merge(&s, &o), None);
+    assert_eq!(pick(&s, &o), None);
     // Too many segments: smallest neighbouring pair.
     let mut s = vec![(1000u64, 1000u64); 3 * 4 + 9];
     for (i, x) in s.iter_mut().enumerate() {
@@ -1449,7 +1777,210 @@ mod tests {
       }
     }
     s[7] = (1, 1);
-    let r = pick_merge(&s, &o).unwrap();
+    let r = pick(&s, &o).unwrap();
     assert!(r.contains(&7) && r.len() == 2);
+  }
+
+  #[test]
+  fn fold_waits_for_enough_flat_segments_then_extends_the_graph() {
+    let o = Options {
+      memtable_max_docs: 100,
+      merge_factor: 4,
+      hnsw_min_docs: 50,
+      ..Options::default()
+    };
+    let fold = |s: &[SegSize], quiet| pick_merge(s, &o, true, quiet);
+    // One memtable's worth after a small graph: fold into it.
+    let mut s = g(&[(100, 100)]);
+    s.push(flat(100));
+    assert_eq!(fold(&s, false), Some(0..2));
+    // A large graph waits for a quarter of its size or four segments...
+    let mut s = g(&[(1000, 1000)]);
+    s.extend([flat(100), flat(100)]);
+    assert_eq!(fold(&s, false), None);
+    s.push(flat(100));
+    assert_eq!(fold(&s, false), Some(0..4));
+    let mut s = g(&[(1000, 1000)]);
+    s.extend([flat(100), flat(100)]);
+    // ... or for writes to pause.
+    assert_eq!(fold(&s, true), Some(0..3));
+    // Without lazy graphs the old policy applies.
+    assert_eq!(pick_merge(&s, &o, false, true), None);
+    // A graph with deletes is not extended (it must lose them first):
+    // the run gets a graph of its own.
+    let mut s = g(&[(900, 1000)]);
+    s.extend([flat(100); 4]);
+    assert_eq!(fold(&s, false), Some(1..5));
+    // Nor is one too large to rewrite for so few documents.
+    let mut s = g(&[(100_000, 100_000)]);
+    s.extend([flat(100); 4]);
+    assert_eq!(fold(&s, false), Some(1..5));
+    // A single small flat segment with nothing to fold into stays.
+    assert_eq!(fold(&[flat(10)], true), None);
+    assert_eq!(fold(&[flat(60)], true), Some(0..1));
+    assert!(!has_trailing_flats(&g(&[(1, 1)])));
+  }
+
+  /// Background merges never produce segments above `max_merge_docs`,
+  /// also when a long graphless tail cannot be folded into a graph.
+  #[test]
+  fn fold_respects_max_merge_docs() {
+    let o = Options {
+      memtable_max_docs: 1000,
+      merge_factor: 4,
+      hnsw_min_docs: 10,
+      max_merge_docs: 2500,
+      ..Options::default()
+    };
+    let s = vec![flat(1000); 4];
+    let r = pick_merge(&s, &o, true, false);
+    let docs: u64 = r.clone().map_or(0, |r| s[r].iter().map(|x| x.live).sum());
+    assert!(docs <= o.max_merge_docs as u64, "{r:?} merges {docs} docs");
+    // The oldest segments that fit go first.
+    assert_eq!(r, Some(0..2));
+  }
+
+  /// A graphless run left between graph segments (for example by the
+  /// segment-count rule merging the end of a run) is still folded.
+  #[test]
+  fn stranded_graphless_segments_are_folded() {
+    let o = Options {
+      memtable_max_docs: 100,
+      merge_factor: 4,
+      hnsw_min_docs: 50,
+      ..Options::default()
+    };
+    // G, F, G': F is folded into G when the rewrite is proportionate.
+    let mut s = g(&[(1_000, 1_000)]);
+    s.push(flat(100));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, false), Some(0..2));
+    // Not for a few documents into a large G: a small F stays (it is
+    // scanned exactly, which is cheap at that size) ...
+    let mut s = g(&[(10_000, 10_000)]);
+    s.push(flat(30));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, true), None);
+    // ... and a large enough F gets a graph of its own, as it does when
+    // G has deletes and cannot be extended.
+    s[1] = flat(60);
+    assert_eq!(pick_merge(&s, &o, true, false), Some(1..2));
+    let mut s = g(&[(900, 1_000)]);
+    s.push(flat(60));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, false), Some(1..2));
+  }
+
+  /// A small graphless segment that fits under `max_merge_docs` with no
+  /// neighbour must not keep the segments after it from getting graphs
+  /// (they would stay graphless forever, and so would every later flush).
+  #[test]
+  fn small_head_that_cannot_pair_does_not_stop_folding() {
+    let o = Options {
+      memtable_max_docs: 50_000,
+      merge_factor: 4,
+      hnsw_min_docs: 10_000,
+      max_merge_docs: 50_000,
+      ..Options::default()
+    };
+    let mut s = vec![flat(1000)];
+    for _ in 0..40 {
+      s.push(flat(50_000));
+    }
+    assert_eq!(pick_merge(&s, &o, true, true), Some(1..2));
+  }
+
+  /// Applies `pick_merge` until it picks nothing, modelling each merge as
+  /// one segment of the summed live documents (with a graph if large
+  /// enough). Returns the final segments, or `None` if it did not end.
+  fn settle(
+    mut s: Vec<SegSize>,
+    o: &Options,
+    quiet: bool,
+  ) -> Option<Vec<SegSize>> {
+    for _ in 0..10_000 {
+      let Some(r) = pick_merge(&s, o, true, quiet) else {
+        return Some(s);
+      };
+      assert!(!r.is_empty() && r.end <= s.len(), "{r:?} of {}", s.len());
+      let live: u64 = s[r.clone()].iter().map(|x| x.live).sum();
+      if r.len() > 1 {
+        assert!(live <= o.max_merge_docs as u64, "{r:?} merges {live}");
+      }
+      let out = (live > 0).then_some(SegSize {
+        live,
+        total: live,
+        graph: live >= o.hnsw_min_docs as u64,
+      });
+      s.splice(r, out);
+    }
+    None
+  }
+
+  /// Property: from any mix of segments, background merging settles,
+  /// leaves no graphless segment large enough for a graph, and gets the
+  /// segment count under its bound whenever merges under the cap can.
+  #[test]
+  fn merge_policy_always_settles_with_graphs() {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = |n: u64| {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      x % n
+    };
+    for case in 0..3000 {
+      let unit = [100u64, 1000][rnd(2) as usize];
+      let cap = match rnd(4) {
+        0 => unit,
+        1 => unit / 2,
+        2 => 3 * unit,
+        _ => 10 * unit,
+      };
+      let o = Options {
+        memtable_max_docs: unit as usize,
+        max_merge_docs: cap as usize,
+        hnsw_min_docs: [1, 10, 50, 500][rnd(4) as usize],
+        merge_factor: 2 + rnd(3) as usize,
+        ..Options::default()
+      };
+      let s: Vec<SegSize> = (0..rnd(60))
+        .map(|_| {
+          let total = 1 + rnd(2 * unit);
+          let live = if rnd(4) == 0 { rnd(total + 1) } else { total };
+          SegSize {
+            live,
+            total,
+            graph: rnd(3) == 0 && live >= o.hnsw_min_docs as u64,
+          }
+        })
+        .collect();
+      for quiet in [true, false] {
+        let end = settle(s.clone(), &o, quiet)
+          .unwrap_or_else(|| panic!("case {case}: no end for {s:?} {o:?}"));
+        if quiet {
+          let stuck: Vec<_> = end
+            .iter()
+            .filter(|x| !x.graph && x.live >= o.hnsw_min_docs as u64)
+            .collect();
+          assert!(stuck.is_empty(), "case {case}: {end:?} {o:?}");
+        }
+        let can_shrink = end.windows(2).any(|w| w[0].live + w[1].live <= cap);
+        assert!(
+          end.len() <= max_segments(&o) || !can_shrink,
+          "case {case}: {} segments: {end:?} {o:?}",
+          end.len()
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn fully_deleted_segments_go_first() {
+    let o = opts();
+    let s = [(100, 100), (0, 50), (0, 80), (10, 90), (0, 5)];
+    assert_eq!(pick(&s, &o), Some(1..3));
+    let s = [(100, 100), (100, 100), (0, 5)];
+    assert_eq!(pick(&s, &o), Some(2..3));
   }
 }

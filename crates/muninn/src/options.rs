@@ -24,6 +24,15 @@ pub struct Options {
   /// index even when the schema asks for HNSW: scanning is faster than a
   /// graph at that size. Default 10 000.
   pub hnsw_min_docs: usize,
+  /// While writes arrive faster than segments are built, flushed
+  /// segments skip the HNSW graph and background merging inserts their
+  /// vectors into a graph segment in bulk, so every vector goes into a
+  /// graph about once. Such segments are searched exactly until then.
+  /// When no write arrives for this long, they are merged whatever their
+  /// size: in practice one to two delays after the last write. Zero
+  /// merges them as soon as the worker is idle, even while writes
+  /// continue; delays below 1 ms count as 1 ms. Default 1 s.
+  pub merge_idle_delay: Duration,
   /// Merge segments in the background. Default true.
   pub auto_compact: bool,
   /// Background merging merges this many neighbouring segments of
@@ -32,9 +41,11 @@ pub struct Options {
   /// A segment in which at least this fraction of documents is deleted
   /// is rewritten without them. Default 0.3.
   pub compact_deleted_ratio: f64,
-  /// Background merges never produce segments above this many documents
-  /// (an explicit [`crate::Collection::compact`] ignores the limit).
-  /// Default 4 000 000.
+  /// Background merges never combine segments into one above this many
+  /// documents (an explicit [`crate::Collection::compact`] ignores the
+  /// limit). A single segment may still be rewritten on its own when it
+  /// is larger, for example a flushed memtable that gets its HNSW graph
+  /// later (when `memtable_max_docs` exceeds this). Default 4 000 000.
   pub max_merge_docs: usize,
   /// Size of one write-ahead-log file before a new one is started.
   /// Default 64 MiB.
@@ -52,6 +63,7 @@ impl Default for Options {
       memtable_max_bytes: 256 << 20,
       max_pending_flushes: 2,
       hnsw_min_docs: 10_000,
+      merge_idle_delay: Duration::from_secs(1),
       auto_compact: true,
       merge_factor: 4,
       compact_deleted_ratio: 0.3,
@@ -119,6 +131,10 @@ pub enum Failpoint {
   AfterManifestCommit,
   /// After a compaction wrote its segment, before the manifest commit.
   AfterCompactionWrite,
+  /// After a compaction committed the manifest and published the merged
+  /// segment, before the second commit that lets the merged-away
+  /// segments be deleted.
+  AfterCompactionCommit,
   /// Not a crash: the worker pauses 20 ms inside the windows where a
   /// flush or merge has captured state that concurrent writes may change
   /// before it publishes, so tests can hit those races reliably.
