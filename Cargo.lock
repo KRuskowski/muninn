@@ -251,9 +251,20 @@ name = "muninn-core"
 version = "0.1.0"
 
 [[package]]
+name = "muninn-filter"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "muninn-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "muninn-simd"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "muninn-core",
 ]
 
