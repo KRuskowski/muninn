@@ -72,7 +72,7 @@ Kernels for `dot`, `l2sq`, `distance_batch`, `dot_f32_u8` (SQ8 query x codes), `
 ### muninn-vector
 - `FlatIndex`: blocked, multi-threaded, filter-aware exact scan; the recall oracle.
 - HNSW: parallel batch build, incremental insert, filter-aware search (keep traversing through filtered-out nodes; fall back to brute force when the filter is very selective), configurable `M`, `ef_construction` and `ef`. Graph stored as flat arrays (fixed-width level-0 adjacency) so it serialises as container sections and opens zero-copy.
-- HNSW node order (format version 3): a bulk build into an empty index renumbers its nodes breadth-first for memory locality and keeps an internal/external id map inside the index, so callers (the engine) see exactly the `DocId`s they inserted. Nodes inserted later keep equal ids. Version 1 and 2 files still open.
+- HNSW node order (format version 3): a bulk build into an empty index renumbers its nodes breadth-first for memory locality and keeps an internal/external id map inside the index, so callers (the engine) see exactly the `DocId`s they inserted. Nodes inserted later keep equal ids. Version 1 and 2 files still open; at open the maps are checked to be inverse permutations (one O(n) pass), else the file is rejected as corrupt. Ties: results tie-break on the caller's id over everything the beam found, but the beam itself (`ef` candidates) is ordered by internal id, so when more than `ef` vectors are exactly equidistant at the cut-off, which of them reach the results depends on the node order. `-0.0` and `+0.0` distances tie everywhere.
 - Quantisation: SQ8 (per-dimension min/max to u8 or i8) and binary (sign bits, Hamming), each with full-precision re-ranking.
 - Recall tests against `FlatIndex` on clustered synthetic data.
 
