@@ -3,8 +3,10 @@ use std::fmt;
 /// Result alias used across muninn.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Every error muninn reports.
+/// Every error muninn reports. More kinds may be added in later
+/// versions, so a `match` on it needs a catch-all arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
   /// An operating system I/O error.
   Io(std::io::Error),

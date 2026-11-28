@@ -515,10 +515,14 @@ async fn delete_documents(
   blocking(move || {
     let start = Instant::now();
     let ids = model::parse_delete(&body.bytes)?;
-    c.delete(&ids)?;
+    let deleted = c.delete_counted(&ids)?;
     json_response(
       StatusCode::OK,
-      &json!({"count": ids.len(), "took_us": micros(start.elapsed())}),
+      &json!({
+        "count": ids.len(),
+        "deleted": deleted,
+        "took_us": micros(start.elapsed()),
+      }),
     )
   })
   .await

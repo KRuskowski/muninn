@@ -281,6 +281,7 @@ async fn upsert_then_search_get_and_delete() {
   .await;
   assert_eq!(r.0, 200, "{}", r.1);
   assert_eq!(r.1["count"], 2);
+  assert_eq!(r.1["deleted"], 1, "only id 1 existed");
   let m = assert_error(
     &call(&a, "GET", "/v1/collections/docs/documents/1", "").await,
     404,
@@ -947,9 +948,9 @@ async fn damaged_collection_is_reported_and_can_be_dropped() {
 }
 
 /// After a background failure the engine cannot recover from, writes are
-/// refused with a 500 that says how to recover.
+/// refused with a 503 that says how to recover.
 #[tokio::test]
-async fn poisoned_collection_refuses_writes_with_internal_error() {
+async fn poisoned_collection_refuses_writes_as_unavailable() {
   let dir = TestDir::new("poisoned");
   let opts = Options {
     durability: Durability::NoSync,
@@ -970,8 +971,8 @@ async fn poisoned_collection_refuses_writes_with_internal_error() {
   assert_eq!(r.0, 200);
   assert_error(
     &call(&a, "POST", "/v1/collections/docs/flush", "").await,
-    500,
-    "internal",
+    503,
+    "unavailable",
   );
   let m = assert_error(
     &call(
@@ -981,8 +982,8 @@ async fn poisoned_collection_refuses_writes_with_internal_error() {
       r#"{"documents": [{"id": 9, "vector": [1, 0, 0]}]}"#,
     )
     .await,
-    500,
-    "internal",
+    503,
+    "unavailable",
   );
   assert!(m.contains("refuses writes"), "{m}");
   drop(a);

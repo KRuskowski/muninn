@@ -123,7 +123,11 @@ impl From<muninn::Error> for ApiError {
       E::AlreadyExists(m) => {
         Self::new(ErrorCode::AlreadyExists, format!("{m} already exists"))
       }
-      e @ (E::Io(_) | E::Corrupt(_)) => Self::internal(e.to_string()),
+      // A collection that stopped accepting writes after a background
+      // failure; reopening (a server restart) recovers it.
+      E::Unavailable(m) => Self::new(ErrorCode::Unavailable, m),
+      // Disk errors, corrupt data, and kinds added later.
+      e => Self::internal(e.to_string()),
     }
   }
 }

@@ -39,8 +39,8 @@ Every failure returns the same body, with a matching status code:
 | `already_exists` | 409 | creating a collection whose name is taken |
 | `payload_too_large` | 413 | the body exceeds `--body-limit` (default 16 MiB); for the bulk endpoint, one line exceeds `--bulk-line-limit` (default 1 MiB) |
 | `unsupported_media_type` | 415 | a body without `Content-Type: application/json` |
-| `internal` | 500 | disk errors, corrupt data, a collection that could not be opened, a collection that stopped accepting writes after a disk failure |
-| `unavailable` | 503 | too many requests, bulk imports or request bytes in flight; retry after the `Retry-After` seconds |
+| `internal` | 500 | disk errors, corrupt data, a collection that could not be opened |
+| `unavailable` | 503 | too many requests, bulk imports or request bytes in flight (retry after the `Retry-After` seconds); a collection that stopped accepting writes after a disk failure (until the server is restarted) |
 
 Messages say exactly what is wrong and where, for example `request body: unknown field \`limit\`, expected one of ... at line 1 column 21` or `filter at $.and[1].range.year: range bound must be a number, got a string`.
 
@@ -67,7 +67,7 @@ Messages say exactly what is wrong and where, for example `request body: unknown
 - `last_lsn`, `durable_lsn`, `checkpoint_lsn`: sequence numbers of the last applied write, of the last write on stable storage, and of the last write contained in segments.
 - `unavailable`: collections whose files could not be opened when the server started, with the reason, for example `{"old": "corrupt data: ..."}`. The other collections work normally. Every endpoint of an unavailable collection answers `500 internal` with that reason; `DELETE /v1/collections/{name}` removes it.
 
-If a disk failure leaves a collection in an unknown state, it stops accepting writes and its write endpoints answer `500 internal` with a message saying so. Restarting the server reopens it and recovers every acknowledged write.
+If a disk failure leaves a collection in an unknown state, it stops accepting writes and its write endpoints answer `503 unavailable` with a message saying so; retrying does not help until the server is restarted. Restarting the server reopens it and recovers every acknowledged write.
 
 ## Collections
 
@@ -149,7 +149,7 @@ curl -sS -X POST -H 'Content-Type: application/x-ndjson' --data-binary @docs.jso
 
 ### Delete: `DELETE /v1/collections/{name}/documents`
 
-`{"ids": ["a1", 7]}`. Unknown ids are ignored; all-or-nothing like an upsert. Response: `{"count": 2, "took_us": 95}` (the number of ids received).
+`{"ids": ["a1", 7]}`. Unknown ids are ignored; all-or-nothing like an upsert. Response: `{"count": 2, "deleted": 1, "took_us": 95}`: `count` is the number of ids received, `deleted` how many of them named a document that existed (an id listed twice counts once).
 
 ### Get: `GET /v1/collections/{name}/documents/{id}[?id_type=string|u64]`
 

@@ -79,3 +79,5 @@ All notable changes to muninn are recorded here, written for people who use muni
 - A collection's schema can be written to and read from JSON (`Schema::to_json`, `Schema::from_json`), in the same format muninn stores it in; settings left out take their defaults, and a misspelt setting is reported by name.
 - `Collection::delete_counted` deletes like `delete` and tells you how many of the given ids existed.
 - Searches on a collection held in a single part skip some internal coordination work, making each search slightly faster.
+- Server: deleting documents now also reports how many of the given ids existed (`"deleted"` next to `"count"` in the response). A collection that stopped accepting writes after a disk failure now answers `503 unavailable` instead of `500 internal`, with a message saying to restart the server.
+- For Rust users: muninn's error type may gain new kinds in later versions, so code that matches on it needs a catch-all arm.
