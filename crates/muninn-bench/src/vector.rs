@@ -306,8 +306,14 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
        {write_s:.2} s",
       bytes as f64 / 1e6
     );
-    let results = sweep(&opened, &qs, &ds, cfg.k, &cfg.efs, cfg.runs, pools)?;
     let stats = opened.stats();
+    if q != Quantization::None {
+      eprintln!(
+        "  {engine}: {} vectors scored at full precision",
+        stats.exact_rows
+      );
+    }
+    let results = sweep(&opened, &qs, &ds, cfg.k, &cfg.efs, cfg.runs, pools)?;
     drop(opened);
     let report = VectorReport {
       kind: "vector",
@@ -339,6 +345,7 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
           "vector_bytes": stats.vector_bytes,
           "graph_bytes": stats.graph_bytes,
           "code_bytes": stats.code_bytes,
+          "exact_rows": stats.exact_rows,
           "max_level": stats.max_level,
           "avg_level0_degree": stats.avg_degree,
         }),

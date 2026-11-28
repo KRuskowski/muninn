@@ -147,7 +147,13 @@ impl Builder<'_> {
     match self.codes {
       Some(qz) => {
         let qc = qz.prepare(self.metric, self.row(q));
-        with_code_dist!(qz.dist(&qc), |d| self.insert_with(q, &d, true))
+        let full = FullDist {
+          metric: self.metric,
+          dim: self.dim,
+          query: self.row(q),
+          data: self.data,
+        };
+        with_code_dist!(qz.dist(&qc, full), |d| self.insert_with(q, &d, true))
       }
       None => {
         let dist = FullDist {

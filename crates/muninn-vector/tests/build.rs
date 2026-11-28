@@ -90,3 +90,46 @@ fn coded_build_recall_with_outliers() {
     }
   }
 }
+
+/// Two populations interleaved row by row (as alternating kinds of
+/// documents arrive): code ranges used to be fitted, and checked, on every
+/// `ceil(n / 8192)`-th row, so with an even stride one population was
+/// never sampled, saturated to a single code and the check still passed
+/// (recall@10 at ef 16 for its queries: 0.62 against 0.98).
+#[test]
+fn coded_build_sees_interleaved_populations() {
+  // Above the size where every row is sampled, with an even stride
+  // (`ceil(32768 / 8192) = 4`) for the old sampling to miss a population.
+  let n = 32_768;
+  let a = Clusters::new(DIM, 30, 0.4, 21);
+  let b = Clusters::new(DIM, 30, 0.4, 22);
+  let (sa, sb) = (a.sample(n / 2, 1), b.sample(n / 2, 2));
+  let shift = |x: &f32| x * 20.0 + 50.0;
+  let mut d = Vec::with_capacity(n * DIM);
+  for i in 0..n / 2 {
+    d.extend_from_slice(&sa[i * DIM..(i + 1) * DIM]);
+    d.extend(sb[i * DIM..(i + 1) * DIM].iter().map(shift));
+  }
+  let qa = a.sample(QUERIES, 77);
+  let qb: Vec<f32> = b.sample(QUERIES, 78).iter().map(shift).collect();
+  let metric = Metric::L2;
+  let p = HnswParams::default().with_ef_construction(100);
+  let bulk = pool()
+    .install(|| HnswIndex::build(DIM, metric, p, &d))
+    .unwrap();
+  let mut chunked = HnswIndex::new(DIM, metric, p).unwrap();
+  pool().install(|| {
+    for ch in d.chunks(3000 * DIM) {
+      chunked.add_batch(ch).unwrap();
+    }
+  });
+  let flat = FlatIndex::from_vectors(DIM, metric, &d).unwrap();
+  for (name, qs) in [("first", &qa), ("second", &qb)] {
+    for ef in [16, 32] {
+      let rb = mean_recall(&bulk, &flat, qs, ef);
+      let rc = mean_recall(&chunked, &flat, qs, ef);
+      println!("{name} population ef {ef}: bulk {rb:.4} chunked {rc:.4}");
+      assert!(rb >= rc - 0.03, "{name} ef {ef}: bulk {rb:.4} vs {rc:.4}");
+    }
+  }
+}

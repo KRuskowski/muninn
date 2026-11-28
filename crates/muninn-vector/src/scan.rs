@@ -135,6 +135,14 @@ pub(crate) fn scan_rows(
 /// rows, where batched distance calls win.
 const SPARSE_DIV: usize = 8;
 
+/// Whether `filter` offers an id set small enough (at most `1 /
+/// SPARSE_DIV` of `n` rows) that scoring its ids beats scanning rows.
+pub(crate) fn sparse_candidates(filter: &dyn DocFilter, n: usize) -> bool {
+  filter
+    .candidates()
+    .is_some_and(|b| b.count().saturating_mul(SPARSE_DIV) <= n)
+}
+
 /// Like [`scan_rows`] with a filter, but visits only the ids set in
 /// `bits` (a superset of the passing ids, see `DocFilter::candidates`),
 /// so the cost follows the number of candidates rather than the range.

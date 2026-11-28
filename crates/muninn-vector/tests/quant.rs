@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Clusters, init_pool, random_set, recall};
-use muninn_core::{AlignedBuf, DocId, Metric, Region};
+use muninn_core::{AlignedBuf, BitSet, DocId, Metric, Region};
 use muninn_vector::{
   FlatIndex, HnswIndex, HnswParams, Quantization, SearchParams, VectorIndex,
 };
@@ -197,4 +197,98 @@ fn quantised_index_grows_one_insert_at_a_time() {
   println!("grown sq8: hnsw {:.4} flat {:.4}", rh / 100.0, rf / 100.0);
   // Retraining as the index grows keeps codes useful.
   assert!(rh / 100.0 >= 0.95 && rf / 100.0 >= 0.97);
+}
+
+/// SQ8 search codes of a quantised index: one vector at +-1e4 among
+/// clustered vectors used to stretch every dimension's range, so all the
+/// others shared one or two code levels (recall@10 0.008 at ef 32..128,
+/// against 1.0 at full precision). The ranges now come from clipped
+/// quantiles and the outliers are scored at full precision: recall stays
+/// within 0.03 of the same graph searched at full precision, with 2% of
+/// outliers too, and a query next to an outlier finds it (at ef 256; at
+/// ef 64 a far outlier is missed now and then at full precision too).
+#[test]
+fn sq8_index_keeps_recall_with_outliers() {
+  let dim = 32;
+  let n = 12_000;
+  let c = common::Clusters::new(dim, 30, 0.4, 21);
+  let qs = c.sample(100, 77);
+  for outliers in [0usize, 1, 240] {
+    let mut d = c.sample(n, 1);
+    let mut rows = Vec::new();
+    for o in 0..outliers {
+      let row = (o * 997 + 14) % n;
+      rows.push(row);
+      for j in 0..dim {
+        let up = (o * 31 + j * 7) % 5 < 2;
+        let m = 1e4 * (1.0 + o as f32 / 512.0);
+        d[row * dim + j] = if up { m } else { -m };
+      }
+    }
+    for metric in [Metric::L2, Metric::Dot] {
+      let p = HnswParams::default();
+      let mut idx = HnswIndex::build(dim, metric, p, &d).unwrap();
+      let full = idx.clone();
+      idx.set_quantization(Quantization::Sq8);
+      let exact = idx.stats().exact_rows;
+      assert!(exact >= outliers && exact <= outliers + n / 100, "{exact}");
+      let flat = FlatIndex::from_vectors(dim, metric, &d).unwrap();
+      for ef in [32, 64] {
+        let sp = SearchParams::new(10).with_ef(ef);
+        let (mut rq, mut rf) = (0.0, 0.0);
+        for q in qs.chunks_exact(dim) {
+          let t = flat.search(q, &sp, None).unwrap();
+          rq += common::recall(&idx.search(q, &sp, None).unwrap(), &t);
+          rf += common::recall(&full.search(q, &sp, None).unwrap(), &t);
+        }
+        let (rq, rf) = (rq / 100.0, rf / 100.0);
+        println!(
+          "{outliers} outliers {metric:?} ef {ef}: sq8 {rq:.4} full {rf:.4}"
+        );
+        assert!(
+          rq >= rf - 0.03,
+          "{outliers} {metric:?} ef {ef}: {rq:.4} vs {rf:.4}"
+        );
+      }
+      if metric == Metric::L2 {
+        let sp = SearchParams::new(1).with_ef(256);
+        for &row in rows.iter().take(40) {
+          let q: Vec<f32> = d[row * dim..(row + 1) * dim]
+            .iter()
+            .map(|x| x + 0.5)
+            .collect();
+          let hit = idx.search(&q, &sp, None).unwrap();
+          assert_eq!(hit[0].id as usize, row, "outlier {row} not found");
+        }
+      }
+    }
+  }
+}
+
+/// A selective filter with an id set on a quantised flat index is
+/// answered by scoring those ids at full precision: exact, and cheaper
+/// than scanning every code. Before, binary codes found 0.964 of the true
+/// ten nearest of 600 passing documents.
+#[test]
+fn quantised_flat_scores_selective_filters_exactly() {
+  let (n, dim) = (20_000, 16);
+  // Unclustered data, where binary codes rank poorly.
+  let mut g = common::Rng::new(5);
+  let d: Vec<f32> = (0..n * dim).map(|_| g.gauss()).collect();
+  let qs: Vec<f32> = (0..30 * dim).map(|_| g.gauss()).collect();
+  let exact = FlatIndex::from_vectors(dim, Metric::L2, &d).unwrap();
+  let mut set = BitSet::new(n);
+  let mut rng = common::Rng::new(4);
+  for _ in 0..600 {
+    set.insert((rng.next_u64() % n as u64) as DocId);
+  }
+  for q in [Quantization::Sq8, Quantization::Binary] {
+    let mut f = FlatIndex::from_vectors(dim, Metric::L2, &d).unwrap();
+    f.quantize(q);
+    for qv in qs.chunks_exact(dim) {
+      let sp = SearchParams::new(10);
+      let want = exact.search(qv, &sp, Some(&set)).unwrap();
+      assert_eq!(f.search(qv, &sp, Some(&set)).unwrap(), want, "{q:?}");
+    }
+  }
 }

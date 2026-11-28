@@ -106,12 +106,6 @@ const PAR_MIN_BATCH: usize = 64;
 /// digits. Small batches are not worth training codes for.
 const CODED_BUILD_MIN: usize = 4096;
 
-/// Largest `Quantizer::sq8_error_ratio` (coding error relative to the
-/// spread of the bulk of the values) at which a build searches with SQ8
-/// codes. Well-spread data scores about 1e-4; codes whose range one
-/// outlier stretched score near or above 1.
-const MAX_CODE_ERROR: f32 = 1e-2;
-
 /// While the graph is smaller than this, a batch is inserted serially
 /// first, so parallel inserts never race over a near-empty graph.
 const SERIAL_WARMUP: usize = 256;
@@ -258,6 +252,11 @@ pub struct HnswStats {
   pub graph_bytes: usize,
   /// Bytes of quantised codes and their parameters.
   pub code_bytes: usize,
+  /// Vectors that quantised traversal scores at full precision because
+  /// their codes would misrepresent them (values far outside the range
+  /// the codes cover); all of them when the codes cannot resolve the data
+  /// at all. Zero without quantisation.
+  pub exact_rows: usize,
   /// Average level-0 out-degree.
   pub avg_degree: usize,
   /// Nodes that a level-0 walk from the entry point cannot reach, so no
@@ -366,6 +365,7 @@ impl HnswIndex {
       vector_bytes: self.vectors.bytes(),
       graph_bytes: self.graph.bytes(),
       code_bytes: self.quant.as_ref().map_or(0, |q| q.bytes()),
+      exact_rows: self.quant.as_ref().map_or(0, |q| q.exact_rows()),
       avg_degree: edges.checked_div(len).unwrap_or(0),
       unreachable: len - self.reachable_at_level0(),
     }
@@ -639,19 +639,22 @@ impl HnswIndex {
     let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
     let entry = Mutex::new((self.entry, self.max_level));
     // Large batches search with SQ8 codes while inserting (see
-    // `Builder::codes`): the index's own SQ8 codes if they still resolve
-    // all the vectors well (they may have been trained on an early part
-    // of them), otherwise codes trained for this build on clipped ranges
-    // (n * dim bytes while the build runs). If even those are too coarse
-    // (heavy outliers), the build searches full vectors.
+    // `Builder::codes`): the index's own SQ8 codes if they resolve the
+    // data well (`Quantizer::good_for_build`), otherwise codes fitted for
+    // this build (n * dim bytes while it runs). If SQ8 cannot stand in for
+    // the vectors (`train_sq8_for_build` gives up), the build searches
+    // full vectors.
     let coded = stripes > 1 && rows >= CODED_BUILD_MIN;
-    let data = self.vectors.as_slice();
-    let fine = |q: &Quantizer| q.sq8_error_ratio(data) <= MAX_CODE_ERROR;
-    let own = self.quant.as_ref().filter(|q| coded && fine(q));
+    let own = self.quant.as_ref().filter(|q| coded && q.good_for_build());
     let temp_codes = (coded && own.is_none())
-      .then(|| Quantizer::train_sq8_clipped(self.dim, self.metric, data))
-      .flatten()
-      .filter(|q| fine(q));
+      .then(|| {
+        Quantizer::train_sq8_for_build(
+          self.dim,
+          self.metric,
+          self.vectors.as_slice(),
+        )
+      })
+      .flatten();
     let build_codes = own.or(temp_codes.as_ref());
     let r = {
       let b = Builder {
@@ -992,20 +995,23 @@ impl VectorIndex for HnswIndex {
       }
       other => other,
     };
-    // With a selectivity hint, Auto decides up front; without one it
-    // judges the filter from the pass rate seen during traversal.
+    // With a selectivity hint, Auto decides up front; with or without
+    // one it also judges the filter from the pass rate seen during
+    // traversal.
     let mut adaptive = false;
     if let Some(f) = filter {
       let exact = match self.params.filter {
         FilterStrategy::Exact => true,
         FilterStrategy::Graph => false,
-        FilterStrategy::Auto => match f.selectivity_hint() {
-          Some(s) => prefer_exact(self.len(), s, ef),
-          None => {
-            adaptive = true;
-            false
-          }
-        },
+        // The pass rate seen during traversal is watched even with a
+        // hint: an overestimating hint (deletes concentrated in the
+        // selection, say) would otherwise walk the whole graph while
+        // fewer than `ef` documents pass.
+        FilterStrategy::Auto => {
+          adaptive = true;
+          f.selectivity_hint()
+            .is_some_and(|s| prefer_exact(self.len(), s, ef))
+        }
       };
       if exact {
         return Ok(self.exact(&q, k, filter).into_hits(self.metric));
@@ -1040,7 +1046,13 @@ impl VectorIndex for HnswIndex {
         }
         .clamp(k, n);
         let qc = qz.prepare(self.metric, &q);
-        let b = with_code_dist!(qz.dist(&qc), |d| {
+        let full = FullDist {
+          metric: self.metric,
+          dim: self.dim,
+          query: &q,
+          data,
+        };
+        let b = with_code_dist!(qz.dist(&qc, full), |d| {
           self.graph_search(&d, ef.max(r), graph_filter, adaptive)
         });
         if b.aborted || b.top.len() < k {

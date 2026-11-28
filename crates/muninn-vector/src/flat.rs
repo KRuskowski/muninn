@@ -4,16 +4,18 @@ use std::ops::Range;
 use muninn_core::container::{Container, ContainerWriter, tag};
 use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Region, Result};
 
-use crate::dist::scan_dist;
+use crate::dist::{FullDist, scan_dist};
 use crate::quant::{Quantization, Quantizer, with_code_dist};
-use crate::scan::{exact_search, par_scan, rerank};
+use crate::scan::{exact_search, par_scan, rerank, sparse_candidates};
 use crate::slab::Slab;
 use crate::{SearchParams, VectorIndex, meta};
 
 /// Container kind of a [`FlatIndex`] file.
 pub const FLAT_KIND: [u8; 8] = tag("flat");
-/// Current [`FlatIndex`] file format version.
-pub const FLAT_VERSION: u32 = 1;
+/// Current [`FlatIndex`] file format version. Version 2 adds the SQ8
+/// sections `qexact` and `qcoarse` (vectors scored at full precision);
+/// version 1 files still open.
+pub const FLAT_VERSION: u32 = 2;
 
 const T_META: [u8; 8] = tag("meta");
 const T_VECTORS: [u8; 8] = tag("vectors");
@@ -161,7 +163,16 @@ impl FlatIndex {
   /// Opens a file written by [`FlatIndex::write_to`]. Vectors and codes
   /// are read in place from `region`; nothing is copied.
   pub fn open(region: Region) -> Result<Self> {
-    let c = Container::open_kind(region, FLAT_KIND, FLAT_VERSION)?;
+    let c = Container::open(region)?;
+    if c.kind() != FLAT_KIND {
+      return Err(Error::corrupt("not a flat index file"));
+    }
+    if !(1..=FLAT_VERSION).contains(&c.version()) {
+      return Err(Error::corrupt(format!(
+        "flat format version {} is not supported (expected 1..={FLAT_VERSION})",
+        c.version()
+      )));
+    }
     Self::from_container(&c)
   }
 
@@ -266,6 +277,11 @@ impl VectorIndex for FlatIndex {
     let data = self.data.as_slice();
     let top = match &self.quant {
       None => exact_search(self.metric, self.dim, data, &q, k, filter, None),
+      // A selective filter with an id set: scoring just those ids at full
+      // precision is cheaper than scanning every code, and exact.
+      Some(_) if filter.is_some_and(|f| sparse_candidates(f, n)) => {
+        exact_search(self.metric, self.dim, data, &q, k, filter, None)
+      }
       Some(qz) => {
         let r = match params.rerank {
           0 => qz.kind().default_rerank(k),
@@ -273,7 +289,13 @@ impl VectorIndex for FlatIndex {
         }
         .clamp(k, n);
         let qc = qz.prepare(self.metric, &q);
-        let cd = qz.dist(&qc);
+        let full = FullDist {
+          metric: self.metric,
+          dim: self.dim,
+          query: &q,
+          data,
+        };
+        let cd = qz.dist(&qc, full);
         let cands = with_code_dist!(cd, |d| {
           par_scan(n, r, n * self.dim / 4, |range, top| {
             scan_dist(&d, range, filter, top)

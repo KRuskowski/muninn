@@ -82,7 +82,9 @@ pub fn normalize(a: &mut [f32]) {
 pub(crate) fn finish(metric: Metric, raw: f32) -> f32 {
   match metric {
     Metric::L2 => raw,
-    Metric::Dot => -raw,
+    // `0.0 - raw`, not `-raw`: a zero dot product gives distance `+0.0`
+    // whatever its sign, so equal distances tie in every sort.
+    Metric::Dot => 0.0 - raw,
     Metric::Cosine => 1.0 - raw,
   }
 }

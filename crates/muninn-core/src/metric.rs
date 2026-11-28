@@ -25,7 +25,9 @@ impl Metric {
   #[inline]
   pub fn score(self, distance: f32) -> f32 {
     match self {
-      Self::L2 | Self::Dot => -distance,
+      // `0.0 - d`, not `-d`: a zero distance scores `+0.0`, never
+      // `-0.0`, so equal scores tie in every sort.
+      Self::L2 | Self::Dot => 0.0 - distance,
       Self::Cosine => 1.0 - distance,
     }
   }
@@ -72,6 +74,15 @@ mod tests {
       assert_eq!(Metric::from_u8(m.to_u8()), Some(m));
     }
     assert_eq!(Metric::from_u8(9), None);
+  }
+
+  #[test]
+  fn zero_distance_scores_positive_zero() {
+    for m in [Metric::L2, Metric::Dot] {
+      for d in [0.0f32, -0.0] {
+        assert_eq!(m.score(d).to_bits(), 0, "{m:?} {d}");
+      }
+    }
   }
 
   #[test]
