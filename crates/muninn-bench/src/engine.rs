@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use muninn::store::ExternalId;
+use muninn::store::{ExternalId, MANIFEST_PREFIX, Manifest, map_file};
 use muninn::{
   Collection, Database, Document, Durability, IndexKind, Options, Query,
   Schema, VectorField,
@@ -72,13 +72,44 @@ pub struct Ingest {
   pub dir_bytes_after_compact: u64,
   /// Time to close the database and open it again.
   pub reopen_seconds: f64,
-  /// Size of the database directory after reopening: the on-disk
-  /// footprint of the data.
+  /// Size of the database directory after reopening. Includes the
+  /// segments of the previous manifest generation, which muninn keeps
+  /// as a crash fallback until the next commit.
   pub dir_bytes: u64,
+  /// Bytes of the files the current manifest references (the live
+  /// segments), plus the manifest itself and the write-ahead log.
+  pub live_bytes: u64,
   /// `dir_bytes` by file extension (`vec`, `ids`, `docs`, `wal`, ...).
   pub bytes_by_kind: BTreeMap<String, u64>,
   /// Resident memory growth over the whole ingest, when measurable.
   pub rss_delta_bytes: Option<i64>,
+}
+
+/// Bytes of the files referenced by the newest manifest in `coll_dir`,
+/// plus that manifest and the write-ahead log directory.
+fn live_bytes(coll_dir: &Path) -> Result<u64> {
+  let mut newest: Option<(u64, PathBuf)> = None;
+  for entry in std::fs::read_dir(coll_dir)? {
+    let p = entry?.path();
+    let name = p.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(g) = name.strip_prefix(MANIFEST_PREFIX)
+      && let Ok(g) = g.parse::<u64>()
+      && newest.as_ref().is_none_or(|n| g > n.0)
+    {
+      newest = Some((g, p.clone()));
+    }
+  }
+  let (_, path) = newest.ok_or("no manifest found")?;
+  let manifest = Manifest::decode(map_file(&path)?)?;
+  let mut total = std::fs::metadata(&path)?.len();
+  for f in manifest.referenced_files() {
+    total += std::fs::metadata(coll_dir.join(f))?.len();
+  }
+  let wal = coll_dir.join("wal");
+  if wal.exists() {
+    total += dir_size(&wal)?;
+  }
+  Ok(total)
 }
 
 fn bytes_by_kind(dir: &Path, out: &mut BTreeMap<String, u64>) -> Result<()> {
@@ -156,15 +187,17 @@ fn ingest(
   let coll = db.collection("bench")?;
   let reopen_s = t.elapsed().as_secs_f64();
   let bytes = dir_size(&dir)?;
+  let live = live_bytes(&dir.join("collections").join("bench"))?;
   let mut kinds = BTreeMap::new();
   bytes_by_kind(&dir, &mut kinds)?;
   eprintln!(
     "  flush {flush_s:.1} s ({after_flush} segments), compact \
      {compact_s:.1} s ({} segments); {:.1} MB on disk after compact, \
-     {:.1} MB after reopening ({reopen_s:.2} s)",
+     {:.1} MB after reopening ({reopen_s:.2} s), {:.1} MB live",
     stats.segments.len(),
     raw_bytes as f64 / 1e6,
-    bytes as f64 / 1e6
+    bytes as f64 / 1e6,
+    live as f64 / 1e6
   );
   let ing = Ingest {
     docs: n,
@@ -177,6 +210,7 @@ fn ingest(
     dir_bytes_after_compact: raw_bytes,
     reopen_seconds: reopen_s,
     dir_bytes: bytes,
+    live_bytes: live,
     bytes_by_kind: kinds,
     rss_delta_bytes: rss,
   };
@@ -298,7 +332,7 @@ pub fn run_engine_vector(
     build: BuildInfo {
       seconds: ing.upsert_seconds + ing.flush_seconds + ing.compact_seconds,
       threads: pools.threads,
-      index_bytes: ing.dir_bytes,
+      index_bytes: ing.live_bytes,
       rss_delta_bytes: ing.rss_delta_bytes,
       peak_rss_bytes: peak_rss_bytes(),
       details: serde_json::to_value(&ing)?,
@@ -309,9 +343,11 @@ pub fn run_engine_vector(
       "End to end through Collection::upsert / flush / compact / search; \
        build seconds = upsert + flush + compact (to one segment)."
         .into(),
-      "Index size is the whole database directory after closing and \
-       reopening it (vectors, graph, id map, stored documents, manifest); \
-       searches run on the reopened collection."
+      "Index size counts the files the current manifest references \
+       (vectors, graph, id map, stored documents) plus manifest and log, \
+       after closing and reopening the database; dir_bytes also counts \
+       the previous generation kept as a crash fallback. Searches run on \
+       the reopened collection."
         .into(),
     ],
   };
@@ -386,7 +422,7 @@ pub fn run_engine_text(cfg: &EngineTextRun, pools: &Pools) -> Result<PathBuf> {
       finish_seconds: ing.flush_seconds + ing.compact_seconds,
       total_seconds: total,
       docs_per_sec: docs.len() as f64 / total,
-      index_bytes: ing.dir_bytes,
+      index_bytes: ing.live_bytes,
       rss_delta_bytes: ing.rss_delta_bytes,
       details: serde_json::to_value(&ing)?,
     },
@@ -510,7 +546,10 @@ mod tests {
     assert_eq!(v["engine"], "muninn-engine");
     // 600 documents stay below the HNSW threshold: an exact segment.
     assert_eq!(v["results"][0]["recall"], 1.0);
-    assert_eq!(v["build"]["details"]["segments_after_compact"], 1);
+    let d = &v["build"]["details"];
+    assert_eq!(d["segments_after_compact"], 1);
+    let live = d["live_bytes"].as_u64().unwrap();
+    assert!(live > 600 * 8 * 4 && live <= d["dir_bytes"].as_u64().unwrap());
     std::fs::remove_dir_all(root).unwrap();
   }
 
