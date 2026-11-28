@@ -140,7 +140,8 @@ pub(crate) struct Core {
   /// `schema`'s filterable fields, for checking query filters.
   pub filter_schema: muninn_filter::Schema,
   pub opts: Options,
-  wal: Wal,
+  /// `None` once the collection is dropped (its files are released).
+  wal: RwLock<Option<Wal>>,
   state: Mutex<State>,
   /// Writers waiting for their turn or for room, and flush/compact
   /// callers waiting for the worker.
@@ -149,6 +150,57 @@ pub(crate) struct Core {
   pub(crate) current: RwLock<Arc<Version>>,
   disk: Mutex<Disk>,
   dropped: AtomicBool,
+  /// Must stay the last field: fields drop in declaration order, so this
+  /// runs after the WAL and the segment maps owned above are released.
+  remover: DirRemover,
+}
+
+/// Marker file in a dropped collection's directory that could not be
+/// renamed aside; such a directory is deleted, never opened.
+pub(crate) const DROPPED_MARKER: &str = "DROPPED";
+
+/// Deletes a dropped collection's directory. A directory carrying the
+/// [`DROPPED_MARKER`] loses the marker last, so a removal that fails
+/// half-way (files still in use) never leaves remains that look like a
+/// collection.
+pub(crate) fn remove_collection_dir(path: &Path) -> std::io::Result<()> {
+  let marker = path.join(DROPPED_MARKER);
+  if !marker.exists() {
+    return std::fs::remove_dir_all(path);
+  }
+  for e in std::fs::read_dir(path)? {
+    let e = e?;
+    if e.file_name() == DROPPED_MARKER {
+      continue;
+    }
+    if e.file_type()?.is_dir() {
+      std::fs::remove_dir_all(e.path())?;
+    } else {
+      std::fs::remove_file(e.path())?;
+    }
+  }
+  std::fs::remove_file(&marker)?;
+  std::fs::remove_dir(path)
+}
+
+/// Deletes a dropped collection's directory once the collection is
+/// released. On Windows a directory cannot be removed while files in it
+/// are open or mapped, so deleting at drop time would fail whenever a
+/// handle or a running search still uses the collection. If something
+/// outside the core (a search still holding a snapshot) keeps files
+/// mapped, removal fails here and `Database::open` sweeps the directory.
+struct DirRemover(Mutex<Option<PathBuf>>);
+
+impl Drop for DirRemover {
+  fn drop(&mut self) {
+    let path = match self.0.get_mut() {
+      Ok(p) => p.take(),
+      Err(e) => e.into_inner().take(),
+    };
+    if let Some(p) = path {
+      let _ = remove_collection_dir(&p);
+    }
+  }
 }
 
 fn poisoned_err(msg: &str) -> Error {
@@ -297,8 +349,11 @@ fn remove_uncommitted(dir: &Path, next_id: u64) -> Result<()> {
     if digits.is_empty() || !e.file_type()?.is_file() {
       continue;
     }
-    if digits.parse::<u64>().is_ok_and(|id| id >= next_id) {
-      std::fs::remove_file(e.path())?;
+    // A file still in use (Windows refuses to delete mapped files) is
+    // left for a later attempt; it is never referenced by a manifest.
+    if digits.parse::<u64>().is_ok_and(|id| id >= next_id)
+      && std::fs::remove_file(e.path()).is_ok()
+    {
       removed = true;
     }
   }
@@ -503,7 +558,7 @@ impl Core {
       filter_schema: schema.filter_schema()?,
       schema,
       opts: opts.clone(),
-      wal,
+      wal: RwLock::new(Some(wal)),
       state: Mutex::new(st),
       cv: Condvar::new(),
       worker_cv: Condvar::new(),
@@ -514,6 +569,7 @@ impl Core {
         tombs,
       }),
       dropped: AtomicBool::new(false),
+      remover: DirRemover(Mutex::new(None)),
     })
   }
 
@@ -553,6 +609,46 @@ impl Core {
     self.dropped.store(true, Ordering::Release);
   }
 
+  /// Runs `f` on the open WAL; `NotFound` once the collection is dropped.
+  fn with_wal<T>(&self, f: impl FnOnce(&Wal) -> Result<T>) -> Result<T> {
+    let g = read(&self.wal);
+    match g.as_ref() {
+      Some(w) => f(w),
+      None => Err(Error::NotFound(format!(
+        "collection {:?} was dropped",
+        self.name
+      ))),
+    }
+  }
+
+  /// Releases the files of a dropped collection, so its directory can be
+  /// deleted (on Windows open or mapped files block that): closes the WAL
+  /// and replaces the snapshot with an empty one, which unmaps every
+  /// segment no running search still holds. Call after the worker
+  /// stopped.
+  pub(crate) fn release_files(&self) {
+    let wal = write(&self.wal).take();
+    if let Some(w) = wal {
+      let _ = w.close();
+    }
+    if let Ok(m) = Memtable::new(u64::MAX, &self.schema) {
+      let empty = Arc::new(Version {
+        views: vec![View::mem(Arc::new(m))],
+        nseg: 0,
+      });
+      let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+      st.version = empty.clone();
+      st.frozen.clear();
+      *write(&self.current) = empty;
+    }
+  }
+
+  /// Deletes `path` (the dropped collection's directory) when the last
+  /// reference to this collection goes away.
+  pub(crate) fn remove_on_release(&self, path: PathBuf) {
+    *self.remover.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+  }
+
   /// Validates, logs and applies one batch.
   fn write(&self, rec: Vec<u8>) -> Result<()> {
     self.check_live()?;
@@ -573,7 +669,7 @@ impl Core {
     // the WAL refuses every append after an I/O failure, and an append
     // that succeeded implies every lower LSN succeeded too. So writers
     // that got an LSN always find their predecessors applied.
-    let lsn = self.wal.append(&rec)?;
+    let lsn = self.with_wal(|w| w.append(&rec))?;
     let mut st = self.lock()?;
     loop {
       if let Some(m) = &st.poisoned {
@@ -870,12 +966,12 @@ impl Core {
 
   /// Writes the oldest frozen memtable as a segment and publishes it.
   fn flush_one(&self, f: Frozen) -> Result<()> {
-    self.wal.rotate()?;
+    self.with_wal(Wal::rotate)?;
     if self.opts.durability == Durability::NoSync {
       // Without syncs the WAL keeps every rotated-out segment file open
       // until the next `Wal::sync`; one rotation per flush would leak a
       // file handle per flush. One fsync per flush releases them.
-      self.wal.sync()?;
+      self.with_wal(Wal::sync)?;
     }
     match self.opts.failpoint {
       Some(Failpoint::SlowFlush) => {
@@ -934,7 +1030,7 @@ impl Core {
     // records are durable would let a power cut keep a delete (for
     // example the old version of a replaced document) while losing the
     // write that caused it. One sync per flush makes them durable first.
-    self.wal.sync()?;
+    self.with_wal(Wal::sync)?;
     self.pause();
     let mut m = disk.manifest.clone();
     let prev_checkpoint = m.wal_checkpoint_lsn;
@@ -1006,7 +1102,7 @@ impl Core {
     }
     // Cleanup only: the flush is complete and visible. A failure here
     // leaves extra files that the next flush removes.
-    if let Err(e) = self.wal.truncate_before(prev_checkpoint + 1) {
+    if let Err(e) = self.with_wal(|w| w.truncate_before(prev_checkpoint + 1)) {
       self.warn(&format!("WAL truncation failed: {e}"));
     }
     if let Err(e) = disk.store.gc(true, &[]) {
@@ -1112,7 +1208,7 @@ impl Core {
     }
     // Docs deleted by writes not yet durable are about to disappear from
     // disk for good: make those writes durable first.
-    self.wal.sync()?;
+    self.with_wal(Wal::sync)?;
     self.commit(&mut disk, &mut m)?;
     disk.manifest = m;
     for sid in &run_ids {
@@ -1181,7 +1277,7 @@ impl Core {
     let mut s = CollectionStats {
       pending_flushes: pending,
       last_lsn: last,
-      durable_lsn: self.wal.durable_lsn(),
+      durable_lsn: self.with_wal(|w| Ok(w.durable_lsn())).unwrap_or(0),
       checkpoint_lsn: cp,
       ..Default::default()
     };
