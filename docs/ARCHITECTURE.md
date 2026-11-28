@@ -51,6 +51,19 @@ search ─▶ snapshot of {memtable, segments} ─▶ parallel per-segment     �
 - **Compaction.** Background merge of small segments and of segments with many tombstones.
 - **Search.** Fan out over segments with rayon, one `TopK` per segment, merge. Hybrid search runs the vector and text queries and fuses them with reciprocal-rank fusion (default) or a weighted, normalised score blend.
 
+### Engine implementation (crate `muninn`)
+
+How the design above is realised; the module docs in `crates/muninn/src` hold the details.
+
+- **Writes.** One `upsert`/`delete` call is one WAL record (hand-rolled binary, format byte 1; see `codec.rs`). Appends run concurrently and share fsyncs; records are then applied to the memtable strictly in LSN order, so memory always equals what replay produces. Live writes and recovery apply records through the same function, decoding the logged bytes.
+- **Snapshots.** A `Version` lists segments (oldest first), frozen memtables and the active memtable, each with a visible length and a copy-on-write tombstone `Arc<BitSet>`. A batch publishes one new version, so no search sees part of it.
+- **Memtable.** Vectors live in an append-only chunked arena that readers scan without locks (`arena.rs`, the engine's only `unsafe`). Id map, stored records and `MemTextIndex`es sit behind an `RwLock`: writers hold it while applying a batch and publishing; text queries hold the read side while taking the snapshot, gathering BM25 statistics and searching the memtable's text, so statistics always match the snapshot.
+- **Ids.** No global id map. The current version of an id is found by probing sources newest first (active memtable id map, frozen memtables, segment id maps), counting a hit only if not deleted. That costs one hash lookup per source and keeps open O(segments).
+- **Flush.** A full memtable is frozen with its checkpoint LSN; one worker thread per collection writes it as a segment with the same doc ids, persists changed tombstones of every segment, commits the manifest, swaps the memtable for the segment in a new version and truncates the WAL below the *previous* manifest's checkpoint (the store falls back to it if the newest manifest is unreadable). Persisted tombstones may include deletes logged after the checkpoint; replaying those again is harmless.
+- **Compaction.** Merges contiguous runs of segments (size tiers of `merge_factor`, plus rewriting segments with many deletes), so write order across segments is kept. Deletes arriving during a merge are carried over at publish. `compact()` flushes and merges everything into one segment.
+- **Search.** Per source in parallel; filter = user filter AND not deleted AND visible. Candidates merge by score, then by write order (source position, doc id), which equals the global top-k because every index breaks ties by smaller doc id. Text uses statistics summed over all sources; like Lucene they count deleted documents until compaction removes them. A multi-field text query scores a document by its best field. Hybrid runs both sides with `max(4k, 40)` candidates and fuses by RRF (default `k = 60`) or a weighted sum of min-max normalised scores.
+- **Filters.** Payload filters are `muninn_filter::Filter` (re-exported as `muninn::Filter`, JSON form included), checked against the schema's filterable fields before the search. Every memtable has a `MemIndex` fed with the same doc ids as its other structures; every segment has a `pindex` file (`FrozenIndex`), merged by compaction with the same doc maps as the text indexes. Per source, the filter evaluates to a bitset (its count taken once per query for the selectivity hint), ANDed with an optional `IdFilter` (external id sets and predicates) and with "not deleted".
+
 ## Component requirements
 
 ### muninn-simd
