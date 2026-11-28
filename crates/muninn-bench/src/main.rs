@@ -66,6 +66,15 @@ enum Cmd {
     /// Use only the first N queries.
     #[arg(long)]
     queries: Option<usize>,
+    /// Keep the built full-precision index at this path, and if a
+    /// readable index is already there, search it instead of building
+    /// (build time is then reported as 0). For search tuning runs.
+    #[arg(long)]
+    reuse_index: Option<PathBuf>,
+    /// Search an in-memory copy of the index file instead of the mapped
+    /// file.
+    #[arg(long)]
+    in_memory: bool,
     #[command(flatten)]
     common: Common,
   },
@@ -193,10 +202,14 @@ fn main() -> muninn_bench::Result<()> {
       ef,
       quant,
       queries,
+      reuse_index,
+      in_memory,
       common,
     } => {
       let pools = Pools::new(common.threads)?;
       let cfg = HnswRun {
+        reuse_index,
+        in_memory,
         data,
         m,
         ef_construction: efc,
