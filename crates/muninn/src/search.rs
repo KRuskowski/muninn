@@ -264,9 +264,7 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
         got: v.len(),
       });
     }
-    if v.iter().any(|x| !x.is_finite()) {
-      return Err(Error::invalid("query vector has non-finite components"));
-    }
+    codec::check_vector(v, "the query")?;
   }
   let fields = text_fields(core, q)?;
   if let Some(f) = &q.filter {

@@ -96,6 +96,8 @@ pub struct CollectionStats {
   pub segments: Vec<SegmentStats>,
   /// Log sequence number of the last applied write.
   pub last_lsn: u64,
+  /// Every write up to this log sequence number is on stable storage.
+  pub durable_lsn: u64,
   /// Every write up to this log sequence number is in segments.
   pub checkpoint_lsn: u64,
 }

@@ -7,7 +7,10 @@
 //! and shared through `Arc`; a write or a flush publishes a new one.
 //! Tombstones are copy-on-write: a batch that deletes docs of a source
 //! clones that source's bitset once, so a search holding an older version
-//! keeps seeing exactly the deletes of its snapshot.
+//! keeps seeing exactly the deletes of its snapshot. The cost is one
+//! bitset copy (one bit per document of that source) per deleting batch:
+//! negligible for memtables and typical segments, about 1.25 MB per batch
+//! for a 10-million-document segment. Batch deletes against huge segments.
 
 use std::sync::Arc;
 

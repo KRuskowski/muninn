@@ -78,6 +78,10 @@ use crate::version::{Source, Version, View};
 /// Name of the WAL directory inside a collection directory.
 pub(crate) const WAL_DIR: &str = "wal";
 
+/// Marker file left by a recovery that found the log damaged before its
+/// end; the collection refuses to open while it exists.
+pub(crate) const WAL_DAMAGED: &str = "WAL-DAMAGED";
+
 /// How long the worker waits before retrying after a failed job.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -104,6 +108,9 @@ pub(crate) struct State {
   flushed_seq: u64,
   compact_req: u64,
   compact_done: u64,
+  /// Highest full-compaction request that failed, and why.
+  compact_failed: u64,
+  compact_error: Option<String>,
   auto_compact_pending: bool,
   next_mem_id: u64,
   /// Writes are refused: an earlier write or the worker failed in a way
@@ -133,7 +140,8 @@ pub(crate) struct Core {
   /// `schema`'s filterable fields, for checking query filters.
   pub filter_schema: muninn_filter::Schema,
   pub opts: Options,
-  wal: Wal,
+  /// `None` once the collection is dropped (its files are released).
+  wal: RwLock<Option<Wal>>,
   state: Mutex<State>,
   /// Writers waiting for their turn or for room, and flush/compact
   /// callers waiting for the worker.
@@ -142,6 +150,57 @@ pub(crate) struct Core {
   pub(crate) current: RwLock<Arc<Version>>,
   disk: Mutex<Disk>,
   dropped: AtomicBool,
+  /// Must stay the last field: fields drop in declaration order, so this
+  /// runs after the WAL and the segment maps owned above are released.
+  remover: DirRemover,
+}
+
+/// Marker file in a dropped collection's directory that could not be
+/// renamed aside; such a directory is deleted, never opened.
+pub(crate) const DROPPED_MARKER: &str = "DROPPED";
+
+/// Deletes a dropped collection's directory. A directory carrying the
+/// [`DROPPED_MARKER`] loses the marker last, so a removal that fails
+/// half-way (files still in use) never leaves remains that look like a
+/// collection.
+pub(crate) fn remove_collection_dir(path: &Path) -> std::io::Result<()> {
+  let marker = path.join(DROPPED_MARKER);
+  if !marker.exists() {
+    return std::fs::remove_dir_all(path);
+  }
+  for e in std::fs::read_dir(path)? {
+    let e = e?;
+    if e.file_name() == DROPPED_MARKER {
+      continue;
+    }
+    if e.file_type()?.is_dir() {
+      std::fs::remove_dir_all(e.path())?;
+    } else {
+      std::fs::remove_file(e.path())?;
+    }
+  }
+  std::fs::remove_file(&marker)?;
+  std::fs::remove_dir(path)
+}
+
+/// Deletes a dropped collection's directory once the collection is
+/// released. On Windows a directory cannot be removed while files in it
+/// are open or mapped, so deleting at drop time would fail whenever a
+/// handle or a running search still uses the collection. If something
+/// outside the core (a search still holding a snapshot) keeps files
+/// mapped, removal fails here and `Database::open` sweeps the directory.
+struct DirRemover(Mutex<Option<PathBuf>>);
+
+impl Drop for DirRemover {
+  fn drop(&mut self) {
+    let path = match self.0.get_mut() {
+      Ok(p) => p.take(),
+      Err(e) => e.into_inner().take(),
+    };
+    if let Some(p) = path {
+      let _ = remove_collection_dir(&p);
+    }
+  }
 }
 
 fn poisoned_err(msg: &str) -> Error {
@@ -290,8 +349,11 @@ fn remove_uncommitted(dir: &Path, next_id: u64) -> Result<()> {
     if digits.is_empty() || !e.file_type()?.is_file() {
       continue;
     }
-    if digits.parse::<u64>().is_ok_and(|id| id >= next_id) {
-      std::fs::remove_file(e.path())?;
+    // A file still in use (Windows refuses to delete mapped files) is
+    // left for a later attempt; it is never referenced by a manifest.
+    if digits.parse::<u64>().is_ok_and(|id| id >= next_id)
+      && std::fs::remove_file(e.path()).is_ok()
+    {
       removed = true;
     }
   }
@@ -352,6 +414,7 @@ fn pick_merge(
   None
 }
 
+#[derive(Clone, Copy)]
 enum Job {
   Flush(Frozen),
   Compact { full: bool, req: u64 },
@@ -378,6 +441,13 @@ impl Core {
   /// Opens the collection at `dir`: loads the manifest and segments and
   /// replays the WAL.
   pub(crate) fn open(dir: &Path, name: &str, opts: &Options) -> Result<Core> {
+    match std::fs::read_to_string(dir.join(WAL_DAMAGED)) {
+      Ok(msg) => {
+        return Err(Error::corrupt(format!("{}: {msg}", dir.display())));
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+      Err(e) => return Err(e.into()),
+    }
     let (store, m) = ManifestStore::open(dir)?;
     let m = m.ok_or_else(|| {
       Error::corrupt(format!("{} has no manifest", dir.display()))
@@ -430,6 +500,8 @@ impl Core {
       flushed_seq: 0,
       compact_req: 0,
       compact_done: 0,
+      compact_failed: 0,
+      compact_error: None,
       auto_compact_pending: true,
       next_mem_id: 2,
       poisoned: None,
@@ -460,6 +532,25 @@ impl Core {
         rec.scan_start_lsn - 1
       )));
     }
+    // A torn tail (the normal result of a crash) is cut silently. A cut
+    // that set later log files aside, or that lands at or below the
+    // checkpoint (records that were synced before the manifest was
+    // committed), means damage in the middle of the log: acknowledged
+    // writes after it would be lost. The WAL has already repaired its
+    // files, so record the refusal in a marker that later opens honour.
+    let below_checkpoint = rec.truncated.is_some() && rec.last_lsn < cp;
+    if !rec.discarded.is_empty() || below_checkpoint {
+      let msg = format!(
+        "the write-ahead log is damaged before its end: {:?}; files set \
+         aside: {:?}; log ends at LSN {}, checkpoint {cp}. Writes after \
+         the damage are not recovered. Copy the files away for analysis; \
+         delete {WAL_DAMAGED} to open the collection with the writes that \
+         survived",
+        rec.truncated, rec.discarded, rec.last_lsn
+      );
+      muninn_store::fs::write_atomic(&dir.join(WAL_DAMAGED), msg.as_bytes())?;
+      return Err(Error::corrupt(format!("{}: {msg}", dir.display())));
+    }
     st.applied_lsn = st.applied_lsn.max(wal.last_lsn());
     Ok(Core {
       dir: dir.to_path_buf(),
@@ -467,7 +558,7 @@ impl Core {
       filter_schema: schema.filter_schema()?,
       schema,
       opts: opts.clone(),
-      wal,
+      wal: RwLock::new(Some(wal)),
       state: Mutex::new(st),
       cv: Condvar::new(),
       worker_cv: Condvar::new(),
@@ -478,6 +569,7 @@ impl Core {
         tombs,
       }),
       dropped: AtomicBool::new(false),
+      remover: DirRemover(Mutex::new(None)),
     })
   }
 
@@ -517,6 +609,46 @@ impl Core {
     self.dropped.store(true, Ordering::Release);
   }
 
+  /// Runs `f` on the open WAL; `NotFound` once the collection is dropped.
+  fn with_wal<T>(&self, f: impl FnOnce(&Wal) -> Result<T>) -> Result<T> {
+    let g = read(&self.wal);
+    match g.as_ref() {
+      Some(w) => f(w),
+      None => Err(Error::NotFound(format!(
+        "collection {:?} was dropped",
+        self.name
+      ))),
+    }
+  }
+
+  /// Releases the files of a dropped collection, so its directory can be
+  /// deleted (on Windows open or mapped files block that): closes the WAL
+  /// and replaces the snapshot with an empty one, which unmaps every
+  /// segment no running search still holds. Call after the worker
+  /// stopped.
+  pub(crate) fn release_files(&self) {
+    let wal = write(&self.wal).take();
+    if let Some(w) = wal {
+      let _ = w.close();
+    }
+    if let Ok(m) = Memtable::new(u64::MAX, &self.schema) {
+      let empty = Arc::new(Version {
+        views: vec![View::mem(Arc::new(m))],
+        nseg: 0,
+      });
+      let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+      st.version = empty.clone();
+      st.frozen.clear();
+      *write(&self.current) = empty;
+    }
+  }
+
+  /// Deletes `path` (the dropped collection's directory) when the last
+  /// reference to this collection goes away.
+  pub(crate) fn remove_on_release(&self, path: PathBuf) {
+    *self.remover.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+  }
+
   /// Validates, logs and applies one batch.
   fn write(&self, rec: Vec<u8>) -> Result<()> {
     self.check_live()?;
@@ -537,7 +669,7 @@ impl Core {
     // the WAL refuses every append after an I/O failure, and an append
     // that succeeded implies every lower LSN succeeded too. So writers
     // that got an LSN always find their predecessors applied.
-    let lsn = self.wal.append(&rec)?;
+    let lsn = self.with_wal(|w| w.append(&rec))?;
     let mut st = self.lock()?;
     loop {
       if let Some(m) = &st.poisoned {
@@ -595,21 +727,23 @@ impl Core {
     self.write(codec::encode_delete(ids)?)
   }
 
-  /// Waits until `done(state)` or a failure.
-  fn wait_for(
-    &self,
-    mut st: MutexGuard<'_, State>,
+  /// Waits until `done(state)` or a failure; flush failures count only if
+  /// `flush_errors`. Returns the state lock.
+  fn wait_for<'a>(
+    &'a self,
+    mut st: MutexGuard<'a, State>,
+    flush_errors: bool,
     done: impl Fn(&State) -> bool,
-  ) -> Result<()> {
+  ) -> Result<MutexGuard<'a, State>> {
     let gen0 = st.err_gen;
     loop {
       if done(&st) {
-        return Ok(());
+        return Ok(st);
       }
       if let Some(m) = &st.poisoned {
         return Err(poisoned_err(m));
       }
-      if st.err_gen != gen0 {
+      if flush_errors && st.err_gen != gen0 {
         let msg = st.bg_error.clone().unwrap_or_default();
         return Err(Error::Io(std::io::Error::other(format!(
           "background flush failed: {msg}"
@@ -634,7 +768,8 @@ impl Core {
     }
     let target = st.freeze_seq;
     self.worker_cv.notify_one();
-    self.wait_for(st, |s| s.flushed_seq >= target)
+    drop(self.wait_for(st, true, |s| s.flushed_seq >= target)?);
+    Ok(())
   }
 
   /// Flushes, then merges every segment into one without deleted docs.
@@ -644,7 +779,14 @@ impl Core {
     st.compact_req += 1;
     let req = st.compact_req;
     self.worker_cv.notify_one();
-    self.wait_for(st, |s| s.compact_done >= req)
+    let st = self.wait_for(st, false, |s| s.compact_done >= req)?;
+    if st.compact_failed >= req {
+      let msg = st.compact_error.clone().unwrap_or_default();
+      return Err(Error::Io(std::io::Error::other(format!(
+        "compaction failed: {msg}"
+      ))));
+    }
+    Ok(())
   }
 
   /// Stops the worker after its current job.
@@ -730,46 +872,113 @@ impl Core {
         }
       };
       flushed_last = matches!(job, Job::Flush(_));
-      let res = match job {
-        Job::Flush(f) => self.flush_one(f),
-        Job::Compact { full, req } => {
-          let r = self.compact_once(full);
-          if let Ok(mut st) = self.state.lock() {
-            match (&r, full) {
-              (Ok(_), true) => st.compact_done = st.compact_done.max(req),
-              (Ok(false), false) => st.auto_compact_pending = false,
-              _ => {}
-            }
-            self.cv.notify_all();
-          }
-          r.map(|_| ())
+      // A panic in a job is a broken invariant: poison the collection and
+      // wake everyone waiting on the worker instead of leaving them
+      // waiting for a thread that is gone.
+      let res =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+          Job::Flush(f) => self.flush_one(f).map(|_| None),
+          Job::Compact { full, req } => self
+            .compact_once(full)
+            .map(|merged| Some((full, req, merged))),
+        }));
+      let res = match res {
+        Ok(r) => r,
+        Err(panic) => {
+          let msg = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+          self.poison(&format!("background worker panicked: {msg}"));
+          return;
         }
       };
       retry_wait = false;
-      if let Err(e) = res {
-        let Ok(mut st) = self.state.lock() else {
-          return;
-        };
-        if st.poisoned.is_some() {
-          self.cv.notify_all();
-          return;
-        }
-        st.bg_error = Some(e.to_string());
-        st.err_gen += 1;
+      let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+      if st.poisoned.is_some() {
         self.cv.notify_all();
-        retry_wait = true;
+        return;
       }
+      match (res, job) {
+        (Ok(Some((full, req, merged))), _) => {
+          if full {
+            st.compact_done = st.compact_done.max(req);
+          } else if !merged {
+            st.auto_compact_pending = false;
+          }
+        }
+        (Ok(None), _) => {}
+        (Err(e), Job::Compact { full, req }) => {
+          // Not retried: an explicit compact() reports the failure to its
+          // caller; background merging tries again after the next flush.
+          if full {
+            st.compact_done = st.compact_done.max(req);
+            st.compact_failed = st.compact_failed.max(req);
+            st.compact_error = Some(e.to_string());
+          } else {
+            st.auto_compact_pending = false;
+            st.compact_error = Some(e.to_string());
+          }
+          drop(st);
+          self.remove_failed_output();
+          self.cv.notify_all();
+          continue;
+        }
+        (Err(e), Job::Flush(_)) => {
+          // The frozen memtable stays (its writes are in the log) and the
+          // flush is retried after a pause.
+          st.bg_error = Some(e.to_string());
+          st.err_gen += 1;
+          retry_wait = true;
+          drop(st);
+          self.remove_failed_output();
+          self.cv.notify_all();
+          continue;
+        }
+      }
+      drop(st);
+      self.cv.notify_all();
     }
+  }
+
+  /// Refuses further writes, wakes every waiter and stops the worker.
+  fn poison(&self, msg: &str) {
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.poisoned.get_or_insert_with(|| msg.to_string());
+    st.shutdown = true;
+    drop(st);
+    self.cv.notify_all();
+    self.worker_cv.notify_all();
+  }
+
+  /// Deletes files a failed job wrote for a segment it never committed
+  /// (ids at or above the manifest's `next_segment_id`). Only the worker
+  /// creates segments, and it is between jobs, so nothing is in flight.
+  fn remove_failed_output(&self) {
+    let next = match self.disk.lock() {
+      Ok(d) => d.manifest.next_segment_id,
+      Err(_) => return,
+    };
+    // Best effort: the files are harmless, and the next open retries.
+    let _ = remove_uncommitted(&self.dir, next);
   }
 
   /// Writes the oldest frozen memtable as a segment and publishes it.
   fn flush_one(&self, f: Frozen) -> Result<()> {
-    self.wal.rotate()?;
+    self.with_wal(Wal::rotate)?;
     if self.opts.durability == Durability::NoSync {
       // Without syncs the WAL keeps every rotated-out segment file open
       // until the next `Wal::sync`; one rotation per flush would leak a
       // file handle per flush. One fsync per flush releases them.
-      self.wal.sync()?;
+      self.with_wal(Wal::sync)?;
+    }
+    match self.opts.failpoint {
+      Some(Failpoint::SlowFlush) => {
+        std::thread::sleep(Duration::from_millis(300))
+      }
+      Some(Failpoint::PanicInFlush) => panic!("failpoint PanicInFlush"),
+      _ => {}
     }
     let mut disk = self.disk.lock().map_err(|_| poisoned_err("disk lock"))?;
     let v = self.snapshot();
@@ -816,6 +1025,12 @@ impl Core {
         targets.push((s.id, view.tomb.clone(), view.deleted, s.len));
       }
     }
+    // The captured tombstones may include deletes logged after the
+    // checkpoint and not yet synced. Persisting them before their log
+    // records are durable would let a power cut keep a delete (for
+    // example the old version of a replaced document) while losing the
+    // write that caused it. One sync per flush makes them durable first.
+    self.with_wal(Wal::sync)?;
     self.pause();
     let mut m = disk.manifest.clone();
     let prev_checkpoint = m.wal_checkpoint_lsn;
@@ -842,7 +1057,10 @@ impl Core {
       written.push((id, ver + 1, tomb));
     }
     m.wal_checkpoint_lsn = f.checkpoint.max(prev_checkpoint);
-    disk.store.commit(&mut m)?;
+    self.commit(&mut disk, &mut m)?;
+    if self.opts.failpoint == Some(Failpoint::FailAfterCommit) {
+      return Err(self.fatal("failpoint FailAfterCommit"));
+    }
     disk.manifest = m;
     for (id, ver, t) in written {
       disk.tombs.insert(id, (ver, Some(t)));
@@ -857,7 +1075,8 @@ impl Core {
       let i = nv.nseg;
       let is_f = nv.views[i].memtable().is_some_and(|m| m.id == f.mem_id);
       if !is_f {
-        return Err(Error::invalid("frozen memtables out of order"));
+        drop(st);
+        return Err(self.fatal("frozen memtables out of order"));
       }
       match &seg {
         Some(s) => {
@@ -881,9 +1100,39 @@ impl Core {
       publish(&self.current, &mut st, nv);
       self.cv.notify_all();
     }
-    self.wal.truncate_before(prev_checkpoint + 1)?;
-    disk.store.gc(true, &[])?;
+    // Cleanup only: the flush is complete and visible. A failure here
+    // leaves extra files that the next flush removes.
+    if let Err(e) = self.with_wal(|w| w.truncate_before(prev_checkpoint + 1)) {
+      self.warn(&format!("WAL truncation failed: {e}"));
+    }
+    if let Err(e) = disk.store.gc(true, &[]) {
+      self.warn(&format!("removing obsolete files failed: {e}"));
+    }
     Ok(())
+  }
+
+  /// Commits a manifest. Any error is fatal: once the commit has started
+  /// the manifest may be durable (the rename can succeed and the
+  /// directory sync fail), so retrying the job could rewrite files a
+  /// committed manifest names. Reopening recovers from whatever is on
+  /// disk.
+  fn commit(&self, disk: &mut Disk, m: &mut Manifest) -> Result<()> {
+    disk
+      .store
+      .commit(m)
+      .map_err(|e| self.fatal(&format!("manifest commit failed: {e}")))
+  }
+
+  /// Poisons the collection and returns the error to report.
+  fn fatal(&self, msg: &str) -> Error {
+    self.poison(msg);
+    poisoned_err(msg)
+  }
+
+  /// Records a background problem that needs no action from callers.
+  fn warn(&self, msg: &str) {
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.bg_error = Some(msg.to_string());
   }
 
   /// One merge (all segments if `full`, else what the policy picks).
@@ -933,6 +1182,9 @@ impl Core {
     };
     self.failpoint(Failpoint::AfterCompactionWrite)?;
     self.pause();
+    if full && self.opts.failpoint == Some(Failpoint::FailCompaction) {
+      return Err(Error::Io(std::io::Error::other("failpoint FailCompaction")));
+    }
     let run_ids: HashSet<u64> = run.iter().map(|(s, _, _)| s.id).collect();
     let mut m = disk.manifest.clone();
     let pos = m
@@ -954,7 +1206,10 @@ impl Core {
     if merged.is_some() {
       m.next_segment_id = id + 1;
     }
-    disk.store.commit(&mut m)?;
+    // Docs deleted by writes not yet durable are about to disappear from
+    // disk for good: make those writes durable first.
+    self.with_wal(Wal::sync)?;
+    self.commit(&mut disk, &mut m)?;
     disk.manifest = m;
     for sid in &run_ids {
       disk.tombs.remove(sid);
@@ -970,7 +1225,8 @@ impl Core {
         .zip(run)
         .all(|(w, (s, _, _))| w.segment().is_some_and(|x| Arc::ptr_eq(x, s)));
       if !same {
-        return Err(Error::invalid("segments changed during a merge"));
+        drop(st);
+        return Err(self.fatal("segments changed during a merge"));
       }
       let new_view = merged.as_ref().map(|(s, maps)| {
         let mut bits = BitSet::new(s.len as usize);
@@ -1000,7 +1256,9 @@ impl Core {
       publish(&self.current, &mut st, nv);
       self.cv.notify_all();
     }
-    disk.store.gc(true, &[])?;
+    if let Err(e) = disk.store.gc(true, &[]) {
+      self.warn(&format!("removing obsolete files failed: {e}"));
+    }
     Ok(true)
   }
 
@@ -1019,6 +1277,7 @@ impl Core {
     let mut s = CollectionStats {
       pending_flushes: pending,
       last_lsn: last,
+      durable_lsn: self.with_wal(|w| Ok(w.durable_lsn())).unwrap_or(0),
       checkpoint_lsn: cp,
       ..Default::default()
     };

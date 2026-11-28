@@ -67,7 +67,9 @@ impl IdFilter {
   }
 
   /// Only documents whose id passes `f`. Evaluated lazily per candidate
-  /// on segments, so keep it cheap.
+  /// on segments, so keep it cheap. It runs while the search holds
+  /// internal read locks of the collection: it must not call back into
+  /// the collection (search, write, flush), which can deadlock.
   pub fn predicate(
     f: impl Fn(IdRef<'_>) -> bool + Send + Sync + 'static,
   ) -> Self {
