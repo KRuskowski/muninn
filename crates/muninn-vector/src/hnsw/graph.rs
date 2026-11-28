@@ -169,7 +169,8 @@ impl BuildView<'_> {
   }
 
   /// Node `node`'s record at `level` (count then slots) and its capacity.
-  /// Callers hold the node's lock. Levels above the node's own are empty.
+  /// Callers hold the node's lock. Levels above the node's own, and
+  /// records outside the arrays, are `None`.
   #[inline]
   pub(crate) fn record(
     &self,
@@ -178,19 +179,11 @@ impl BuildView<'_> {
   ) -> Option<(&[AtomicU32], usize)> {
     let node = node as usize;
     if level == 0 {
-      let b = node * (1 + self.m0);
-      Some((&self.l0[b..b + 1 + self.m0], self.m0))
+      let b = node.checked_mul(1 + self.m0)?;
+      Some((self.l0.get(b..b.checked_add(1 + self.m0)?)?, self.m0))
     } else {
       let b = upper_base(self.levels, self.upoff, self.m, node, level)?;
-      Some((&self.upper[b..b + 1 + self.m], self.m))
-    }
-  }
-
-  /// Replaces node `node`'s list at `level`.
-  pub(crate) fn set(&self, node: DocId, level: usize, ids: &[u32]) {
-    let _g = self.lock(node);
-    if let Some((rec, cap)) = self.record(node, level) {
-      write_record(rec, cap, ids);
+      Some((self.upper.get(b..b.checked_add(1 + self.m)?)?, self.m))
     }
   }
 }
@@ -205,12 +198,23 @@ pub(crate) fn write_record(rec: &[AtomicU32], cap: usize, ids: &[u32]) {
   rec[0].store(c as u32, Relaxed);
 }
 
-/// The ids currently in a locked record.
+/// The ids currently in a locked record, without any `>= n` (which only
+/// a corrupt file can contain).
 #[inline]
-pub(crate) fn read_record(rec: &[AtomicU32], cap: usize, out: &mut Vec<u32>) {
+pub(crate) fn read_record(
+  rec: &[AtomicU32],
+  cap: usize,
+  n: usize,
+  out: &mut Vec<u32>,
+) {
   let c = (rec[0].load(Relaxed) as usize).min(cap);
   out.clear();
-  out.extend(rec[1..1 + c].iter().map(|a| a.load(Relaxed)));
+  out.extend(
+    rec[1..1 + c]
+      .iter()
+      .map(|a| a.load(Relaxed))
+      .filter(|&id| (id as usize) < n),
+  );
 }
 
 impl Neighbors for BuildView<'_> {
@@ -227,7 +231,7 @@ impl Neighbors for BuildView<'_> {
   ) -> &'a [u32] {
     let _g = self.lock(node);
     match self.record(node, level) {
-      Some((rec, cap)) => read_record(rec, cap, buf),
+      Some((rec, cap)) => read_record(rec, cap, self.levels.len(), buf),
       None => buf.clear(),
     }
     buf
