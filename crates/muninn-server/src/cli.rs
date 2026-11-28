@@ -290,6 +290,9 @@ pub fn serve(a: ServeArgs) -> CliResult {
   let rt = rt.build()?;
   tracing::info!("opening {}", a.data.data.display());
   let db = Arc::new(a.data.open()?);
+  for (name, reason) in db.open_failures() {
+    tracing::error!("collection {name:?} is unavailable: {reason}");
+  }
   let cfg = ServerConfig {
     body_limit: a.body_limit,
     bulk_batch: a.bulk_batch,
@@ -577,8 +580,12 @@ pub fn stats(a: DataArgs) -> CliResult {
       }),
     );
   }
+  let out = json!({
+    "collections": out,
+    "unavailable": model::unavailable_json(&db),
+  });
   let mut stdout = std::io::stdout().lock();
-  serde_json::to_writer_pretty(&mut stdout, &json!({ "collections": out }))?;
+  serde_json::to_writer_pretty(&mut stdout, &out)?;
   writeln!(stdout)?;
   Ok(())
 }

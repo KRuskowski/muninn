@@ -47,6 +47,12 @@ pub fn app(dir: &Path, cfg: ServerConfig) -> Router {
   muninn_server::router(AppState::new(Arc::new(db), cfg))
 }
 
+/// A router over a database in `dir` opened with `opts`.
+pub fn app_with(dir: &Path, cfg: ServerConfig, opts: Options) -> Router {
+  let db = Database::open(dir, opts).unwrap();
+  muninn_server::router(AppState::new(Arc::new(db), cfg))
+}
+
 /// Sends one request through `app` in process.
 pub async fn call(
   app: &Router,

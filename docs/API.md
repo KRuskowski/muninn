@@ -19,7 +19,7 @@ Every failure returns the same body, with a matching status code:
 | `method_not_allowed` | 405 | the route exists but not with this method |
 | `already_exists` | 409 | creating a collection whose name is taken |
 | `payload_too_large` | 413 | the body exceeds `--body-limit` (default 64 MiB); for the bulk endpoint, one line exceeds it |
-| `internal` | 500 | disk errors, corrupt data |
+| `internal` | 500 | disk errors, corrupt data, a collection that could not be opened, a collection that stopped accepting writes after a disk failure |
 
 Messages say exactly what is wrong and where, for example `request body: unknown field \`limit\`, expected one of ... at line 1 column 21` or `filter at $.and[1].range.year: range bound must be a number, got a string`.
 
@@ -34,14 +34,19 @@ Messages say exactly what is wrong and where, for example `request body: unknown
   "live_docs": 1000, "deleted_docs": 12, "memtable_docs": 200,
   "pending_flushes": 0,
   "segments": [{"id": 3, "docs": 812, "deleted": 12, "vector_index": "hnsw"}],
-  "last_lsn": 57, "checkpoint_lsn": 41
-}}}
+  "last_lsn": 57, "durable_lsn": 57, "checkpoint_lsn": 41
+}},
+ "unavailable": {}}
 ```
 
 - `live_docs`: documents that can be found.
 - `deleted_docs`: deleted or replaced documents still taking space until compaction.
 - `memtable_docs`: recent documents held in memory (already durable in the write-ahead log), not yet in an on-disk segment.
 - `segments`: the immutable on-disk parts; `vector_index` is `hnsw`, `flat` or `none`.
+- `last_lsn`, `durable_lsn`, `checkpoint_lsn`: sequence numbers of the last applied write, of the last write on stable storage, and of the last write contained in segments.
+- `unavailable`: collections whose files could not be opened when the server started, with the reason, for example `{"old": "corrupt data: ..."}`. The other collections work normally. Every endpoint of an unavailable collection answers `500 internal` with that reason; `DELETE /v1/collections/{name}` removes it.
+
+If a disk failure leaves a collection in an unknown state, it stops accepting writes and its write endpoints answer `500 internal` with a message saying so. Restarting the server reopens it and recovers every acknowledged write.
 
 ## Collections
 
@@ -73,7 +78,7 @@ A schema needs a vector field, at least one text field, or both. Responds `201 C
 
 ### List: `GET /v1/collections`
 
-`{"collections": ["docs", "notes"]}`, sorted by name.
+`{"collections": ["docs", "notes"], "unavailable": {}}`: names sorted, and collections that could not be opened (see statistics above).
 
 ### Describe: `GET /v1/collections/{name}`
 

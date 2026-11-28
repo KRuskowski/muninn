@@ -420,8 +420,21 @@ pub fn stats_to_json(s: &CollectionStats) -> Value {
       "vector_index": g.vector_index,
     })).collect::<Vec<_>>(),
     "last_lsn": s.last_lsn,
+    "durable_lsn": s.durable_lsn,
     "checkpoint_lsn": s.checkpoint_lsn,
   })
+}
+
+/// Collections that could not be opened, as `{"name": "reason"}`. Their
+/// endpoints answer with that reason (500 `internal`) until they are
+/// repaired or dropped.
+pub fn unavailable_json(db: &muninn::Database) -> Value {
+  Value::Object(
+    db.open_failures()
+      .into_iter()
+      .map(|(name, reason)| (name, Value::String(reason)))
+      .collect(),
+  )
 }
 
 // ---------------------------------------------------------------------

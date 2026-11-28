@@ -265,7 +265,13 @@ async fn stats(State(st): State<AppState>) -> Result<Response, ApiError> {
       };
       out.insert(name, model::stats_to_json(&c.stats()?));
     }
-    json_response(StatusCode::OK, &json!({"collections": out}))
+    json_response(
+      StatusCode::OK,
+      &json!({
+        "collections": out,
+        "unavailable": model::unavailable_json(&st.db),
+      }),
+    )
   })
   .await
 }
@@ -274,7 +280,13 @@ async fn list_collections(
   State(st): State<AppState>,
 ) -> Result<Response, ApiError> {
   let names = st.db.list_collections()?;
-  json_response(StatusCode::OK, &json!({"collections": names}))
+  json_response(
+    StatusCode::OK,
+    &json!({
+      "collections": names,
+      "unavailable": model::unavailable_json(&st.db),
+    }),
+  )
 }
 
 async fn create_collection(

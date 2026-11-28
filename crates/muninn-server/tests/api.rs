@@ -2,7 +2,8 @@
 
 mod common;
 
-use common::{TestDir, app, assert_error, call};
+use common::{TestDir, app, app_with, assert_error, call};
+use muninn::{Durability, Failpoint, Options};
 use muninn_server::ServerConfig;
 use serde_json::{Value, json};
 
@@ -75,7 +76,7 @@ async fn health_unknown_routes_and_methods() {
     "method_not_allowed",
   );
   let r = call(&a, "GET", "/v1/collections", "").await;
-  assert_eq!(r.1, json!({"collections": []}));
+  assert_eq!(r.1, json!({"collections": [], "unavailable": {}}));
 }
 
 #[tokio::test]
@@ -114,7 +115,10 @@ async fn collection_lifecycle() {
   assert_eq!(r.1["schema"]["analyzer"]["stemmer"], "porter_english");
 
   let r = call(&a, "GET", "/v1/collections", "").await;
-  assert_eq!(r.1, json!({"collections": ["docs", "notes"]}));
+  assert_eq!(
+    r.1,
+    json!({"collections": ["docs", "notes"], "unavailable": {}})
+  );
   let r = call(&a, "GET", "/v1/collections/notes", "").await;
   assert_eq!(r.0, 200);
   assert_eq!(r.1["name"], "notes");
@@ -170,7 +174,7 @@ async fn collection_lifecycle() {
     "not_found",
   );
   let r = call(&a, "GET", "/v1/collections", "").await;
-  assert_eq!(r.1, json!({"collections": ["docs"]}));
+  assert_eq!(r.1, json!({"collections": ["docs"], "unavailable": {}}));
 }
 
 #[tokio::test]
@@ -704,7 +708,7 @@ async fn data_survives_a_restart() {
   // The router (and with it the database) is gone: open a new server.
   let a = app(dir.path(), ServerConfig::default());
   let r = call(&a, "GET", "/v1/collections", "").await;
-  assert_eq!(r.1, json!({"collections": ["docs"]}));
+  assert_eq!(r.1, json!({"collections": ["docs"], "unavailable": {}}));
   let r = call(&a, "GET", "/v1/collections/docs", "").await;
   assert_eq!(r.1["stats"]["live_docs"], 4, "{}", r.1);
   assert_eq!(r.1["schema"]["text_fields"], json!(["title", "body"]));
@@ -828,4 +832,161 @@ async fn bulk_ndjson_import() {
   // An empty body stores nothing and succeeds.
   let r = call(&a, "POST", "/v1/collections/b/documents:bulk", "\n\n").await;
   assert_eq!(r.1["count"], 0);
+}
+
+/// Nested JSON deeper than the engine stores, and vectors whose distances
+/// would overflow, are invalid arguments.
+#[tokio::test]
+async fn engine_limits_are_invalid_arguments() {
+  let dir = TestDir::new("limits");
+  let a = setup(&dir).await;
+  let mut deep = json!("leaf");
+  for _ in 0..110 {
+    deep = json!([deep]);
+  }
+  let body = json!({"documents": [
+    {"id": 70, "vector": [1, 0, 0], "payload": {"deep": deep}}
+  ]});
+  let m = assert_error(
+    &call(
+      &a,
+      "POST",
+      "/v1/collections/docs/documents",
+      body.to_string(),
+    )
+    .await,
+    400,
+    "invalid_argument",
+  );
+  assert!(m.contains("deep") || m.contains("nest"), "{m}");
+  let m = assert_error(
+    &call(
+      &a,
+      "POST",
+      "/v1/collections/docs/documents",
+      r#"{"documents": [{"id": 71, "vector": [1e30, 1e30, 1e30]}]}"#,
+    )
+    .await,
+    400,
+    "invalid_argument",
+  );
+  assert!(!m.is_empty());
+  assert_error(
+    &call(
+      &a,
+      "POST",
+      "/v1/collections/docs/search",
+      r#"{"vector": [1e30, 1e30, 1e30]}"#,
+    )
+    .await,
+    400,
+    "invalid_argument",
+  );
+}
+
+/// A collection whose files are damaged does not keep the server from
+/// starting: it is listed as unavailable, its endpoints report why, and it
+/// can be dropped.
+#[tokio::test]
+async fn damaged_collection_is_reported_and_can_be_dropped() {
+  let dir = TestDir::new("damaged");
+  {
+    let a = setup(&dir).await;
+    let r =
+      call(&a, "PUT", "/v1/collections/ok", r#"{"text_fields": ["t"]}"#).await;
+    assert_eq!(r.0, 201);
+  }
+  let cdir = dir.path().join("collections").join("docs");
+  let mut damaged = 0;
+  for e in std::fs::read_dir(&cdir).unwrap() {
+    let p = e.unwrap().path();
+    let name = p.file_name().unwrap().to_str().unwrap().to_string();
+    if name.starts_with("MANIFEST-") {
+      let mut bytes = std::fs::read(&p).unwrap();
+      let mid = bytes.len() / 2;
+      bytes[mid] ^= 0xff;
+      std::fs::write(&p, bytes).unwrap();
+      damaged += 1;
+    }
+  }
+  assert!(damaged > 0);
+
+  let a = app(dir.path(), ServerConfig::default());
+  let r = call(&a, "GET", "/v1/collections", "").await;
+  assert_eq!(r.1["collections"], json!(["ok"]));
+  let reason = r.1["unavailable"]["docs"].as_str().unwrap().to_string();
+  assert!(!reason.is_empty());
+  let r = call(&a, "GET", "/v1/stats", "").await;
+  assert_eq!(r.1["unavailable"]["docs"], reason.as_str());
+  assert!(r.1["collections"]["ok"].is_object());
+  for (method, uri, body) in [
+    ("GET", "/v1/collections/docs", ""),
+    ("POST", "/v1/collections/docs/search", r#"{"text": "x"}"#),
+    (
+      "POST",
+      "/v1/collections/docs/documents",
+      r#"{"documents": []}"#,
+    ),
+    ("GET", "/v1/collections/docs/documents/1", ""),
+  ] {
+    let m = assert_error(&call(&a, method, uri, body).await, 500, "internal");
+    assert!(m.contains("could not be opened"), "{method} {uri}: {m}");
+  }
+  assert_error(
+    &call(&a, "PUT", "/v1/collections/docs", SCHEMA).await,
+    409,
+    "already_exists",
+  );
+  let r = call(&a, "DELETE", "/v1/collections/docs", "").await;
+  assert_eq!(r.0, 200, "{}", r.1);
+  let r = call(&a, "GET", "/v1/collections", "").await;
+  assert_eq!(r.1, json!({"collections": ["ok"], "unavailable": {}}));
+  let r = call(&a, "PUT", "/v1/collections/docs", SCHEMA).await;
+  assert_eq!(r.0, 201, "{}", r.1);
+}
+
+/// After a background failure the engine cannot recover from, writes are
+/// refused with a 500 that says how to recover.
+#[tokio::test]
+async fn poisoned_collection_refuses_writes_with_internal_error() {
+  let dir = TestDir::new("poisoned");
+  let opts = Options {
+    durability: Durability::NoSync,
+    failpoint: Some(Failpoint::FailAfterCommit),
+    auto_compact: false,
+    ..Options::default()
+  };
+  let a = app_with(dir.path(), ServerConfig::default(), opts);
+  let r = call(&a, "PUT", "/v1/collections/docs", SCHEMA).await;
+  assert_eq!(r.0, 201);
+  let r = call(
+    &a,
+    "POST",
+    "/v1/collections/docs/documents",
+    docs().to_string(),
+  )
+  .await;
+  assert_eq!(r.0, 200);
+  assert_error(
+    &call(&a, "POST", "/v1/collections/docs/flush", "").await,
+    500,
+    "internal",
+  );
+  let m = assert_error(
+    &call(
+      &a,
+      "POST",
+      "/v1/collections/docs/documents",
+      r#"{"documents": [{"id": 9, "vector": [1, 0, 0]}]}"#,
+    )
+    .await,
+    500,
+    "internal",
+  );
+  assert!(m.contains("refuses writes"), "{m}");
+  drop(a);
+  // A restart recovers every acknowledged write.
+  let a = app(dir.path(), ServerConfig::default());
+  let r = call(&a, "GET", "/v1/collections/docs", "").await;
+  assert_eq!(r.1["stats"]["live_docs"], 4, "{}", r.1);
 }
