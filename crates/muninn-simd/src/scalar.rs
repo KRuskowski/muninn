@@ -65,6 +65,66 @@ pub fn distance_batch(
   }
 }
 
+/// Distances from `query` to rows picked by id, see
+/// [`crate::distance_gather`].
+pub fn distance_gather(
+  metric: Metric,
+  query: &[f32],
+  rows: &[f32],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = query.len();
+  for (o, &id) in out.iter_mut().zip(ids) {
+    let s = id as usize * dim;
+    let Some(row) = rows.get(s..s + dim) else {
+      *o = f32::NAN;
+      continue;
+    };
+    *o = match metric {
+      Metric::L2 => l2sq(query, row),
+      Metric::Dot | Metric::Cosine => crate::finish(metric, dot(query, row)),
+    };
+  }
+}
+
+/// Dot product of `f32` weights with `u8` codes widened to `f32`, see
+/// [`crate::dot_f32_u8`].
+pub fn dot_f32_u8(a: &[f32], b: &[u8]) -> f32 {
+  debug_assert_eq!(a.len(), b.len());
+  let mut acc = [0.0f32; 4];
+  let (ca, cb) = (a.chunks_exact(4), b.chunks_exact(4));
+  let (ra, rb) = (ca.remainder(), cb.remainder());
+  for (x, y) in ca.zip(cb) {
+    for i in 0..4 {
+      acc[i] += x[i] * y[i] as f32;
+    }
+  }
+  let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+  for (x, &y) in ra.iter().zip(rb) {
+    s += x * y as f32;
+  }
+  s
+}
+
+/// Dot products of `w` with code rows picked by id, see
+/// [`crate::dot_f32_u8_gather`]. A bad id scores NaN.
+pub fn dot_f32_u8_gather(
+  w: &[f32],
+  codes: &[u8],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = w.len();
+  for (o, &id) in out.iter_mut().zip(ids) {
+    let s = id as usize * dim;
+    *o = match codes.get(s..s + dim) {
+      Some(r) => dot_f32_u8(w, r),
+      None => f32::NAN,
+    };
+  }
+}
+
 /// `i8` dot product in `i32`. The sum wraps (mod 2^32) instead of
 /// overflowing, like every SIMD implementation, see [`crate::dot_i8`].
 pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {

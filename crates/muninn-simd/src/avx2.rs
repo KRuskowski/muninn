@@ -16,6 +16,16 @@ use muninn_core::Metric;
 use crate::dispatch::{Isa, Kernels};
 use crate::{finish, scalar};
 
+/// Rows per kernel call in `distance_gather`: as many as `distance_batch`
+/// keeps in registers.
+const GATHER_ROWS: usize = BATCH_ROWS;
+
+/// How many groups of `GATHER_ROWS` ahead `distance_gather` prefetches.
+/// Two measured best on SIFT-1M graph search (Emerald Rapids, 4 threads):
+/// one group ahead arrives too late, and prefetching all rows up front
+/// stalls on the line fill buffers.
+const GATHER_AHEAD: usize = 2;
+
 /// Rows per iteration in `distance_batch`: 2 rows x 4 accumulators keep 8
 /// of the 16 ymm registers for sums, leaving room for the query and rows.
 const BATCH_ROWS: usize = 2;
@@ -33,6 +43,9 @@ static KERNELS: Kernels = Kernels {
   dot,
   l2sq,
   distance_batch,
+  distance_gather,
+  dot_f32_u8,
+  dot_f32_u8_gather,
   dot_i8,
   l2sq_u8,
   hamming,
@@ -88,6 +101,174 @@ fn distance_batch(
     } else {
       batch::<false>(metric, query, rows, out)
     }
+  }
+}
+
+/// Distances to rows picked by id (see `crate::distance_gather`):
+/// `GATHER_ROWS` rows per kernel call with the query loaded once, while
+/// every line of the next group's rows is prefetched.
+fn distance_gather(
+  metric: Metric,
+  query: &[f32],
+  rows: &[f32],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = query.len();
+  let n = ids.len().min(out.len());
+  if dim == 0 {
+    out[..n].fill(finish(metric, 0.0));
+    return;
+  }
+  // Every id names a whole row (checked by the caller,
+  // `crate::distance_gather`); `get` keeps a broken caller from reading
+  // out of bounds.
+  let row = |i: usize| -> *const f32 {
+    let s = ids[i] as usize * dim;
+    rows
+      .get(s..s + dim)
+      .map_or(core::ptr::null(), |r| r.as_ptr())
+  };
+  // SAFETY: CPU features confirmed (see above).
+  unsafe {
+    if metric == Metric::L2 {
+      gather::<true>(metric, query.as_ptr(), dim, n, row, out)
+    } else {
+      gather::<false>(metric, query.as_ptr(), dim, n, row, out)
+    }
+  }
+}
+
+/// Prefetches every cache line of the row at `p` (`dim` floats). A null
+/// `p` is skipped.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn prefetch_row(p: *const f32, dim: usize) {
+  if p.is_null() {
+    return;
+  }
+  let mut off = 0;
+  while off < dim {
+    prefetch(p.wrapping_add(off));
+    off += 16;
+  }
+  // The last line, when the row does not start on a line boundary.
+  prefetch(p.wrapping_add(dim - 1));
+}
+
+/// The body of `distance_gather`; `row(i)` is the start of row `ids[i]`,
+/// valid for `dim` reads, or null for an id out of range (scored as NaN).
+/// Every line of the rows `GATHER_AHEAD` groups ahead is prefetched while
+/// a group is scored.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn gather<const L2: bool>(
+  metric: Metric,
+  q: *const f32,
+  dim: usize,
+  n: usize,
+  row: impl Fn(usize) -> *const f32,
+  out: &mut [f32],
+) {
+  let ahead = GATHER_ROWS * GATHER_AHEAD;
+  for i in 0..n.min(ahead) {
+    prefetch_row(row(i), dim);
+  }
+  let mut i = 0;
+  while i + GATHER_ROWS <= n {
+    let ptrs: [*const f32; GATHER_ROWS] = core::array::from_fn(|r| row(i + r));
+    for j in i + ahead..n.min(i + ahead + GATHER_ROWS) {
+      prefetch_row(row(j), dim);
+    }
+    if ptrs.iter().all(|p| !p.is_null()) {
+      // SAFETY: every pointer is valid for `dim` reads.
+      let d = unsafe { rows_f32::<GATHER_ROWS, L2, false>(q, ptrs, dim, 0) };
+      for r in 0..GATHER_ROWS {
+        out[i + r] = finish(metric, d[r]);
+      }
+    } else {
+      for r in 0..GATHER_ROWS {
+        out[i + r] = one::<L2>(metric, q, ptrs[r], dim);
+      }
+    }
+    i += GATHER_ROWS;
+  }
+  while i < n {
+    out[i] = one::<L2>(metric, q, row(i), dim);
+    i += 1;
+  }
+}
+
+/// One gathered row's distance; NaN for a null (out-of-range) row.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn one<const L2: bool>(
+  metric: Metric,
+  q: *const f32,
+  p: *const f32,
+  dim: usize,
+) -> f32 {
+  if p.is_null() {
+    return f32::NAN;
+  }
+  // SAFETY: a non-null row pointer is valid for `dim` reads.
+  finish(metric, unsafe {
+    rows_f32::<1, L2, false>(q, [p], dim, 0)[0]
+  })
+}
+
+fn dot_f32_u8(a: &[f32], b: &[u8]) -> f32 {
+  debug_assert_eq!(a.len(), b.len());
+  let n = a.len().min(b.len());
+  // SAFETY: CPU features confirmed (see above); both pointers are valid
+  // for `n` reads.
+  unsafe { f32_u8_impl(a.as_ptr(), b.as_ptr(), n) }
+}
+
+fn dot_f32_u8_gather(w: &[f32], codes: &[u8], ids: &[u32], out: &mut [f32]) {
+  let dim = w.len();
+  let n = ids.len().min(out.len());
+  if dim == 0 {
+    out[..n].fill(0.0);
+    return;
+  }
+  // `get` keeps a caller with bad ids (only possible through the table;
+  // the free function checks) from reading out of bounds.
+  let row = |i: usize| -> Option<&[u8]> {
+    let s = ids[i] as usize * dim;
+    codes.get(s..s + dim)
+  };
+  let ahead = GATHER_ROWS * GATHER_AHEAD;
+  for i in 0..n.min(ahead) {
+    if let Some(r) = row(i) {
+      prefetch_codes(r);
+    }
+  }
+  for i in 0..n {
+    if i + ahead < n
+      && let Some(r) = row(i + ahead)
+    {
+      prefetch_codes(r);
+    }
+    out[i] = match row(i) {
+      // SAFETY: CPU features confirmed (see above); both pointers are
+      // valid for `dim` reads.
+      Some(r) => unsafe { f32_u8_impl(w.as_ptr(), r.as_ptr(), dim) },
+      None => f32::NAN,
+    };
+  }
+}
+
+/// Prefetches every cache line of a code row.
+#[inline]
+fn prefetch_codes(r: &[u8]) {
+  let p = r.as_ptr();
+  let mut off = 0;
+  while off < r.len() {
+    // SAFETY: CPU features confirmed (see above); a prefetch never
+    // faults.
+    unsafe { prefetch(p.wrapping_add(off).cast()) };
+    off += 64;
   }
 }
 
@@ -305,6 +486,68 @@ fn batch<const L2: bool>(
     out[i] = finish(metric, d[0]);
     i += 1;
   }
+}
+
+/// Loads eight codes and widens them to `f32` (exact).
+///
+/// # Safety
+/// The CPU supports AVX2; `p` is valid for 8 reads.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn load_u8_f32(p: *const u8) -> __m256 {
+  // SAFETY: guaranteed by the caller.
+  let c = unsafe { _mm_loadl_epi64(p.cast()) };
+  _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(c))
+}
+
+/// `sum a_i * b_i` with the codes widened to `f32`: eight codes per
+/// vector, four accumulators, masked tail.
+///
+/// # Safety
+/// The CPU supports AVX2 and FMA; `a` and `b` are valid for `n` reads.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn f32_u8_impl(a: *const f32, b: *const u8, n: usize) -> f32 {
+  let mut acc = [_mm256_setzero_ps(); 4];
+  let mut j = 0;
+  while j + 32 <= n {
+    for u in 0..4 {
+      // SAFETY: `j + 8 * u + 8 <= n`.
+      let (x, y) = unsafe {
+        (
+          _mm256_loadu_ps(a.add(j + 8 * u)),
+          load_u8_f32(b.add(j + 8 * u)),
+        )
+      };
+      acc[u] = _mm256_fmadd_ps(x, y, acc[u]);
+    }
+    j += 32;
+  }
+  // Constant accumulator indices keep the accumulators in registers.
+  for u in 0..3 {
+    if j + 8 <= n {
+      // SAFETY: `j + 8 <= n`.
+      let (x, y) =
+        unsafe { (_mm256_loadu_ps(a.add(j)), load_u8_f32(b.add(j))) };
+      acc[u] = _mm256_fmadd_ps(x, y, acc[u]);
+      j += 8;
+    }
+  }
+  if j < n {
+    let rem = n - j;
+    let mut t = [0u8; 8];
+    // SAFETY: `rem < 8` codes remain at `b + j`; `t` holds 8.
+    unsafe { core::ptr::copy_nonoverlapping(b.add(j), t.as_mut_ptr(), rem) };
+    // SAFETY: `maskload` reads only the `rem` in-bounds lanes; `t` holds
+    // 8 codes. Masked-off lanes are zero in both and add nothing.
+    let (x, y) = unsafe {
+      (
+        _mm256_maskload_ps(a.add(j), tail_mask(rem)),
+        load_u8_f32(t.as_ptr()),
+      )
+    };
+    acc[3] = _mm256_fmadd_ps(x, y, acc[3]);
+  }
+  reduce4(acc)
 }
 
 /// Exact `i8` dot product: sign-extend to `i16`, `madd` pairs into `i32`.

@@ -259,6 +259,103 @@ fn distance_batch_is_bitwise_split_invariant() {
   }
 }
 
+/// Gathered rows score bit-identically to `distance` on each row, for
+/// every id count (all group remainders) and dimension, repeated ids
+/// included.
+#[test]
+fn distance_gather_matches_distance_bitwise() {
+  for k in variants() {
+    let mut rng = Rng::new(21);
+    for dim in (0..=MAX_LEN).step_by(7).chain([1, 16, 64, 100, 128, 256]) {
+      let rows_n = 13;
+      let rows = rng.exact(dim * rows_n, Rng::f32);
+      let q = rng.exact(dim, Rng::f32);
+      for count in 0..=11 {
+        let ids: Vec<u32> = (0..count)
+          .map(|_| (rng.next_u64() % rows_n as u64) as u32)
+          .collect();
+        for metric in METRICS {
+          let mut out = vec![0.0f32; count + 1];
+          (k.distance_gather)(metric, &q, &rows, &ids, &mut out);
+          for (i, &id) in ids.iter().enumerate() {
+            let row = &rows[id as usize * dim..(id as usize + 1) * dim];
+            let mut want = [0.0f32];
+            (k.distance_batch)(metric, &q, row, &mut want);
+            assert_eq!(
+              out[i].to_bits(),
+              want[0].to_bits(),
+              "{} {metric:?} dim {dim} count {count} slot {i}",
+              k.features
+            );
+          }
+          assert_eq!(out[count], 0.0, "wrote past the ids");
+        }
+      }
+    }
+  }
+}
+
+/// Gathered code rows score bit-identically to `dot_f32_u8` on each
+/// row, for every id count and dimension.
+#[test]
+fn dot_f32_u8_gather_matches_single_rows_bitwise() {
+  for k in variants() {
+    let mut rng = Rng::new(31);
+    for dim in (0..=MAX_LEN).step_by(9).chain([1, 16, 64, 100, 128, 256]) {
+      let rows_n = 11;
+      let codes = rng.exact(dim * rows_n, Rng::u8);
+      let w = rng.exact(dim, Rng::f32);
+      for count in 0..=10 {
+        let ids: Vec<u32> = (0..count)
+          .map(|_| (rng.next_u64() % rows_n as u64) as u32)
+          .collect();
+        let mut out = vec![0.0f32; count + 1];
+        (k.dot_f32_u8_gather)(&w, &codes, &ids, &mut out);
+        for (i, &id) in ids.iter().enumerate() {
+          let row = &codes[id as usize * dim..(id as usize + 1) * dim];
+          let want = (k.dot_f32_u8)(&w, row);
+          assert_eq!(
+            out[i].to_bits(),
+            want.to_bits(),
+            "{} dim {dim} count {count} slot {i}",
+            k.features
+          );
+        }
+        assert_eq!(out[count], 0.0, "wrote past the ids");
+      }
+    }
+    let mut out = [0.0f32; 3];
+    (k.dot_f32_u8_gather)(&[1.0; 4], &[1u8; 8], &[1, 2, 0], &mut out);
+    assert!(out[1].is_nan() && out[0] == 4.0 && out[2] == 4.0);
+  }
+  let r = std::panic::catch_unwind(|| {
+    let mut out = [0.0f32; 1];
+    crate::dot_f32_u8_gather(&[0.0; 4], &[0; 8], &[2], &mut out);
+  });
+  assert!(r.is_err());
+}
+
+/// Called through the table, a bad id scores NaN instead of reading out
+/// of bounds; the free function panics.
+#[test]
+fn distance_gather_rejects_bad_ids() {
+  for k in variants() {
+    let rows = [1.0f32; 8];
+    let q = [0.5f32; 4];
+    let mut out = [0.0f32; 6];
+    let ids = [0, 2, 1, 7, 0, 1];
+    (k.distance_gather)(Metric::L2, &q, &rows, &ids, &mut out);
+    assert!(out[1].is_nan() && out[3].is_nan(), "{}", k.features);
+    assert_eq!(out[0], 1.0);
+    assert_eq!(out[5], 1.0);
+  }
+  let r = std::panic::catch_unwind(|| {
+    let mut out = [0.0f32; 1];
+    crate::distance_gather(Metric::L2, &[0.0; 4], &[0.0; 8], &[2], &mut out);
+  });
+  assert!(r.is_err());
+}
+
 #[test]
 fn distance_batch_handles_empty_inputs() {
   for k in variants() {
@@ -268,6 +365,45 @@ fn distance_batch_handles_empty_inputs() {
       (k.distance_batch)(metric, &[], &[], &mut out);
       let want = finish(metric, 0.0);
       assert!(out.iter().all(|d| d.to_bits() == want.to_bits()));
+    }
+  }
+}
+
+#[test]
+fn dot_f32_u8_matches_scalar() {
+  for k in variants() {
+    let mut rng = Rng::new(11);
+    for len in 0..=MAX_LEN {
+      let a = rng.fill(len, Rng::f32);
+      let b = rng.fill(len, Rng::u8);
+      let (a, b) = (win(&a, len % 2, len), win(&b, (len / 2) % 2, len));
+      let mag: f32 = a.iter().zip(b).map(|(x, &y)| (x * y as f32).abs()).sum();
+      let what = format!("{} dot_f32_u8 len {len}", k.features);
+      assert_close((k.dot_f32_u8)(a, b), scalar::dot_f32_u8(a, b), mag, &what);
+    }
+  }
+}
+
+/// Small integer weights make every product and partial sum exact in
+/// `f32` (all stay below 2^24), so every instruction set must agree with
+/// a plain integer sum bit for bit, extreme codes included.
+#[test]
+fn dot_f32_u8_is_exact_on_integer_weights() {
+  for k in variants() {
+    let mut rng = Rng::new(12);
+    for len in [0, 1, 7, 15, 16, 17, 63, 64, 65, 100, 128, 255, 256, 1024] {
+      let b = rng.exact(len, Rng::u8);
+      let a: Vec<f32> = (0..len)
+        .map(|i| match i % 4 {
+          0 => 15.0,
+          1 => -15.0,
+          _ => (rng.next_u64() % 31) as f32 - 15.0,
+        })
+        .collect();
+      let want: i64 =
+        a.iter().zip(&b).map(|(&x, &y)| x as i64 * y as i64).sum();
+      let got = (k.dot_f32_u8)(&a, &b);
+      assert_eq!(got, want as f32, "{} len {len}", k.features);
     }
   }
 }
@@ -597,6 +733,10 @@ fn free_functions_use_the_dispatched_kernels() {
   assert_eq!(crate::dot_i8(&x, &y), scalar::dot_i8(&x, &y));
   let (x, y) = (rng.exact(300, Rng::u8), rng.exact(300, Rng::u8));
   assert_eq!(crate::l2sq_u8(&x, &y), scalar::l2sq_u8(&x, &y));
+  assert_eq!(
+    crate::dot_f32_u8(&a, &x).to_bits(),
+    (k.dot_f32_u8)(&a, &x).to_bits()
+  );
   let (x, y) = (rng.exact(30, Rng::next_u64), rng.exact(30, Rng::next_u64));
   assert_eq!(crate::hamming(&x, &y), scalar::hamming(&x, &y));
   let (x, y) = (rng.exact(300, random_f16), rng.exact(300, random_f16));
