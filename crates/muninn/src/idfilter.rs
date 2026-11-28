@@ -1,24 +1,20 @@
-//! Search filters and the hook payload-filter crates plug into.
+//! Filters: per-source evaluation of payload filters and id filters.
 //!
-//! A [`Filter`] is evaluated once per *source* of a search snapshot (each
-//! segment and memtable) into a [`Selection`], which the engine ANDs with
-//! "not deleted" and hands to the vector and text indexes as their
-//! `DocFilter`, so filters apply during the search and `k` results come
-//! back whenever `k` documents match.
-//!
-//! Built-in filters select by external id. Payload filters (field
-//! equality, ranges) are provided by implementing [`FilterPlugin`]: given
-//! a [`FilterSource`] (one segment or memtable), return the set of
-//! matching doc ids. A plugin with its own per-segment indexes looks them
-//! up by [`FilterSource::segment_id`].
+//! A query may carry a payload [`Filter`] (fields of the JSON payload,
+//! evaluated by the per-source payload indexes of `muninn-filter`) and an
+//! [`IdFilter`] (external ids). Both are evaluated once per *source* of a
+//! search snapshot (each segment and memtable) into a [`Selection`],
+//! which the engine ANDs with "not deleted" and hands to the vector and
+//! text indexes as their `DocFilter`. Filters therefore apply during the
+//! search, and `k` results come back whenever `k` documents match.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use muninn_core::{BitSet, DocFilter, DocId, Result};
+use muninn_filter::{Filter, FilterIndex, MemIndex};
 use muninn_store::ExternalIdRef;
 
-use crate::codec;
 use crate::memtable::MemInner;
 use crate::segment::Segment;
 use crate::types::Id;
@@ -26,64 +22,35 @@ use crate::types::Id;
 /// A borrowed [`Id`], passed to predicates without allocating.
 pub type IdRef<'a> = ExternalIdRef<'a>;
 
-/// What a [`FilterPlugin`] can see of one source of a collection.
-pub trait FilterSource {
-  /// Doc ids of this source are `0..len()`.
-  fn len(&self) -> u32;
-  /// True for an empty source.
-  fn is_empty(&self) -> bool {
-    self.len() == 0
-  }
-  /// The segment id, or `None` for in-memory data.
-  fn segment_id(&self) -> Option<u64>;
-  /// The external id of `doc`.
-  fn external_id(&self, doc: DocId) -> Result<Id>;
-  /// The doc of a live external id in this source, if any. A doc returned
-  /// here may still have been deleted since; the engine excludes deleted
-  /// docs on its own.
-  fn lookup(&self, id: &Id) -> Option<DocId>;
-  /// The stored payload of `doc` (`Null` if none).
-  fn payload(&self, doc: DocId) -> Result<serde_json::Value>;
-}
-
-/// A filter that can be evaluated per source: the extension point for
-/// payload filtering.
-pub trait FilterPlugin: Send + Sync {
-  /// The docs of `src` that match. Ids at or above `src.len()` are
-  /// ignored.
-  fn select(&self, src: &dyn FilterSource) -> Result<BitSet>;
-}
-
 type Predicate = dyn Fn(IdRef<'_>) -> bool + Send + Sync;
 
 #[derive(Clone)]
 enum Kind {
   Ids(Arc<HashSet<Id>>),
   Predicate(Arc<Predicate>),
-  Plugin(Arc<dyn FilterPlugin>),
-  And(Vec<Filter>),
-  Or(Vec<Filter>),
-  Not(Box<Filter>),
+  And(Vec<IdFilter>),
+  Or(Vec<IdFilter>),
+  Not(Box<IdFilter>),
 }
 
-/// Restricts which documents a search may return.
+/// Restricts a search to documents by external id. Combine with a
+/// payload [`Filter`] on the same query; both must match.
 ///
 /// ```
-/// use muninn::Filter;
-/// let f = Filter::ids([1u64, 2, 3]).and(Filter::ids([2u64, 3]).not());
+/// use muninn::IdFilter;
+/// let f = IdFilter::ids([1u64, 2, 3]).and(IdFilter::ids([2u64]).not());
 /// # let _ = f;
 /// ```
 #[derive(Clone)]
-pub struct Filter {
+pub struct IdFilter {
   kind: Kind,
 }
 
-impl std::fmt::Debug for Filter {
+impl std::fmt::Debug for IdFilter {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match &self.kind {
       Kind::Ids(s) => write!(f, "Ids({} ids)", s.len()),
       Kind::Predicate(_) => write!(f, "Predicate"),
-      Kind::Plugin(_) => write!(f, "Plugin"),
       Kind::And(v) => f.debug_tuple("And").field(v).finish(),
       Kind::Or(v) => f.debug_tuple("Or").field(v).finish(),
       Kind::Not(x) => f.debug_tuple("Not").field(x).finish(),
@@ -91,7 +58,7 @@ impl std::fmt::Debug for Filter {
   }
 }
 
-impl Filter {
+impl IdFilter {
   /// Only documents with one of these ids.
   pub fn ids<I: Into<Id>>(ids: impl IntoIterator<Item = I>) -> Self {
     Self {
@@ -109,22 +76,15 @@ impl Filter {
     }
   }
 
-  /// A filter evaluated by a [`FilterPlugin`].
-  pub fn plugin(p: Arc<dyn FilterPlugin>) -> Self {
-    Self {
-      kind: Kind::Plugin(p),
-    }
-  }
-
   /// Documents matching both.
-  pub fn and(self, other: Filter) -> Self {
+  pub fn and(self, other: IdFilter) -> Self {
     Self {
       kind: Kind::And(vec![self, other]),
     }
   }
 
   /// Documents matching either.
-  pub fn or(self, other: Filter) -> Self {
+  pub fn or(self, other: IdFilter) -> Self {
     Self {
       kind: Kind::Or(vec![self, other]),
     }
@@ -187,17 +147,6 @@ impl Filter {
           Selection::bits(b)
         }
       },
-      Kind::Plugin(p) => {
-        let mut b = p.select(src)?;
-        if b.capacity() > len as usize {
-          let mut t = BitSet::new(len as usize);
-          for d in b.iter().take_while(|&d| d < len) {
-            t.insert(d);
-          }
-          b = t;
-        }
-        Selection::bits(b)
-      }
       Kind::And(v) => {
         let parts = v
           .iter()
@@ -232,34 +181,11 @@ pub(crate) enum SourceRef<'a> {
   Seg(&'a Segment),
 }
 
-impl FilterSource for SourceRef<'_> {
+impl SourceRef<'_> {
   fn len(&self) -> u32 {
     match self {
       Self::Mem(_, n) => *n,
       Self::Seg(s) => s.len,
-    }
-  }
-
-  fn segment_id(&self) -> Option<u64> {
-    match self {
-      Self::Mem(..) => None,
-      Self::Seg(s) => Some(s.id),
-    }
-  }
-
-  fn external_id(&self, doc: DocId) -> Result<Id> {
-    let missing = || muninn_core::Error::NotFound(format!("doc {doc}"));
-    match self {
-      Self::Mem(g, n) => {
-        if doc >= *n {
-          return Err(missing());
-        }
-        g.ids
-          .external_id(doc)
-          .map(|e| e.into_owned())
-          .ok_or_else(missing)
-      }
-      Self::Seg(s) => Ok(s.ids.external_id(doc)?.into_owned()),
     }
   }
 
@@ -270,26 +196,29 @@ impl FilterSource for SourceRef<'_> {
     }
   }
 
-  fn payload(&self, doc: DocId) -> Result<serde_json::Value> {
-    let rec = match self {
-      Self::Mem(g, n) => {
-        if doc >= *n {
-          return Err(muninn_core::Error::NotFound(format!("doc {doc}")));
-        }
-        g.stored
-          .get(doc)
-          .ok_or_else(|| muninn_core::Error::NotFound(format!("doc {doc}")))?
-      }
-      Self::Seg(s) => s.stored.get(doc)?,
+  /// Evaluates a payload filter (already checked against the schema) on
+  /// this source's payload index.
+  pub(crate) fn payload(&self, f: &Filter) -> Result<Selection<'static>> {
+    let len = self.len() as usize;
+    let idx: Option<&dyn FilterIndex> = match self {
+      Self::Mem(g, _) => g.pindex.as_ref().map(|i| i as &dyn FilterIndex),
+      Self::Seg(s) => s.pindex.as_ref().map(|i| i as &dyn FilterIndex),
     };
-    codec::parse_payload(codec::decode_stored(rec)?.payload)
+    let bits = match idx {
+      Some(i) => i.evaluate(f, len)?,
+      // No filterable fields: only field-free filters (empty `and`/`or`
+      // and negations of them) pass the schema check, and an empty index
+      // evaluates those.
+      None => MemIndex::new(muninn_filter::Schema::new()).evaluate(f, len)?,
+    };
+    Ok(Selection::bits(bits))
   }
 }
 
 /// A filter evaluated on one source.
 pub(crate) enum Selection<'a> {
   All,
-  /// Allowed docs and their count.
+  /// Allowed docs and their count (counted once, not per query step).
   Bits(BitSet, usize),
   Pred(Box<dyn Fn(DocId) -> bool + Send + Sync + 'a>),
   And(Vec<Selection<'a>>),
@@ -303,7 +232,7 @@ impl<'a> Selection<'a> {
     Self::Bits(b, n)
   }
 
-  fn and(parts: Vec<Selection<'a>>) -> Self {
+  pub(crate) fn and(parts: Vec<Selection<'a>>) -> Self {
     let mut bits: Option<BitSet> = None;
     let mut rest = Vec::new();
     for p in parts {
@@ -379,7 +308,7 @@ impl<'a> Selection<'a> {
   }
 }
 
-/// The filter handed to an index: the user's selection AND not deleted
+/// The filter handed to an index: the query's selection AND not deleted
 /// AND below the snapshot's length.
 pub(crate) struct SourceFilter<'a> {
   pub sel: &'a Selection<'a>,
@@ -409,8 +338,7 @@ impl DocFilter for SourceFilter<'_> {
     };
     match self.sel {
       Selection::All => Some(live),
-      // A bitset's count already excludes nothing deleted; assume
-      // independence otherwise.
+      // Assume deletes are independent of the selection.
       s => s.hint(self.len).map(|h| h * live),
     }
   }

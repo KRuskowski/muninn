@@ -8,6 +8,9 @@
 //! | `text:<field>` | `seg-<id>.t<i>`      | `TextIndex` of text field `i`  |
 //! | `docs`         | `seg-<id>.docs`      | stored records (`payload` file)|
 //! | `ids`          | `seg-<id>.ids`       | `FrozenIdMap`                  |
+//! | `pindex`       | `seg-<id>.pidx`      | payload index (`FrozenIndex`), |
+//! |                |                      | if the schema has filterable   |
+//! |                |                      | fields                         |
 //!
 //! Every file is written to a temporary name, fsynced and renamed, so a
 //! file under its final name is always complete. Doc ids are dense and in
@@ -21,6 +24,7 @@ use std::path::Path;
 
 use muninn_core::container::Container;
 use muninn_core::{BitSet, DocId, Error, Result};
+use muninn_filter::FrozenIndex;
 use muninn_store::fs::write_atomic_with;
 use muninn_store::{
   Advice, FrozenIdMap, IdMap, PayloadStore, SegmentEntry, map_file,
@@ -88,6 +92,7 @@ pub(crate) struct Segment {
   pub text: Vec<TextIndex>,
   pub stored: PayloadStore,
   pub ids: FrozenIdMap,
+  pub pindex: Option<FrozenIndex>,
   /// The manifest entry, without tombstones (tracked by the engine).
   pub entry: SegmentEntry,
 }
@@ -216,6 +221,13 @@ pub(crate) fn write_from_memtable(
     g.ids.write_to(w)?;
     Ok(())
   })?;
+  if let Some(pi) = &g.pindex {
+    let p = fs.path("pindex".into(), "pidx");
+    write_atomic_with(&p, |w| {
+      pi.write_to(w)?;
+      Ok(())
+    })?;
+  }
   Ok(fs.finish(n, vectors.as_ref()))
 }
 
@@ -310,6 +322,25 @@ pub(crate) fn write_merged(
     ids.write_to(w)?;
     Ok(())
   })?;
+  if !schema.filterable.is_empty() {
+    let fschema = schema.filter_schema()?;
+    let pin: Vec<(&FrozenIndex, &[DocId])> = inputs
+      .iter()
+      .zip(&maps)
+      .map(|((seg, _), m)| {
+        seg
+          .pindex
+          .as_ref()
+          .map(|x| (x, m.as_slice()))
+          .ok_or_else(|| Error::corrupt("segment has no payload index"))
+      })
+      .collect::<Result<_>>()?;
+    let p = fs.path("pindex".into(), "pidx");
+    write_atomic_with(&p, |w| {
+      FrozenIndex::merge(&fschema, &pin, w)?;
+      Ok(())
+    })?;
+  }
   Ok(Some((fs.finish(n, vectors.as_ref()), maps)))
 }
 
@@ -378,6 +409,19 @@ impl Segment {
     check("stored records", stored.len())?;
     let ids = FrozenIdMap::open(map_file(&file("ids")?)?)?;
     check("id map", ids.len())?;
+    let pindex = if schema.filterable.is_empty() {
+      None
+    } else {
+      let p = FrozenIndex::open(map_file(&file("pindex")?)?)?;
+      if *p.schema() != schema.filter_schema()? || p.doc_count() > len as usize
+      {
+        return Err(Error::corrupt(format!(
+          "segment {} payload index does not match the schema",
+          entry.id
+        )));
+      }
+      Some(p)
+    };
     let mut entry = entry.clone();
     entry.tombstones = None;
     Ok(Segment {
@@ -387,6 +431,7 @@ impl Segment {
       text,
       stored,
       ids,
+      pindex,
       entry,
     })
   }

@@ -19,6 +19,7 @@
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use muninn_core::{DocId, Metric, Result};
+use muninn_filter::MemIndex;
 use muninn_store::{IdMap, PayloadBuilder};
 use muninn_text::{Analyzer, MemTextIndex};
 
@@ -57,6 +58,8 @@ pub(crate) struct MemInner {
   pub stored: PayloadBuilder,
   /// One index per schema text field.
   pub text: Vec<MemTextIndex>,
+  /// Payload index of the filterable fields; `None` if there are none.
+  pub pindex: Option<MemIndex>,
   /// Docs added.
   pub docs: u32,
   /// Approximate memory held, for flush decisions.
@@ -81,6 +84,11 @@ impl Memtable {
       .iter()
       .map(|_| MemTextIndex::new(analyzer.clone()))
       .collect();
+    let pindex = if schema.filterable.is_empty() {
+      None
+    } else {
+      Some(MemIndex::new(schema.filter_schema()?))
+    };
     Ok(Memtable {
       id,
       vectors,
@@ -90,6 +98,7 @@ impl Memtable {
         ids: IdMap::new(),
         stored: PayloadBuilder::new(),
         text,
+        pindex,
         docs: 0,
         bytes: 0,
         scratch: Vec::new(),
@@ -120,6 +129,7 @@ impl Memtable {
       record,
       stored,
       text,
+      pindex,
       ..
     } = &mut *g;
     record.clear();
@@ -130,6 +140,11 @@ impl Memtable {
     for &(f, t) in &st.text {
       text[f].add(next, t)?;
       text_bytes += t.len();
+    }
+    if let Some(pi) = pindex
+      && !st.payload.is_empty()
+    {
+      pi.add(next, &codec::parse_payload(st.payload)?)?;
     }
     let pushed = stored.push(record);
     debug_assert_eq!(pushed, next);

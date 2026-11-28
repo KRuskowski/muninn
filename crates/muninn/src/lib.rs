@@ -1,8 +1,8 @@
 //! muninn: an embedded vector database and full-text search engine.
 //!
 //! ```no_run
-//! use muninn::{Database, Document, Metric, Options, Query, Schema,
-//!              VectorField};
+//! use muninn::{Database, Document, FieldSpec, Filter, Metric, Options,
+//!              Query, Schema, VectorField};
 //! use serde_json::json;
 //!
 //! # fn main() -> muninn::Result<()> {
@@ -10,14 +10,18 @@
 //! let docs = db.create_collection(
 //!   "docs",
 //!   Schema::vector(VectorField::hnsw(3, Metric::Cosine))
-//!     .with_text_fields(["title"]),
+//!     .with_text_fields(["title"])
+//!     .with_filterable(FieldSpec::keyword("lang")),
 //! )?;
 //! docs.upsert(&[Document::new("a")
 //!   .vector(vec![0.1, 0.2, 0.3])
 //!   .text("title", "an embedded database")
 //!   .payload(json!({"lang": "en"}))])?;
 //! let hits = docs.search(
-//!   &Query::hybrid(vec![0.1, 0.2, 0.3], "database").k(10).with_payload(true),
+//!   &Query::hybrid(vec![0.1, 0.2, 0.3], "database")
+//!     .k(10)
+//!     .filter(Filter::eq("lang", "en"))
+//!     .with_payload(true),
 //! )?;
 //! # let _ = hits;
 //! # Ok(())
@@ -40,7 +44,7 @@ mod arena;
 mod codec;
 mod collection;
 mod database;
-mod filter;
+mod idfilter;
 mod memtable;
 mod options;
 mod query;
@@ -58,7 +62,9 @@ pub use muninn_vector as vector;
 
 pub use collection::Collection;
 pub use database::Database;
-pub use filter::{Filter, FilterPlugin, FilterSource, IdRef};
+pub use idfilter::{IdFilter, IdRef};
+pub use muninn_filter as filter;
+pub use muninn_filter::Filter;
 #[doc(hidden)]
 pub use options::Failpoint;
 pub use options::{Durability, Options};

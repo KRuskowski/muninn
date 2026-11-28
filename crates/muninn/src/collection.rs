@@ -130,6 +130,8 @@ pub(crate) struct Core {
   pub dir: PathBuf,
   pub name: String,
   pub schema: Schema,
+  /// `schema`'s filterable fields, for checking query filters.
+  pub filter_schema: muninn_filter::Schema,
   pub opts: Options,
   wal: Wal,
   state: Mutex<State>,
@@ -462,6 +464,7 @@ impl Core {
     Ok(Core {
       dir: dir.to_path_buf(),
       name: name.to_string(),
+      filter_schema: schema.filter_schema()?,
       schema,
       opts: opts.clone(),
       wal,

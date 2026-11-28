@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use common::{Rng, TestDir};
 use muninn::{
-  Collection, Database, Document, Durability, Failpoint, Filter, Id, Metric,
+  Collection, Database, Document, Durability, Failpoint, Id, IdFilter, Metric,
   Options, Query, Schema, SearchHit, VectorField,
 };
 use serde_json::json;
@@ -61,7 +61,7 @@ fn reader(c: &Collection, rng: &mut Rng, doomed: &Mutex<Vec<u64>>) {
   let w = rng.below(WRITERS);
   let g = rng.below(GROUPS);
   let ids = group_ids(w, g);
-  let f = Filter::ids(ids.iter().copied());
+  let f = IdFilter::ids(ids.iter().copied());
   let k = SIZE as usize * 2;
   let qv: Vec<f32> = (0..DIM).map(|_| rng.f32() * 50.0).collect();
   let queries = [
@@ -71,7 +71,7 @@ fn reader(c: &Collection, rng: &mut Rng, doomed: &Mutex<Vec<u64>>) {
   ];
   for (what, q) in queries {
     let hits = c
-      .search(&q.k(k).filter(f.clone()).with_payload(true))
+      .search(&q.k(k).id_filter(f.clone()).with_payload(true))
       .unwrap();
     check_group(&hits, what);
   }
@@ -81,7 +81,7 @@ fn reader(c: &Collection, rng: &mut Rng, doomed: &Mutex<Vec<u64>>) {
     .search(
       &Query::vector(vec![0.0; DIM])
         .k((WRITERS * GROUPS * SIZE) as usize + 5)
-        .filter(Filter::predicate(|id| !is_loose(id)))
+        .id_filter(IdFilter::predicate(|id| !is_loose(id)))
         .with_payload(true),
     )
     .unwrap();
@@ -97,7 +97,7 @@ fn reader(c: &Collection, rng: &mut Rng, doomed: &Mutex<Vec<u64>>) {
     .search(
       &Query::vector(vec![0.0; DIM])
         .k(LOOSE as usize + 10)
-        .filter(Filter::predicate(is_loose)),
+        .id_filter(IdFilter::predicate(is_loose)),
     )
     .unwrap();
   let ids: HashSet<&Id> = loose.iter().map(|h| &h.id).collect();
@@ -110,7 +110,7 @@ fn reader(c: &Collection, rng: &mut Rng, doomed: &Mutex<Vec<u64>>) {
       .search(
         &Query::vector(vec![0.0; DIM])
           .k(gone.len() + 1)
-          .filter(Filter::ids(gone.iter().copied())),
+          .id_filter(IdFilter::ids(gone.iter().copied())),
       )
       .unwrap();
     assert!(back.is_empty(), "deleted documents resurrected: {back:?}");
@@ -272,12 +272,12 @@ fn readers_writers_flushes_and_merges_run_together() {
   let before: Vec<Vec<SearchHit>> = (0..WRITERS)
     .flat_map(|w| (0..GROUPS).map(move |g| (w, g)))
     .map(|(w, g)| {
-      let f = Filter::ids(group_ids(w, g));
+      let f = IdFilter::ids(group_ids(w, g));
       let hits = c
         .search(
           &Query::vector(vec![0.0; DIM])
             .k(100)
-            .filter(f)
+            .id_filter(f)
             .with_payload(true),
         )
         .unwrap();
@@ -294,11 +294,11 @@ fn readers_writers_flushes_and_merges_run_together() {
   let after: Vec<Vec<SearchHit>> = (0..WRITERS)
     .flat_map(|w| (0..GROUPS).map(move |g| (w, g)))
     .map(|(w, g)| {
-      let f = Filter::ids(group_ids(w, g));
+      let f = IdFilter::ids(group_ids(w, g));
       c.search(
         &Query::vector(vec![0.0; DIM])
           .k(100)
-          .filter(f)
+          .id_filter(f)
           .with_payload(true),
       )
       .unwrap()

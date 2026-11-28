@@ -13,6 +13,7 @@ muninn-simd.workspace = true
 muninn-vector.workspace = true
 muninn-text.workspace = true
 muninn-store.workspace = true
+muninn-filter.workspace = true
 # Parallel fan-out of one search over segments (already used by
 # muninn-vector, so no new dependency in the build).
 rayon = "1.10"

@@ -32,9 +32,10 @@ use rayon::prelude::*;
 use crate::arena::VecArena;
 use crate::codec;
 use crate::collection::Core;
-use crate::filter::{Selection, SourceFilter, SourceRef};
+use crate::idfilter::{Selection, SourceFilter, SourceRef};
 use crate::memtable::{MemInner, read};
 use crate::query::{Fusion, Query};
+use crate::segment::Segment;
 use crate::types::{Document, Id, SearchHit};
 use crate::version::{Source, Version};
 
@@ -153,6 +154,23 @@ struct Locked {
   text: Vec<(usize, CorpusStats, Vec<Cand>)>,
 }
 
+/// The query's payload and id filters evaluated on one source. Lazy
+/// parts may borrow only `lazy_seg`.
+fn select<'s>(
+  q: &Query,
+  src: &SourceRef<'_>,
+  lazy_seg: Option<&'s Segment>,
+) -> Result<Selection<'s>> {
+  let mut parts = Vec::with_capacity(2);
+  if let Some(f) = &q.filter {
+    parts.push(src.payload(f)?);
+  }
+  if let Some(f) = &q.id_filter {
+    parts.push(f.select(src, lazy_seg)?);
+  }
+  Ok(Selection::and(parts))
+}
+
 /// Validated text fields of a query.
 fn text_fields(core: &Core, q: &Query) -> Result<Vec<usize>> {
   if q.text.is_none() {
@@ -222,6 +240,9 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
     }
   }
   let fields = text_fields(core, q)?;
+  if let Some(f) = &q.filter {
+    core.filter_schema.check(f)?;
+  }
   if q.vector.is_none() && q.text.is_none() {
     return Err(Error::invalid("a query needs a vector or text"));
   }
@@ -234,10 +255,9 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
   let (v, locked) = with_locked(core, |v, guards| {
     let mut mem_sels = Vec::with_capacity(v.views.len());
     for (w, g) in v.views.iter().zip(guards) {
-      mem_sels.push(match (g, &q.filter) {
-        (Some(g), Some(f)) => Some(f.select(&SourceRef::Mem(g, w.len), None)?),
-        (Some(_), None) => Some(Selection::All),
-        (None, _) => None,
+      mem_sels.push(match g {
+        Some(g) => Some(select(q, &SourceRef::Mem(g, w.len), None)?),
+        None => None,
       });
     }
     let mut out = Vec::new();
@@ -285,10 +305,7 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
   for (w, ms) in v.views.iter().zip(mem_sels) {
     sels.push(match (ms, &w.src) {
       (Some(s), _) => s,
-      (None, Source::Seg(seg)) => match &q.filter {
-        Some(f) => f.select(&SourceRef::Seg(seg), Some(seg))?,
-        None => Selection::All,
-      },
+      (None, Source::Seg(seg)) => select(q, &SourceRef::Seg(seg), Some(seg))?,
       (None, Source::Mem(_)) => unreachable!("memtables have selections"),
     });
   }

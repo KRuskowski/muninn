@@ -1,6 +1,8 @@
 //! Search requests.
 
-use crate::filter::Filter;
+use muninn_filter::Filter;
+
+use crate::idfilter::IdFilter;
 
 /// How a hybrid query combines its vector and text results.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,9 +36,10 @@ impl Default for Fusion {
 /// A search request: vector, text, or both (hybrid).
 ///
 /// ```
-/// use muninn::{Fusion, Query};
+/// use muninn::{Filter, Fusion, Query};
 /// let q = Query::hybrid(vec![0.1, 0.2], "rust database")
 ///   .k(10)
+///   .filter(Filter::eq("lang", "en") & Filter::range("year", 2020..))
 ///   .fusion(Fusion::Rrf { k: 60 })
 ///   .with_payload(true);
 /// # let _ = q;
@@ -51,6 +54,7 @@ pub struct Query {
   pub(crate) rerank: usize,
   pub(crate) candidates: usize,
   pub(crate) filter: Option<Filter>,
+  pub(crate) id_filter: Option<IdFilter>,
   pub(crate) fusion: Fusion,
   pub(crate) with_payload: bool,
 }
@@ -66,6 +70,7 @@ impl Query {
       rerank: 0,
       candidates: 0,
       filter: None,
+      id_filter: None,
       fusion: Fusion::default(),
       with_payload: false,
     }
@@ -124,9 +129,19 @@ impl Query {
     self
   }
 
-  /// Only returns documents matching `f`.
+  /// Only returns documents whose payload matches `f`. Fields must be
+  /// declared filterable in the schema; otherwise the search fails with
+  /// `InvalidArgument`. Build filters with the [`Filter`] helpers or parse
+  /// the JSON form with [`Filter::from_json`].
   pub fn filter(mut self, f: Filter) -> Self {
     self.filter = Some(f);
+    self
+  }
+
+  /// Only returns documents whose id matches `f` (in addition to any
+  /// payload filter).
+  pub fn id_filter(mut self, f: IdFilter) -> Self {
+    self.id_filter = Some(f);
     self
   }
 

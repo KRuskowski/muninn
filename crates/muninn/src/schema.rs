@@ -18,9 +18,10 @@ pub struct Schema {
   /// How text is split into terms (for every text field). Custom
   /// stemmers cannot be stored in a schema; use the built-in choices.
   pub analyzer: AnalyzerConfig,
-  /// Payload fields that filters will be able to use. Declared now so
-  /// collections created today get payload indexes once filtering by
-  /// payload is available; currently stored and validated only.
+  /// Payload fields that filters can use (see [`crate::Filter`]). Each
+  /// gets a payload index in every segment. A name is a dot-separated
+  /// path into the payload (`"meta.lang"`); arrays along the path are
+  /// flattened, so fields can hold several values.
   pub filterable: Vec<FieldSpec>,
 }
 
@@ -64,6 +65,15 @@ impl Schema {
   pub fn with_filterable(mut self, field: FieldSpec) -> Self {
     self.filterable.push(field);
     self
+  }
+
+  /// The payload-index schema of the filterable fields.
+  pub(crate) fn filter_schema(&self) -> Result<muninn_filter::Schema> {
+    let mut fs = muninn_filter::Schema::new();
+    for f in &self.filterable {
+      fs.add(&f.name, f.kind.filter_type())?;
+    }
+    Ok(fs)
   }
 
   /// Index of text field `name`.
@@ -112,6 +122,7 @@ impl Schema {
         )));
       }
     }
+    self.filter_schema()?;
     if let StemmerChoice::Custom(name) = &self.analyzer.stemmer {
       return Err(Error::invalid(format!(
         "custom stemmer {name:?} cannot be stored in a schema"
@@ -370,7 +381,7 @@ pub enum IndexKind {
 /// A payload field declared for filtering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldSpec {
-  /// Top-level payload key.
+  /// Dot-separated path into the payload, e.g. `"meta.lang"`.
   pub name: String,
   /// Value type.
   pub kind: FieldKind,
@@ -400,6 +411,14 @@ impl FieldSpec {
       kind: FieldKind::Float,
     }
   }
+
+  /// A boolean field.
+  pub fn boolean(name: impl Into<String>) -> Self {
+    Self {
+      name: name.into(),
+      kind: FieldKind::Bool,
+    }
+  }
 }
 
 /// Value type of a [`FieldSpec`].
@@ -409,8 +428,10 @@ pub enum FieldKind {
   Keyword,
   /// 64-bit integers, for equality and ranges.
   Integer,
-  /// 64-bit floats, for ranges.
+  /// 64-bit floats, for equality and ranges.
   Float,
+  /// `true` / `false`.
+  Bool,
 }
 
 impl FieldKind {
@@ -419,6 +440,16 @@ impl FieldKind {
       Self::Keyword => "keyword",
       Self::Integer => "integer",
       Self::Float => "float",
+      Self::Bool => "bool",
+    }
+  }
+
+  fn filter_type(self) -> muninn_filter::FieldType {
+    match self {
+      Self::Keyword => muninn_filter::FieldType::Keyword,
+      Self::Integer => muninn_filter::FieldType::Integer,
+      Self::Float => muninn_filter::FieldType::Float,
+      Self::Bool => muninn_filter::FieldType::Bool,
     }
   }
 
@@ -427,6 +458,7 @@ impl FieldKind {
       "keyword" => Some(Self::Keyword),
       "integer" => Some(Self::Integer),
       "float" => Some(Self::Float),
+      "bool" => Some(Self::Bool),
       _ => None,
     }
   }
@@ -445,7 +477,9 @@ mod tests {
     .with_text_fields(["title", "body"])
     .with_analyzer(AnalyzerConfig::english())
     .with_filterable(FieldSpec::keyword("lang"))
-    .with_filterable(FieldSpec::integer("year"));
+    .with_filterable(FieldSpec::integer("year"))
+    .with_filterable(FieldSpec::float("price"))
+    .with_filterable(FieldSpec::boolean("meta.ok"));
     s.validate().unwrap();
     assert_eq!(Schema::from_json(&s.to_json()).unwrap(), s);
     let t = Schema::text(["a"]);
