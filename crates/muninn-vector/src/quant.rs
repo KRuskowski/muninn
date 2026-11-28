@@ -103,6 +103,16 @@ const EXACT_MAX_FRACTION: f64 = 0.05;
 /// Rows sampled for fitting ranges, and again for checking them.
 const SAMPLE_ROWS: usize = 8192;
 
+/// Whether no bit at or past `n` is set (an exact-row set read from a
+/// file must not mark vectors that do not exist yet).
+fn no_bits_past(words: &[u64], n: usize) -> bool {
+  let full = n / 64;
+  words.iter().enumerate().skip(full).all(|(i, &w)| {
+    let keep = if i == full { (1u64 << (n % 64)) - 1 } else { 0 };
+    w & !keep == 0
+  })
+}
+
 /// Two disjoint samples of row indexes, about `SAMPLE_ROWS` each: one to
 /// fit code ranges on, one to check them on. Rows are picked by a hash of
 /// their index (fixed seed, so deterministic), never by a stride, so no
@@ -174,9 +184,8 @@ fn steps(lo: &[f32], hi: &[f32]) -> Vec<f32> {
 /// How coarse SQ8 codes with ranges `min + [0, 255] * step` are for the
 /// values in `cols`: estimated mean squared coding error (`step^2 / 12`
 /// inside the range plus the squared excess of bulk values outside it,
-/// which saturate) summed over dimensions, divided by the summed robust
-/// variance of the bulk (`(IQR / 1.349)^2`, which outliers cannot
-/// inflate). The bulk is what lies inside the `clip` quantiles: codes
+/// which saturate) summed over dimensions, divided by the summed
+/// `robust_var` of the bulk (which outliers cannot inflate). The bulk is what lies inside the `clip` quantiles: codes
 /// fitted on a narrower part of the data fail by saturating it, while
 /// clipping the outliers is intended. Computed in `f64`; anything
 /// non-finite counts as infinitely coarse.
@@ -198,9 +207,7 @@ fn error_ratio(min: &[f32], step: &[f32], cols: &[Vec<f32>], clip: f64) -> f64 {
       })
       .sum();
     err += d * d / 12.0 + out / col.len() as f64;
-    let (q1, q3) = quantiles(col.clone(), 0.25, 0.75);
-    let iqr = (q3 as f64 - q1 as f64) / 1.349;
-    var += iqr * iqr;
+    var += robust_var(col);
   }
   let r = if err == 0.0 { 0.0 } else { err / var };
   if r.is_finite() { r } else { f64::INFINITY }
@@ -229,6 +236,27 @@ fn extend(col: &[f32], (a, b): (f32, f32)) -> (f32, f32) {
 /// How far beyond the clipping quantiles (in multiples of their distance)
 /// values still count as the bulk's tail; see `extend`.
 const EXTEND: f64 = 0.5;
+
+/// A variance of the bulk of `col` that outliers cannot inflate:
+/// `(IQR / 1.349)^2`. When at least half the values are equal (sparse or
+/// ReLU-style dimensions, IQR 0), the same measure over the values that
+/// differ from the median, weighted by their share. Computed in `f64`.
+fn robust_var(col: &[f32]) -> f64 {
+  let (q1, q3) = quantiles(col.to_vec(), 0.25, 0.75);
+  let iqr = (q3 as f64 - q1 as f64) / 1.349;
+  if iqr > 0.0 {
+    return iqr * iqr;
+  }
+  let (med, _) = quantiles(col.to_vec(), 0.5, 0.5);
+  let rest: Vec<f32> = col.iter().copied().filter(|&x| x != med).collect();
+  if rest.is_empty() {
+    return 0.0;
+  }
+  let share = rest.len() as f64 / col.len() as f64;
+  let (r1, r3) = quantiles(rest, 0.25, 0.75);
+  let iqr = (r3 as f64 - r1 as f64) / 1.349;
+  share * iqr * iqr
+}
 
 /// SQ8 ranges for `data`: the first clipping level of `CLIPS` whose ranges
 /// (its quantiles widened by `extend`, fitted on one hashed sample) pass
@@ -290,18 +318,34 @@ pub(crate) struct Sq8 {
   /// none (all files before this field existed).
   exact: Slab<u64>,
   /// The codes cannot resolve the bulk of the data at all (see
-  /// `fit_sq8`): every vector is scored at full precision.
+  /// `fit_sq8`): every vector is scored at full precision, and no codes
+  /// are stored.
   coarse: bool,
+  /// Number of encoded vectors (also when `coarse` stores no codes).
+  rows: usize,
+  /// Number of bits set in `exact`, kept up to date.
+  marked: usize,
+  /// Read from a file written before ranges were fitted and checked
+  /// (no `qcoarse` section): plain min/max ranges that one extreme vector
+  /// may have stretched. Checked against the data by `upgrade_legacy`.
+  legacy: bool,
 }
 
 impl Sq8 {
   fn exact_count(&self) -> usize {
-    self
-      .exact
-      .as_slice()
-      .iter()
-      .map(|w| w.count_ones() as usize)
-      .sum()
+    self.marked
+  }
+
+  /// Whether the stored ranges pass the `error_ratio` check on a hashed
+  /// sample of `data`.
+  fn ranges_fit(&self, data: &[f32]) -> bool {
+    let n = data.len().checked_div(self.dim).unwrap_or(0);
+    let (_, check) = sample_rows(n);
+    let cols = columns(self.dim, data, &check);
+    let (min, step) = (self.min.as_slice(), self.step.as_slice());
+    // The bulk at the widest clip: fitted ranges may leave up to that
+    // much out on purpose.
+    error_ratio(min, step, &cols, CLIPS[CLIPS.len() - 1]) <= MAX_CODE_ERROR
   }
 }
 
@@ -407,6 +451,9 @@ impl Quantizer {
       sq: Slab::default(),
       exact: Slab::default(),
       coarse,
+      rows: 0,
+      marked: 0,
+      legacy: false,
     })
   }
 
@@ -429,21 +476,50 @@ impl Quantizer {
     }
     let mut q = Self::sq8_with_range(dim, metric, lo, &hi, false);
     q.append(data);
-    q.good_for_build().then_some(q)
+    q.good_for_build(data).then_some(q)
   }
 
-  /// Whether these are SQ8 codes that resolve the data well enough to
-  /// search with while building: not coarse, and few enough vectors that
-  /// need full precision (codes trained on an early part of the data mark
-  /// later vectors outside their range that way).
-  pub(crate) fn good_for_build(&self) -> bool {
+  /// Whether these are SQ8 codes that resolve `data` (the vectors they
+  /// encode) well enough to search with while building: not coarse, few
+  /// enough vectors that need full precision (codes trained on an early
+  /// part of the data mark later vectors outside their range that way),
+  /// and ranges that pass the `error_ratio` check on a hashed sample of
+  /// `data` (catching ranges an outlier stretched before ranges were
+  /// fitted, in old files, where nothing is ever marked).
+  pub(crate) fn good_for_build(&self, data: &[f32]) -> bool {
     match self {
       Self::Sq8(s) => {
         !s.coarse
           && (s.exact_count() as f64) <= EXACT_MAX_FRACTION * self.len() as f64
+          && s.ranges_fit(data)
       }
       Self::Binary(_) => false,
     }
+  }
+
+  /// SQ8 codes from an old file (min/max ranges, never checked) are
+  /// checked against the vectors they encode once, when the file is
+  /// opened; ranges an extreme vector stretched until the codes collapsed
+  /// are refitted and every vector re-encoded. Returns whether it did.
+  pub(crate) fn upgrade_legacy(
+    &mut self,
+    metric: Metric,
+    data: &[f32],
+  ) -> bool {
+    let Self::Sq8(s) = self else {
+      return false;
+    };
+    if !s.legacy {
+      return false;
+    }
+    s.legacy = false;
+    if s.ranges_fit(data) {
+      return false;
+    }
+    if let Some(q) = Self::train(Quantization::Sq8, s.dim, metric, data) {
+      *self = q;
+    }
+    true
   }
 
   /// Number of vectors scored at full precision instead of from codes.
@@ -466,7 +542,7 @@ impl Quantizer {
   /// Number of encoded vectors.
   pub(crate) fn len(&self) -> usize {
     match self {
-      Self::Sq8(s) => s.codes.len().checked_div(s.dim).unwrap_or(0),
+      Self::Sq8(s) => s.rows,
       Self::Binary(b) => b.bits.len().checked_div(b.words).unwrap_or(0),
     }
   }
@@ -476,7 +552,12 @@ impl Quantizer {
   pub(crate) fn append(&mut self, rows: &[f32]) {
     match self {
       Self::Sq8(s) => {
-        let first = s.codes.len().checked_div(s.dim).unwrap_or(0);
+        let first = s.rows;
+        s.rows += rows.len() / s.dim;
+        if s.coarse {
+          // Every vector is scored at full precision: no codes needed.
+          return;
+        }
         let (min, step) = (s.min.as_slice(), s.step.as_slice());
         // Mean squared rounding error of one vector's codes.
         let noise: f64 =
@@ -503,7 +584,7 @@ impl Quantizer {
             codes.push(c);
           }
           sq.push(acc);
-          if !s.coarse && out > EXACT_FACTOR * noise {
+          if out > EXACT_FACTOR * noise {
             flagged.push(first + r);
           }
         }
@@ -511,9 +592,9 @@ impl Quantizer {
           s.sq.to_mut().extend_from_slice(&sq);
         }
         if !flagged.is_empty() || !s.exact.as_slice().is_empty() {
-          let n = first + rows.len() / s.dim;
           let exact = s.exact.to_mut();
-          exact.resize(n.div_ceil(64), 0);
+          exact.resize(s.rows.div_ceil(64), 0);
+          s.marked += flagged.len();
           for i in flagged {
             exact[i / 64] |= 1 << (i % 64);
           }
@@ -540,6 +621,9 @@ impl Quantizer {
     use crate::hnsw::permute_rows;
     match self {
       Self::Sq8(s) => {
+        if s.coarse {
+          return;
+        }
         permute_rows(s.codes.to_mut(), s.dim, order);
         if s.l2 {
           permute_rows(s.sq.to_mut(), 1, order);
@@ -725,9 +809,16 @@ impl Quantizer {
           None => Slab::default(),
         },
         coarse: match c.try_section(T_COARSE) {
-          Some(r) => Slab::<u64>::from_region(r)?.as_slice() == [1],
+          Some(r) => match Slab::<u64>::from_region(r)?.as_slice() {
+            [0] => false,
+            [1] => true,
+            _ => return Err(Error::corrupt("bad SQ8 coarse flag")),
+          },
           None => false,
         },
+        rows: n,
+        marked: 0,
+        legacy: c.try_section(T_COARSE).is_none(),
       }),
       Quantization::Binary => Self::Binary(Binary {
         dim,
@@ -741,9 +832,10 @@ impl Quantizer {
       Self::Sq8(s) => {
         s.min.len() == dim
           && s.step.len() == dim
-          && s.codes.len() == n * dim
-          && s.sq.len() == if s.l2 { n } else { 0 }
+          && s.codes.len() == if s.coarse { 0 } else { n * dim }
+          && s.sq.len() == if s.l2 && !s.coarse { n } else { 0 }
           && (s.exact.len() == 0 || s.exact.len() == n.div_ceil(64))
+          && no_bits_past(s.exact.as_slice(), n)
       }
       Self::Binary(b) => {
         b.mean.len() == dim
@@ -753,6 +845,15 @@ impl Quantizer {
     };
     if !ok {
       return Err(Error::corrupt("quantiser sections have the wrong size"));
+    }
+    let mut q = q;
+    if let Self::Sq8(s) = &mut q {
+      s.marked = s
+        .exact
+        .as_slice()
+        .iter()
+        .map(|w| w.count_ones() as usize)
+        .sum();
     }
     Ok(Some(q))
   }
@@ -1041,7 +1142,7 @@ mod tests {
     assert!(s.step.as_slice().iter().all(|&d| d < 0.01), "{s:?}");
     assert_eq!(qz.exact_rows(), 1);
     assert!(s.exact.as_slice()[0] >> 17 & 1 == 1);
-    assert!(qz.good_for_build());
+    assert!(qz.good_for_build(&data));
     // The exact row is scored at full precision.
     let q = vec![1e4f32; dim];
     let qc = qz.prepare(Metric::L2, &q);
@@ -1063,7 +1164,7 @@ mod tests {
     };
     assert!(!s.coarse && s.step.as_slice().iter().all(|&d| d < 0.01));
     assert_eq!(qz.exact_rows(), 101);
-    assert!(qz.good_for_build());
+    assert!(qz.good_for_build(&data));
     // Ranges fitted on a narrow early part saturate the bulk of later
     // data: rejected, and later rows come out exact.
     let later = rows(n, dim);
@@ -1089,6 +1190,85 @@ mod tests {
     );
     assert_eq!(quantiles(vec![], 0.1, 0.9), (0.0, 0.0));
     assert_eq!(quantiles(vec![3.0, 1.0, 2.0], 0.0, 1.0), (1.0, 3.0));
+  }
+
+  /// Sparse (ReLU-style) data, where every dimension's interquartile
+  /// range is 0: the spread comes from the values that are not the
+  /// median, so the codes are kept (it used to mark every vector for full
+  /// precision at 10% and 20% density).
+  #[test]
+  fn sparse_data_keeps_its_codes() {
+    let (n, dim) = (5000, 16);
+    for dens in [0.05f64, 0.1, 0.2, 0.5, 1.0] {
+      let mut x = 7u64;
+      let mut u = || {
+        x = splitmix64(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+      };
+      let d: Vec<f32> = (0..n * dim)
+        .map(|_| if u() < dens { u() as f32 } else { 0.0 })
+        .collect();
+      let qz =
+        Quantizer::train(Quantization::Sq8, dim, Metric::L2, &d).unwrap();
+      let Quantizer::Sq8(s) = &qz else {
+        unreachable!()
+      };
+      assert!(!s.coarse, "density {dens}");
+      assert!(
+        qz.exact_rows() < n / 100,
+        "density {dens}: {}",
+        qz.exact_rows()
+      );
+      assert!(qz.good_for_build(&d), "density {dens}");
+    }
+  }
+
+  /// Codes marked coarse store no codes; the maintained marked count
+  /// equals the bitset's population through appends and renumbering.
+  #[test]
+  fn coarse_codes_store_nothing_and_counts_stay_exact() {
+    let dim = 4;
+    let mut q = Quantizer::sq8_with_range(
+      dim,
+      Metric::L2,
+      vec![0.0; dim],
+      &[1.0; 4],
+      true,
+    );
+    q.append(&rows(10, dim));
+    let Quantizer::Sq8(s) = &q else {
+      unreachable!()
+    };
+    assert_eq!(
+      (s.codes.len(), s.sq.len(), q.len(), q.exact_rows()),
+      (0, 0, 10, 10)
+    );
+    let mut data = rows(300, dim);
+    for j in 0..dim {
+      data[5 * dim + j] = 1e4;
+      data[200 * dim + j] = -1e4;
+    }
+    let mut q =
+      Quantizer::train(Quantization::Sq8, dim, Metric::L2, &data).unwrap();
+    let mut more = rows(100, dim);
+    more[3 * dim] = 1e5;
+    q.append(&more);
+    let order: Vec<u32> = (0..400u32).rev().collect();
+    q.permute(&order);
+    let Quantizer::Sq8(s) = &q else {
+      unreachable!()
+    };
+    let pop: usize = s
+      .exact
+      .as_slice()
+      .iter()
+      .map(|w| w.count_ones() as usize)
+      .sum();
+    assert_eq!(s.marked, pop);
+    assert_eq!(pop, 3);
+    assert!(no_bits_past(s.exact.as_slice(), 400));
+    assert!(!no_bits_past(&[1 << 63], 63));
+    assert!(no_bits_past(&[u64::MAX], 64));
   }
 
   /// Samples are hashed, not strided: with two populations interleaved,

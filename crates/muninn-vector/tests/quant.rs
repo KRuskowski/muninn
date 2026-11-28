@@ -292,3 +292,217 @@ fn quantised_flat_scores_selective_filters_exactly() {
     }
   }
 }
+
+/// The section table of a container file: (tag, entry offset, section
+/// offset, section length).
+fn sections(b: &[u8]) -> Vec<([u8; 8], usize, usize, usize)> {
+  let f = b.len() - 64;
+  let toff = u64::from_le_bytes(b[f..f + 8].try_into().unwrap()) as usize;
+  let cnt = u32::from_le_bytes(b[f + 8..f + 12].try_into().unwrap()) as usize;
+  (0..cnt)
+    .map(|i| {
+      let e = toff + i * 24;
+      let tag: [u8; 8] = b[e..e + 8].try_into().unwrap();
+      let off = u64::from_le_bytes(b[e + 8..e + 16].try_into().unwrap());
+      let len = u64::from_le_bytes(b[e + 16..e + 24].try_into().unwrap());
+      (tag, e, off as usize, len as usize)
+    })
+    .collect()
+}
+
+fn find(
+  t: &[([u8; 8], usize, usize, usize)],
+  s: &str,
+) -> (usize, usize, usize) {
+  let e = t
+    .iter()
+    .find(|e| e.0 == muninn_core::container::tag(s))
+    .unwrap();
+  (e.1, e.2, e.3)
+}
+
+/// An SQ8 index file as written before ranges were fitted (format v2,
+/// min/max ranges, no `qexact`/`qcoarse`), holding one vector at +-1e4:
+/// its collapsed codes used to be trusted for good (recall@10 0.01, and
+/// a merge-like `add_batch` built a damaged graph on them: 0.84 at full
+/// precision). Opening now checks the ranges against the vectors and
+/// refits them.
+#[test]
+fn old_min_max_sq8_file_is_refitted_on_open() {
+  let dim = 32;
+  let n = 12_000;
+  let c = Clusters::new(dim, 30, 0.4, 21);
+  let mut d = c.sample(n, 1);
+  for j in 0..dim {
+    d[17 * dim + j] = if j % 2 == 0 { 1e4 } else { -1e4 };
+  }
+  let p = HnswParams::default().with_quantization(Quantization::Sq8);
+  let idx = HnswIndex::build(dim, Metric::L2, p, &d).unwrap();
+  let buf = idx.write_to(AlignedBuf::new()).unwrap();
+  let t = sections(buf.as_slice());
+  let (_, voff, vlen) = find(&t, "vectors");
+  let vecs: Vec<f32> = buf.as_slice()[voff..voff + vlen]
+    .chunks_exact(4)
+    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    .collect();
+  // Main's min/max codes over the stored (internal-order) vectors.
+  let mut lo = vec![f32::INFINITY; dim];
+  let mut hi = vec![f32::NEG_INFINITY; dim];
+  for row in vecs.chunks_exact(dim) {
+    for j in 0..dim {
+      lo[j] = lo[j].min(row[j]);
+      hi[j] = hi[j].max(row[j]);
+    }
+  }
+  let step: Vec<f32> = lo
+    .iter()
+    .zip(&hi)
+    .map(|(&l, &h)| if h > l { h / 255.0 - l / 255.0 } else { 0.0 })
+    .collect();
+  let (mut codes, mut sq) = (Vec::new(), Vec::new());
+  for row in vecs.chunks_exact(dim) {
+    let mut acc = 0.0f32;
+    for j in 0..dim {
+      let c = if step[j] > 0.0 {
+        ((row[j] - lo[j]) / step[j]).round().clamp(0.0, 255.0) as u8
+      } else {
+        0
+      };
+      let v = step[j] * c as f32;
+      acc += v * v;
+      codes.push(c);
+    }
+    sq.push(acc);
+  }
+  let mut b = buf.clone();
+  let f2b =
+    |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+  for (name, bytes) in [
+    ("qmin", f2b(&lo)),
+    ("qstep", f2b(&step)),
+    ("qcodes", codes),
+    ("qsq", f2b(&sq)),
+  ] {
+    let (_, off, len) = find(&t, name);
+    assert_eq!(len, bytes.len(), "{name}");
+    b.as_mut_slice()[off..off + len].copy_from_slice(&bytes);
+  }
+  b.as_mut_slice()[16..20].copy_from_slice(&2u32.to_le_bytes());
+  for (name, gone) in [("qexact", "zzold1"), ("qcoarse", "zzold2")] {
+    let (e, _, _) = find(&t, name);
+    b.as_mut_slice()[e..e + 8]
+      .copy_from_slice(&muninn_core::container::tag(gone));
+  }
+  let old = HnswIndex::open(Region::new(b)).unwrap();
+  let flat = FlatIndex::from_vectors(dim, Metric::L2, &d).unwrap();
+  let qs = c.sample(100, 77);
+  let rec = |ix: &HnswIndex, fl: &FlatIndex| {
+    let sp = SearchParams::new(10).with_ef(64);
+    let mut r = 0.0;
+    for q in qs.chunks_exact(dim) {
+      let t = fl.search(q, &sp, None).unwrap();
+      r += recall(&ix.search(q, &sp, None).unwrap(), &t);
+    }
+    r / 100.0
+  };
+  let (rn, ro) = (rec(&idx, &flat), rec(&old, &flat));
+  println!("recall new file {rn:.4}, old file {ro:.4}");
+  assert!(ro >= rn - 0.03, "old file {ro:.4} vs {rn:.4}");
+  assert_eq!(old.stats().exact_rows, 1);
+  // A merge-like extension builds a sound graph.
+  let more = c.sample(5000, 2);
+  let mut ext = old.clone();
+  ext.add_batch(&more).unwrap();
+  ext.set_quantization(Quantization::None);
+  let all: Vec<f32> = d.iter().chain(&more).copied().collect();
+  let flat2 = FlatIndex::from_vectors(dim, Metric::L2, &all).unwrap();
+  let r = rec(&ext, &flat2);
+  assert!(r >= 0.97, "extended graph at full precision {r:.4}");
+}
+
+/// Exact-row and coarse sections are fully validated at open: a bit past
+/// the last vector, a coarse flag other than 0 or 1, and sections of the
+/// wrong length are corrupt files, not silently accepted.
+#[test]
+fn bad_sq8_sections_are_rejected() {
+  let dim = 8;
+  let n = 5000 + 7;
+  let mut d = Clusters::new(dim, 10, 0.4, 3).sample(n, 1);
+  for j in 0..dim {
+    d[17 * dim + j] = 1e4;
+  }
+  let p = HnswParams::default().with_quantization(Quantization::Sq8);
+  let idx = HnswIndex::build(dim, Metric::L2, p, &d).unwrap();
+  assert_eq!(idx.stats().exact_rows, 1);
+  let buf = idx.write_to(AlignedBuf::new()).unwrap();
+  assert!(HnswIndex::open(Region::new(buf.clone())).is_ok());
+  let t = sections(buf.as_slice());
+  let (xe, xoff, xlen) = find(&t, "qexact");
+  let (ce, coff, _) = find(&t, "qcoarse");
+  let mut cases: Vec<(&str, AlignedBuf)> = Vec::new();
+  let mut b = buf.clone();
+  let last = xoff + xlen - 8;
+  let w = u64::from_le_bytes(b.as_slice()[last..last + 8].try_into().unwrap());
+  b.as_mut_slice()[last..last + 8]
+    .copy_from_slice(&(w | 1 << 63).to_le_bytes());
+  cases.push(("bit past n", b));
+  let mut b = buf.clone();
+  b.as_mut_slice()[coff..coff + 8].copy_from_slice(&2u64.to_le_bytes());
+  cases.push(("coarse = 2", b));
+  let mut b = buf.clone();
+  b.as_mut_slice()[ce + 16..ce + 24].copy_from_slice(&0u64.to_le_bytes());
+  cases.push(("coarse empty", b));
+  for delta in [8u64, 4, 1] {
+    let mut b = buf.clone();
+    b.as_mut_slice()[xe + 16..xe + 24]
+      .copy_from_slice(&(xlen as u64 - delta).to_le_bytes());
+    cases.push(("exact too short", b));
+  }
+  for (what, b) in cases {
+    assert!(HnswIndex::open(Region::new(b)).is_err(), "{what}: opened");
+  }
+}
+
+/// Sparse data (each value nonzero with probability 10% or 20%, so every
+/// dimension's interquartile range is 0) keeps its SQ8 codes: few vectors
+/// at full precision, recall within 0.03 of full precision.
+#[test]
+fn sparse_data_keeps_sq8_codes() {
+  let (n, dim) = (12_000, 32);
+  for dens in [0.1f64, 0.2] {
+    let mut g = common::Rng::new(4);
+    let mut sparse = |m: usize| -> Vec<f32> {
+      (0..m * dim)
+        .map(|_| {
+          if g.uniform() < dens {
+            g.uniform() as f32
+          } else {
+            0.0
+          }
+        })
+        .collect()
+    };
+    let d = sparse(n);
+    let qs = sparse(100);
+    let full =
+      HnswIndex::build(dim, Metric::L2, HnswParams::default(), &d).unwrap();
+    let mut idx = full.clone();
+    idx.set_quantization(Quantization::Sq8);
+    assert!(
+      idx.stats().exact_rows < n / 100,
+      "{}",
+      idx.stats().exact_rows
+    );
+    let flat = FlatIndex::from_vectors(dim, Metric::L2, &d).unwrap();
+    let sp = SearchParams::new(10).with_ef(64);
+    let (mut rq, mut rf) = (0.0, 0.0);
+    for q in qs.chunks_exact(dim) {
+      let t = flat.search(q, &sp, None).unwrap();
+      rq += recall(&idx.search(q, &sp, None).unwrap(), &t);
+      rf += recall(&full.search(q, &sp, None).unwrap(), &t);
+    }
+    let (rq, rf) = (rq / 100.0, rf / 100.0);
+    println!("density {dens}: sq8 {rq:.4} full {rf:.4}");
+    assert!(rq >= rf - 0.03, "density {dens}: {rq:.4} vs {rf:.4}");
+  }
+}

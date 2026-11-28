@@ -233,6 +233,10 @@ pub struct HnswIndex {
   /// Whether every node is known to hang in the protected tree; false
   /// after opening a file until [`HnswIndex::check_tree`] has run.
   tree_ready: bool,
+  /// Coded builds (see `with_builder`) found SQ8 unusable for this data;
+  /// not tried again before the index has this many vectors. Not
+  /// persisted.
+  coded_skip_until: usize,
   /// Caller ids of the internal nodes. Everything above (vectors, graph,
   /// codes, `prot`, `entry`) is in internal order; ids cross over only in
   /// `search`, `vector` and the exact scans.
@@ -284,6 +288,7 @@ impl HnswIndex {
       from_file: false,
       prot: Slab::default(),
       tree_ready: true,
+      coded_skip_until: 0,
       ids: IdMap::default(),
     })
   }
@@ -640,21 +645,37 @@ impl HnswIndex {
     let entry = Mutex::new((self.entry, self.max_level));
     // Large batches search with SQ8 codes while inserting (see
     // `Builder::codes`): the index's own SQ8 codes if they resolve the
-    // data well (`Quantizer::good_for_build`), otherwise codes fitted for
-    // this build (n * dim bytes while it runs). If SQ8 cannot stand in for
-    // the vectors (`train_sq8_for_build` gives up), the build searches
-    // full vectors.
-    let coded = stripes > 1 && rows >= CODED_BUILD_MIN;
-    let own = self.quant.as_ref().filter(|q| coded && q.good_for_build());
+    // data well (`Quantizer::good_for_build`; drifted own codes are
+    // retrained first, since they serve searches too), otherwise codes
+    // fitted for this build (n * dim bytes while it runs). If SQ8 cannot
+    // stand in for the vectors, the build searches full vectors, and
+    // coded builds are not tried again until the index grew by half.
+    let n = self.len();
+    let coded =
+      stripes > 1 && rows >= CODED_BUILD_MIN && n >= self.coded_skip_until;
+    if coded
+      && let Some(q @ Quantizer::Sq8(_)) = &self.quant
+      && !q.good_for_build(self.vectors.as_slice())
+    {
+      self.quant = Quantizer::train(
+        Quantization::Sq8,
+        self.dim,
+        self.metric,
+        self.vectors.as_slice(),
+      );
+      self.trained_on = n;
+    }
+    let data = self.vectors.as_slice();
+    let own = self
+      .quant
+      .as_ref()
+      .filter(|q| coded && q.good_for_build(data));
     let temp_codes = (coded && own.is_none())
-      .then(|| {
-        Quantizer::train_sq8_for_build(
-          self.dim,
-          self.metric,
-          self.vectors.as_slice(),
-        )
-      })
+      .then(|| Quantizer::train_sq8_for_build(self.dim, self.metric, data))
       .flatten();
+    if coded && own.is_none() && temp_codes.is_none() {
+      self.coded_skip_until = n + n / 2;
+    }
     let build_codes = own.or(temp_codes.as_ref());
     let r = {
       let b = Builder {
@@ -888,7 +909,10 @@ impl HnswIndex {
     if !entry_ok {
       return Err(Error::corrupt("HNSW entry point is invalid"));
     }
-    let quant = Quantizer::open(params.quantization, &c, dim, metric, n)?;
+    let mut quant = Quantizer::open(params.quantization, &c, dim, metric, n)?;
+    if let Some(q) = &mut quant {
+      q.upgrade_legacy(metric, vectors.as_slice());
+    }
     Ok(Self {
       dim,
       metric,
@@ -902,6 +926,7 @@ impl HnswIndex {
       from_file: true,
       prot,
       tree_ready: false,
+      coded_skip_until: 0,
       ids,
     })
   }
@@ -1270,6 +1295,32 @@ mod tests {
     let mut nb = idx.view().neighbors(0, 0, &mut buf).to_vec();
     nb.sort_unstable();
     assert_eq!(nb, vec![1, 2, 3, 5]);
+  }
+
+  /// When SQ8 cannot stand in for the vectors (here 6% of them far out,
+  /// more than may be scored at full precision), a coded build gives up
+  /// and remembers it: the next large batches do not fit codes over all
+  /// vectors again until the index has grown by half.
+  #[test]
+  fn coded_build_gives_up_until_the_index_grows() {
+    let (n, dim) = (10_000, 8);
+    let mut d = data(n, dim, 3);
+    for i in (0..n).step_by(16) {
+      let m = if (i / 16) % 2 == 0 { -1e4 } else { 1e4 };
+      d[i * dim..(i + 1) * dim].fill(m);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+      .num_threads(2)
+      .build()
+      .unwrap();
+    let mut idx = pool
+      .install(|| HnswIndex::build(dim, Metric::L2, HnswParams::default(), &d))
+      .unwrap();
+    assert_eq!(idx.coded_skip_until, n + n / 2);
+    pool
+      .install(|| idx.add_batch(&data(CODED_BUILD_MIN, dim, 4)))
+      .unwrap();
+    assert_eq!(idx.coded_skip_until, n + n / 2, "tried again too soon");
   }
 
   /// Review item 6: in a parallel build another thread can add a

@@ -187,7 +187,10 @@ impl FlatIndex {
     if Some(data.len()) != n.checked_mul(dim) {
       return Err(Error::corrupt("flat vectors section has the wrong size"));
     }
-    let quant = Quantizer::open(kind, c, dim, metric, n)?;
+    let mut quant = Quantizer::open(kind, c, dim, metric, n)?;
+    if let Some(q) = &mut quant {
+      q.upgrade_legacy(metric, data.as_slice());
+    }
     Ok(Self {
       dim,
       metric,
