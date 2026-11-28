@@ -242,6 +242,67 @@ fn incremental_insert_after_load() {
   assert!(r >= MIN_RECALL);
 }
 
+/// Checks reachability (hard) and self-search misses at ef 64 (bounded);
+/// prints the counts and, for each miss, whether a larger ef finds it.
+fn check_reachable(idx: &HnswIndex, label: &str) {
+  let st = idx.stats();
+  let p = SearchParams::new(1).with_ef(EF);
+  let mut misses = 0;
+  for id in 0..idx.len() as DocId {
+    let hits = idx.search(idx.vector(id), &p, None).unwrap();
+    if hits[0].id != id {
+      misses += 1;
+      let f: Vec<bool> = [256, 1024]
+        .iter()
+        .map(|&ef| {
+          let p = SearchParams::new(1).with_ef(ef);
+          idx.search(idx.vector(id), &p, None).unwrap()[0].id == id
+        })
+        .collect();
+      println!(
+        "  {label} miss {id} top {} score {} found@256/1024 {f:?}",
+        hits[0].id, hits[0].score
+      );
+    }
+  }
+  println!(
+    "{label}: {} unreachable, {misses} self-query misses",
+    st.unreachable
+  );
+  assert_eq!(st.unreachable, 0, "{label}: unreachable nodes");
+  assert!(misses * 2000 <= idx.len(), "{label}: {misses} self misses");
+}
+
+/// Parallel `add_batch` on a fresh and on a reopened index, at several
+/// thread counts, leaves no node unreachable from the entry point, and
+/// practically every node is found by a search for its own vector.
+///
+/// Reachability is a hard invariant (orphans are re-linked). Self-search
+/// at ef 64 is not guaranteed by any HNSW: a few nodes next to "hub"
+/// nodes are only found at a larger ef (measured: at most 2 of 20-23k per
+/// build), so that part is bounded at 0.05%.
+#[test]
+fn every_node_is_reachable_after_parallel_builds() {
+  let c = clusters();
+  let data = c.sample(N, 2);
+  let extra = c.sample(3000, 4);
+  for threads in [1, 2, 3, 4, 8] {
+    let pool = rayon::ThreadPoolBuilder::new()
+      .num_threads(threads)
+      .build()
+      .unwrap();
+    pool.install(|| {
+      let p = HnswParams::default();
+      let idx = HnswIndex::build(DIM, Metric::L2, p, &data).unwrap();
+      check_reachable(&idx, &format!("fresh, {threads} threads"));
+      let buf = idx.write_to(AlignedBuf::new()).unwrap();
+      let mut back = HnswIndex::open(Region::new(buf)).unwrap();
+      back.add_batch(&extra).unwrap();
+      check_reachable(&back, &format!("reopened, {threads} threads"));
+    });
+  }
+}
+
 #[test]
 fn serial_build_is_deterministic() {
   init_pool();

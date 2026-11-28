@@ -3,10 +3,11 @@
 //! over a [`BuildView`].
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use muninn_core::{DocId, Metric};
 
-use super::graph::{BuildView, read_record, write_record};
+use super::graph::{BuildView, NONE, read_record, write_record};
 use super::search::{Scratch, beam, greedy, with_scratch};
 use crate::dist::{Dist, FullDist};
 
@@ -19,6 +20,15 @@ pub(crate) struct Builder<'a> {
   pub ef_construction: usize,
   /// Current entry point and top level.
   pub entry: &'a Mutex<(DocId, u8)>,
+  /// Level-0 in-degree of every node (how many lists contain it).
+  pub indeg: &'a [AtomicU32],
+  /// Nodes that may have lost their last incoming level-0 edge during
+  /// this batch; see [`Builder::reconnect_orphans`].
+  pub orphans: &'a Mutex<Vec<DocId>>,
+  /// Per node, the neighbour whose level-0 edge to it was forced in by
+  /// [`Builder::ensure_backlink`] ([`NONE`] if none, e.g. for nodes read
+  /// from a file). Prunes never drop that edge.
+  pub prot: &'a [AtomicU32],
 }
 
 impl Builder<'_> {
@@ -33,6 +43,71 @@ impl Builder<'_> {
     muninn_simd::distance(self.metric, self.row(a), self.row(b))
   }
 
+  /// Whether the edge `e -> y` is `y`'s protected edge.
+  #[inline]
+  fn protected(&self, y: DocId, e: DocId) -> bool {
+    self.prot[y as usize].load(Relaxed) == e
+  }
+
+  /// After node `e`'s candidates (`sorted`, closest first) were pruned to
+  /// `keep`, puts back every dropped candidate whose nearest neighbour is
+  /// `e`, evicting the farthest unprotected kept entries.
+  fn keep_protected(
+    &self,
+    e: DocId,
+    sorted: &[(DocId, f32)],
+    keep: &mut Vec<DocId>,
+    cap: usize,
+  ) {
+    for &(y, _) in sorted {
+      if !self.protected(y, e) || keep.contains(&y) {
+        continue;
+      }
+      if keep.len() < cap {
+        keep.push(y);
+        continue;
+      }
+      let victim = sorted
+        .iter()
+        .rev()
+        .map(|c| c.0)
+        .find(|&z| !self.protected(z, e) && keep.contains(&z));
+      match victim.and_then(|z| keep.iter().position(|&k| k == z)) {
+        Some(i) => keep[i] = y,
+        None => break,
+      }
+    }
+  }
+
+  fn note_orphan(&self, x: DocId) {
+    self
+      .orphans
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .push(x);
+  }
+
+  /// Updates level-0 in-degrees after a list changed from `old` to `new`.
+  fn note_change(&self, level: usize, old: &[DocId], new: &[DocId]) {
+    if level != 0 {
+      return;
+    }
+    for &x in new {
+      if !old.contains(&x) {
+        self.indeg[x as usize].fetch_add(1, Relaxed);
+      }
+    }
+    for &x in old {
+      if !new.contains(&x) {
+        let prev = self.indeg[x as usize]
+          .fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+        if prev == Ok(1) {
+          self.note_orphan(x);
+        }
+      }
+    }
+  }
+
   /// Writes the new node `q`'s list at `level`: `selected` merged with
   /// any back-links other threads added meanwhile (they can reach `q` as
   /// a search entry from the level above before `q`'s own insert gets
@@ -43,27 +118,29 @@ impl Builder<'_> {
     let Some((rec, cap)) = self.view.record(q, level) else {
       return;
     };
-    let mut ids = Vec::with_capacity(cap + selected.len());
-    read_record(rec, cap, self.data.len() / self.dim, &mut ids);
-    if ids.is_empty() {
-      write_record(rec, cap, selected);
-      return;
-    }
+    let mut old = Vec::with_capacity(cap);
+    read_record(rec, cap, self.data.len() / self.dim, &mut old);
+    let mut ids = old.clone();
     for &s in selected {
       if !ids.contains(&s) {
         ids.push(s);
       }
     }
-    if ids.len() <= cap {
-      write_record(rec, cap, &ids);
-      return;
-    }
-    let mut cands: Vec<(DocId, f32)> =
-      ids.iter().map(|&x| (x, self.d(q, x))).collect();
-    cands.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
-    let mut keep = Vec::with_capacity(cap);
-    self.select(&cands, cap, &mut keep);
+    let keep = if ids.len() <= cap {
+      ids
+    } else {
+      let mut cands: Vec<(DocId, f32)> =
+        ids.iter().map(|&x| (x, self.d(q, x))).collect();
+      cands.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+      let mut keep = Vec::with_capacity(cap);
+      self.select(&cands, cap, &mut keep);
+      if level == 0 {
+        self.keep_protected(q, &cands, &mut keep, cap);
+      }
+      keep
+    };
     write_record(rec, cap, &keep);
+    self.note_change(level, &old, &keep);
   }
 
   /// Whether `q` is the current entry point.
@@ -92,6 +169,7 @@ impl Builder<'_> {
     }
     let mut entries = vec![cur];
     let mut selected = Vec::with_capacity(self.view.m);
+    let mut links = Vec::with_capacity(lq.min(top) as usize + 1);
     for lc in (0..=lq.min(top) as usize).rev() {
       let found = with_scratch(|s: &mut Scratch| {
         beam(
@@ -109,17 +187,163 @@ impl Builder<'_> {
       w.retain(|&(id, _)| id != q);
       self.select(&w, self.view.m, &mut selected);
       self.set_merged(q, lc, &selected);
-      for &e in &selected {
+      links.push((lc, selected.clone()));
+      entries = w;
+    }
+    // Back-links only once every level of `q` is written. Linked level by
+    // level, `q` became reachable at its upper levels while its lower
+    // lists were still empty, and another thread descending through it
+    // got stuck there: its level-0 beam could not expand, so its own node
+    // was linked to `q` alone, far from its real neighbours.
+    for (lc, sel) in links {
+      for e in sel {
         self.connect(e, q, lc);
       }
-      entries = w;
+    }
+    if self.indeg[q as usize].load(Relaxed) == 0 {
+      // Every neighbour pruned the back-link to `q` straight away.
+      self.note_orphan(q);
     }
     if lq > top {
       let mut g = self.entry.lock().unwrap_or_else(|e| e.into_inner());
       if lq > g.1 {
+        // The old entry point may have had no incoming edge: it did not
+        // need one while searches started there.
+        let old = g.0;
         *g = (q, lq);
+        drop(g);
+        self.note_orphan(old);
       }
     }
+  }
+
+  /// Re-links nodes left without any incoming level-0 edge.
+  ///
+  /// Re-pruning a full list with the heuristic can drop a node from the
+  /// last list that pointed to it; no search can reach it after that
+  /// (measured on 20k clustered vectors: 3 to 12 such nodes per build,
+  /// at any thread count). Each orphan is searched for from the entry
+  /// point like a new insert and added to the closest reachable node's
+  /// list, replacing that node's farthest neighbour that has another
+  /// incoming edge if the list is full. Run serially after a batch;
+  /// orphans are rare, so it costs little.
+  pub(crate) fn reconnect_orphans(&self) {
+    let mut orphans = std::mem::take(
+      &mut *self.orphans.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    orphans.sort_unstable();
+    orphans.dedup();
+    for x in orphans {
+      if self.indeg[x as usize].load(Relaxed) == 0 && !self.is_entry(x) {
+        self.adopt(x);
+      }
+    }
+  }
+
+  /// Gives orphan `x` one incoming level-0 edge from the closest node a
+  /// search from the entry point finds (so a reachable one).
+  fn adopt(&self, x: DocId) {
+    let dist = FullDist {
+      metric: self.metric,
+      dim: self.dim,
+      query: self.row(x),
+      data: self.data,
+    };
+    let (ep, top) = *self.entry.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cur = (ep, dist.dist(ep));
+    let mut buf = Vec::new();
+    for lc in (1..=top as usize).rev() {
+      cur = greedy(&self.view, &dist, cur, lc, &mut buf);
+    }
+    let found = with_scratch(|s: &mut Scratch| {
+      beam(
+        &self.view,
+        &dist,
+        &[cur],
+        self.ef_construction,
+        0,
+        None,
+        None,
+        s,
+      )
+    });
+    for (e, _) in found.top.into_sorted_vec() {
+      if e != x && self.force_link(e, x) {
+        return;
+      }
+    }
+  }
+
+  /// Makes sure the closest of `x`'s level-0 neighbours (that has room)
+  /// links back to it, and from then on every prune keeps that edge.
+  ///
+  /// The heuristic drops a back-link `e -> x` when some neighbour `r` of
+  /// `e` is closer to `x` than `e` is, assuming `x` is reachable through
+  /// `r`; but `r` need not link to `x`. When that happens at every node
+  /// near `x`, `x`'s only in-links come from far away and a search for
+  /// `x`'s own vector arrives next to it without seeing it (measured: a
+  /// few nodes per 20k, more in parallel builds). One forced edge from
+  /// its nearest neighbour fixes that.
+  pub(crate) fn ensure_backlink(&self, x: DocId) {
+    if self.prot[x as usize].load(Relaxed) != NONE {
+      return;
+    }
+    let mut out = Vec::new();
+    {
+      let _g = self.view.lock(x);
+      if let Some((rec, cap)) = self.view.record(x, 0) {
+        read_record(rec, cap, self.data.len() / self.dim, &mut out);
+      }
+    }
+    let mut by_dist: Vec<(DocId, f32)> = out
+      .into_iter()
+      .filter(|&e| e != x)
+      .map(|e| (e, self.d(x, e)))
+      .collect();
+    by_dist.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    // The nearest neighbour that can take the edge (a hub whose list is
+    // all protected edges cannot).
+    for (e, _) in by_dist {
+      if self.force_link(e, x) {
+        self.prot[x as usize].store(e, Relaxed);
+        return;
+      }
+    }
+  }
+
+  /// Adds `x` to `e`'s level-0 list if absent: appended if there is room,
+  /// else replacing `e`'s farthest neighbour that has another in-edge.
+  /// Returns whether `e` now links to `x`.
+  fn force_link(&self, e: DocId, x: DocId) -> bool {
+    let n = self.data.len() / self.dim;
+    let _g = self.view.lock(e);
+    let Some((rec, cap)) = self.view.record(e, 0) else {
+      return false;
+    };
+    let mut ids = Vec::with_capacity(cap + 1);
+    read_record(rec, cap, n, &mut ids);
+    if ids.contains(&x) {
+      return true;
+    }
+    let old = ids.clone();
+    if ids.len() < cap {
+      ids.push(x);
+    } else {
+      // Never evict a node's last in-edge or its protected one.
+      let victim = (0..ids.len())
+        .filter(|&i| {
+          self.indeg[ids[i] as usize].load(Relaxed) >= 2
+            && !self.protected(ids[i], e)
+        })
+        .max_by(|&a, &b| self.d(e, ids[a]).total_cmp(&self.d(e, ids[b])));
+      let Some(i) = victim else {
+        return false;
+      };
+      ids[i] = x;
+    }
+    write_record(rec, cap, &ids);
+    self.note_change(0, &old, &ids);
+    true
   }
 
   /// Algorithm 4 without candidate extension: walk candidates from the
@@ -168,6 +392,7 @@ impl Builder<'_> {
     if ids.len() < cap {
       ids.push(q);
       write_record(rec, cap, &ids);
+      self.note_change(level, &[], &[q]);
       return;
     }
     let mut cands: Vec<(DocId, f32)> =
@@ -176,7 +401,11 @@ impl Builder<'_> {
     cands.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut keep = Vec::with_capacity(cap);
     self.select(&cands, cap, &mut keep);
+    if level == 0 {
+      self.keep_protected(e, &cands, &mut keep, cap);
+    }
     write_record(rec, cap, &keep);
+    self.note_change(level, &ids, &keep);
   }
 }
 

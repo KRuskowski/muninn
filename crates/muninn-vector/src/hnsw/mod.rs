@@ -13,7 +13,7 @@ use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Region, Result, TopK};
 use rayon::prelude::*;
 
 use self::build::{Builder, MAX_LEVEL, level_for};
-use self::graph::{BuildView, Graph, GraphView, NONE, as_atomic};
+use self::graph::{BuildView, Graph, GraphView, NONE, Neighbors, as_atomic};
 use self::search::{Abort, Beam, beam, greedy, prefer_exact, with_scratch};
 use crate::dist::{Dist, FullDist};
 use crate::flat::{
@@ -27,7 +27,7 @@ use crate::{SearchParams, VectorIndex, meta};
 /// Container kind of an [`HnswIndex`] file.
 pub const HNSW_KIND: [u8; 8] = tag("hnsw");
 /// Current [`HnswIndex`] file format version.
-pub const HNSW_VERSION: u32 = 1;
+pub const HNSW_VERSION: u32 = 2;
 
 const T_META: [u8; 8] = tag("meta");
 const T_VECTORS: [u8; 8] = tag("vectors");
@@ -35,6 +35,9 @@ const T_LEVELS: [u8; 8] = tag("levels");
 const T_L0: [u8; 8] = tag("l0");
 const T_UPOFF: [u8; 8] = tag("upoff");
 const T_UPPER: [u8; 8] = tag("upper");
+/// Since version 2: per node, the neighbour whose edge to it is
+/// protected (see `Builder::ensure_backlink`). Version 1 files have none.
+const T_PROT: [u8; 8] = tag("prot");
 const META_FIELDS: usize = 12;
 
 /// Nodes a filtered search scores before judging the filter's
@@ -204,6 +207,15 @@ pub struct HnswIndex {
   /// Opened from a file whose graph has not been checked yet; see
   /// [`HnswIndex::repair`].
   from_file: bool,
+  /// Level-0 in-degree per node, maintained by builds so orphaned nodes
+  /// can be re-linked. Not persisted: rebuilt from the graph on the first
+  /// insert after opening a file (`indeg_ready == false`).
+  indeg: Vec<u32>,
+  /// Per node, the neighbour whose edge to it is protected ([`NONE`] =
+  /// none); see `Builder::ensure_backlink`. Persisted (mapped after
+  /// open); empty or shorter than `len()` means "none" for the rest.
+  prot: Slab<u32>,
+  indeg_ready: bool,
 }
 
 /// Index structure sizes, for capacity planning and reports.
@@ -221,6 +233,9 @@ pub struct HnswStats {
   pub code_bytes: usize,
   /// Average level-0 out-degree.
   pub avg_degree: usize,
+  /// Nodes that a level-0 walk from the entry point cannot reach, so no
+  /// search can find them. Zero in a healthy graph.
+  pub unreachable: usize,
 }
 
 impl HnswIndex {
@@ -241,6 +256,9 @@ impl HnswIndex {
       quant: Quantizer::train(params.quantization, dim, metric, &[]),
       trained_on: 0,
       from_file: false,
+      indeg: Vec::new(),
+      prot: Slab::default(),
+      indeg_ready: true,
     })
   }
 
@@ -322,7 +340,33 @@ impl HnswIndex {
       graph_bytes: self.graph.bytes(),
       code_bytes: self.quant.as_ref().map_or(0, |q| q.bytes()),
       avg_degree: edges.checked_div(len).unwrap_or(0),
+      unreachable: len - self.reachable_at_level0(),
     }
+  }
+
+  /// How many nodes a breadth-first walk over level 0 from the entry
+  /// point reaches.
+  fn reachable_at_level0(&self) -> usize {
+    let n = self.len();
+    if n == 0 {
+      return 0;
+    }
+    let g = self.view();
+    let mut seen = vec![false; n];
+    let mut queue = vec![self.entry];
+    seen[self.entry as usize] = true;
+    let mut buf = Vec::new();
+    let mut count = 1;
+    while let Some(x) = queue.pop() {
+      for &y in g.neighbors(x, 0, &mut buf) {
+        if (y as usize) < n && !seen[y as usize] {
+          seen[y as usize] = true;
+          count += 1;
+          queue.push(y);
+        }
+      }
+    }
+    count
   }
 
   /// Adds one vector and returns its id.
@@ -445,6 +489,16 @@ impl HnswIndex {
           .into_par_iter()
           .for_each(|id| b.insert(id as DocId));
       }
+      // Every new node gets an in-edge from its nearest neighbour, then
+      // any node left without an in-edge gets one.
+      if rows < PAR_MIN_BATCH {
+        (start..end).for_each(|id| b.ensure_backlink(id as DocId));
+      } else {
+        (start..end)
+          .into_par_iter()
+          .for_each(|id| b.ensure_backlink(id as DocId));
+      }
+      b.reconnect_orphans();
     });
   }
 
@@ -456,8 +510,24 @@ impl HnswIndex {
     f: impl FnOnce(&Builder<'_>) -> R,
   ) -> R {
     let (m, m0) = (self.params.m, 2 * self.params.m);
+    let n = self.len();
+    if !self.indeg_ready {
+      self.indeg = vec![0; n];
+      for rec in self.graph.l0.as_slice().chunks_exact(1 + m0) {
+        for &id in &rec[1..1 + (rec[0] as usize).min(m0)] {
+          if let Some(d) = self.indeg.get_mut(id as usize) {
+            *d += 1;
+          }
+        }
+      }
+      self.indeg_ready = true;
+    }
+    // Nodes appended since the last build have no edges yet.
+    self.indeg.resize(n, 0);
+    self.prot.to_mut().resize(n, NONE);
     let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
     let entry = Mutex::new((self.entry, self.max_level));
+    let orphans = Mutex::new(Vec::new());
     let r = {
       let b = Builder {
         view: BuildView {
@@ -474,6 +544,9 @@ impl HnswIndex {
         metric: self.metric,
         ef_construction: self.params.ef_construction,
         entry: &entry,
+        indeg: as_atomic(&mut self.indeg),
+        orphans: &orphans,
+        prot: as_atomic(self.prot.to_mut()),
       };
       f(&b)
     };
@@ -546,6 +619,10 @@ impl HnswIndex {
     w.pod_section(T_L0, self.graph.l0.as_slice())?;
     w.pod_section(T_UPOFF, self.graph.upoff.as_slice())?;
     w.pod_section(T_UPPER, self.graph.upper.as_slice())?;
+    // Shorter than `len()` only for an index that was never built on.
+    let prot = self.prot.as_slice();
+    let prot = if prot.len() == self.len() { prot } else { &[] };
+    w.pod_section(T_PROT, prot)?;
     if let Some(q) = &self.quant {
       q.write_sections(&mut w)?;
     }
@@ -556,7 +633,16 @@ impl HnswIndex {
   /// codes are read in place from `region`: opening costs a few header
   /// reads, whatever the index size.
   pub fn open(region: Region) -> Result<Self> {
-    let c = Container::open_kind(region, HNSW_KIND, HNSW_VERSION)?;
+    let c = Container::open(region)?;
+    if c.kind() != HNSW_KIND {
+      return Err(Error::corrupt("not an HNSW index file"));
+    }
+    if !(1..=HNSW_VERSION).contains(&c.version()) {
+      return Err(Error::corrupt(format!(
+        "HNSW format version {} is not supported (expected 1..={HNSW_VERSION})",
+        c.version()
+      )));
+    }
     let f = meta::read(c.section(T_META)?, META_FIELDS)?;
     let dim = meta::usize_field(f[0], "dimension")?;
     let metric = meta::metric(f[1])?;
@@ -585,7 +671,12 @@ impl HnswIndex {
       upoff: Slab::from_region(c.section(T_UPOFF)?)?,
       upper: Slab::from_region(c.section(T_UPPER)?)?,
     };
+    let prot = match c.try_section(T_PROT) {
+      Some(r) => Slab::from_region(r)?,
+      None => Slab::default(),
+    };
     let sizes_ok = Some(vectors.len()) == n.checked_mul(dim)
+      && (prot.len() == n || prot.len() == 0)
       && graph.levels.len() == n
       && graph.upoff.len() == n
       && Some(graph.l0.len()) == n.checked_mul(1 + m0);
@@ -614,6 +705,9 @@ impl HnswIndex {
       quant,
       trained_on: meta::usize_field(f[11], "training size")?,
       from_file: true,
+      indeg: Vec::new(),
+      prot,
+      indeg_ready: false,
     })
   }
 
@@ -781,7 +875,6 @@ fn upper_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-  use super::graph::Neighbors;
   use super::*;
 
   fn data(n: usize, dim: usize, seed: u64) -> Vec<f32> {

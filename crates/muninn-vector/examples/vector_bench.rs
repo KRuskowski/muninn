@@ -206,11 +206,13 @@ fn main() {
   let st = hnsw.stats();
   println!(
     "\n## HNSW build\n\n{} with {threads} threads ({:.0} vectors/s); \
-     max level {}, avg level-0 degree {}, graph {:.1} MB, vectors {:.1} MB",
+     max level {}, avg level-0 degree {}, {} unreachable, graph {:.1} MB, \
+     vectors {:.1} MB",
     secs(build),
     a.n as f64 / build.as_secs_f64(),
     st.max_level,
     st.avg_degree,
+    st.unreachable,
     st.graph_bytes as f64 / 1e6,
     st.vector_bytes as f64 / 1e6
   );

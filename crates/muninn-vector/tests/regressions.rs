@@ -241,3 +241,18 @@ fn scores_consistent_flat_vs_hnsw() {
     }
   }
 }
+
+/// Format version 2 adds the protected-edge section; version 1 files
+/// (without it) still open, unknown versions do not.
+#[test]
+fn hnsw_format_versions() {
+  let d = data(200, 4);
+  let idx = HnswIndex::build(4, Metric::L2, HnswParams::default(), &d).unwrap();
+  let buf = idx.write_to(AlignedBuf::new()).unwrap();
+  for (version, ok) in [(1u32, true), (2, true), (3, false), (0, false)] {
+    let mut b = buf.clone();
+    b.as_mut_slice()[16..20].copy_from_slice(&version.to_le_bytes());
+    let r = HnswIndex::open(Region::new(b));
+    assert_eq!(r.is_ok(), ok, "version {version}");
+  }
+}
