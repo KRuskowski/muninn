@@ -360,36 +360,38 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
     let params = SearchParams::new(side_k)
       .with_ef(q.ef)
       .with_rerank(q.rerank);
-    let per: Vec<Result<Vec<Cand>>> = v
-      .views
-      .par_iter()
-      .enumerate()
-      .map(|(i, w)| {
-        let sf = &filters[i];
-        let hits = match &w.src {
-          Source::Mem(m) => match &m.vectors {
-            Some(a) => scan_memtable(a, w.len, metric, &prepared, side_k, sf),
-            None => Vec::new(),
-          },
-          Source::Seg(seg) => {
-            let vi = seg.vectors.as_ref().ok_or_else(|| {
-              Error::corrupt("segment without a vector index")
-            })?;
-            match sf.sel {
-              Selection::Bits(bits, n) if *n <= EXACT_MAX_DOCS => {
-                scan_selected(vi, bits, sf, metric, &prepared, side_k)
-              }
-              _ => {
-                let filt: Option<&dyn DocFilter> =
-                  if sf.passes_all() { None } else { Some(sf) };
-                vi.index().search(query, &params, filt)?
-              }
+    // Empty sources (typically the active memtable right after a flush)
+    // cost nothing; skipping them often leaves a single source, searched
+    // without a parallel fan-out.
+    let nonempty: Vec<usize> =
+      (0..v.views.len()).filter(|&i| v.views[i].len > 0).collect();
+    let per: Vec<Result<Vec<Cand>>> = fan_out(&nonempty, |i| {
+      let w = &v.views[i];
+      let sf = &filters[i];
+      let hits = match &w.src {
+        Source::Mem(m) => match &m.vectors {
+          Some(a) => scan_memtable(a, w.len, metric, &prepared, side_k, sf),
+          None => Vec::new(),
+        },
+        Source::Seg(seg) => {
+          let vi = seg
+            .vectors
+            .as_ref()
+            .ok_or_else(|| Error::corrupt("segment without a vector index"))?;
+          match sf.sel {
+            Selection::Bits(bits, n) if *n <= EXACT_MAX_DOCS => {
+              scan_selected(vi, bits, sf, metric, &prepared, side_k)
+            }
+            _ => {
+              let filt: Option<&dyn DocFilter> =
+                if sf.passes_all() { None } else { Some(sf) };
+              vi.index().search(query, &params, filt)?
             }
           }
-        };
-        Ok(to_cands(i, hits).collect())
-      })
-      .collect();
+        }
+      };
+      Ok(to_cands(i, hits).collect())
+    });
     let mut all = Vec::new();
     for r in per {
       all.extend(r?);
@@ -405,18 +407,15 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
     };
     let mut best: HashMap<(u32, DocId), f32> = HashMap::new();
     for (f, stats, mem_hits) in &text_parts {
-      let per: Vec<Result<Vec<Cand>>> = v.views[..v.nseg]
-        .par_iter()
-        .enumerate()
-        .map(|(i, w)| {
-          let seg = w.segment().expect("segment");
-          let sf = &filters[i];
-          let filt: Option<&dyn DocFilter> =
-            if sf.passes_all() { None } else { Some(sf) };
-          let h = seg.text[*f].search_with_stats(text, side_k, filt, stats)?;
-          Ok(to_cands(i, h).collect())
-        })
-        .collect();
+      let segs: Vec<usize> = (0..v.nseg).collect();
+      let per: Vec<Result<Vec<Cand>>> = fan_out(&segs, |i| {
+        let seg = v.views[i].segment().expect("segment");
+        let sf = &filters[i];
+        let filt: Option<&dyn DocFilter> =
+          if sf.passes_all() { None } else { Some(sf) };
+        let h = seg.text[*f].search_with_stats(text, side_k, filt, stats)?;
+        Ok(to_cands(i, h).collect())
+      });
       let mut all: Vec<Cand> = mem_hits.clone();
       for r in per {
         all.extend(r?);
@@ -443,10 +442,29 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
     Ok(all)
   };
 
-  let (vr, tr) = rayon::join(vector_part, text_part);
-  let (vc, tc) = (vr?, tr?);
+  let (vc, tc) = match (q.vector.is_some(), text.is_some()) {
+    (true, true) => {
+      let (vr, tr) = rayon::join(vector_part, text_part);
+      (vr?, tr?)
+    }
+    (true, false) => (vector_part()?, Vec::new()),
+    _ => (Vec::new(), text_part()?),
+  };
   let fused = fuse(q, &vc, &tc);
   resolve(&v, &fused, q.with_payload)
+}
+
+/// Maps `f` over `items`, in parallel on rayon when there are several:
+/// a one-item fan-out would only add a task hand-off to the query.
+fn fan_out<T: Send>(
+  items: &[usize],
+  f: impl Fn(usize) -> T + Sync + Send,
+) -> Vec<T> {
+  if items.len() <= 1 {
+    items.iter().map(|&i| f(i)).collect()
+  } else {
+    items.par_iter().map(|&i| f(i)).collect()
+  }
 }
 
 /// A fused result before id resolution.

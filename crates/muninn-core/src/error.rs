@@ -18,6 +18,10 @@ pub enum Error {
   NotFound(String),
   /// A named thing already exists.
   AlreadyExists(String),
+  /// The target cannot serve the request right now, for example a
+  /// collection that refuses writes after a background failure until it
+  /// is reopened. Retrying after recovery may succeed.
+  Unavailable(String),
 }
 
 impl Error {
@@ -42,6 +46,7 @@ impl fmt::Display for Error {
       ),
       Self::NotFound(m) => write!(f, "not found: {m}"),
       Self::AlreadyExists(m) => write!(f, "already exists: {m}"),
+      Self::Unavailable(m) => write!(f, "unavailable: {m}"),
     }
   }
 }

@@ -1,13 +1,17 @@
 //! HNSW recall through the engine, on clustered data, against exact
 //! brute force: across several segments plus a memtable, after a full
-//! compaction into one segment, and with SQ8 quantisation.
+//! compaction into one segment (which extends the first segment's graph),
+//! with SQ8 quantisation, and after a bulk load whose flushes leave their
+//! graphs to background merges.
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{Rng, TestDir};
 use muninn::{
-  Collection, Database, Document, Durability, Metric, Options, Quantization,
-  Query, Schema, VectorField,
+  Collection, Database, Document, Durability, Id, Metric, Options,
+  Quantization, Query, Schema, VectorField,
 };
 
 const DIM: usize = 32;
@@ -142,4 +146,75 @@ fn hnsw_recall_l2() {
 #[test]
 fn hnsw_recall_cosine_sq8() {
   run(Metric::Cosine, Quantization::Sq8);
+}
+
+/// A bulk load: writes outpace the worker, so flushes leave their graphs
+/// to merges, which insert those vectors into one growing graph; when the
+/// writes stop, the rest is merged after the idle delay. Every document
+/// keeps its id and vector, and recall holds before and after `compact`.
+#[test]
+fn bulk_load_builds_graphs_in_merges() {
+  let mut rng = Rng::new(7);
+  let (docs, queries) = data(&mut rng);
+  let dir = TestDir::new("recall-bulk");
+  let opts = Options {
+    durability: Durability::NoSync,
+    memtable_max_docs: 1_500,
+    hnsw_min_docs: 1_000,
+    merge_idle_delay: Duration::from_millis(50),
+    ..Options::default()
+  };
+  let db = Database::open(dir.path(), opts).unwrap();
+  let field = VectorField {
+    dim: DIM,
+    metric: Metric::L2,
+    index: muninn::IndexKind::Hnsw {
+      m: 16,
+      ef_construction: 100,
+    },
+    quantization: Quantization::None,
+  };
+  let c = db.create_collection("r", Schema::vector(field)).unwrap();
+  let mut flat_seen = false;
+  for (chunk_i, chunk) in docs.chunks(500).enumerate() {
+    let batch: Vec<Document> = chunk
+      .iter()
+      .enumerate()
+      .map(|(j, v)| Document::new((chunk_i * 500 + j) as u64).vector(v.clone()))
+      .collect();
+    c.upsert(&batch).unwrap();
+    let st = c.stats().unwrap();
+    flat_seen |= st
+      .segments
+      .iter()
+      .any(|s| s.vector_index == "flat" && s.docs >= 1_000);
+  }
+  assert!(flat_seen, "no flush left its graph to a merge");
+  c.flush().unwrap();
+  // The idle delay folds whatever is left into graphs.
+  let t = Instant::now();
+  let st = loop {
+    let st = c.stats().unwrap();
+    if st.segments.iter().all(|s| s.vector_index == "hnsw") {
+      break st;
+    }
+    assert!(t.elapsed() < Duration::from_secs(60), "{st:?}");
+    std::thread::sleep(Duration::from_millis(10));
+  };
+  assert_eq!(st.live_docs, N as u64, "{st:?}");
+  assert!(st.segments.len() <= 4, "{st:?}");
+  for (i, v) in docs.iter().enumerate().step_by(97) {
+    let d = c.get(&Id::U64(i as u64)).unwrap().unwrap();
+    assert_eq!(d.vector.as_deref(), Some(v.as_slice()), "doc {i}");
+  }
+  let r = recall(&c, &docs, &queries, Metric::L2);
+  println!(
+    "bulk load: {} segments, recall@{K} = {r:.4}",
+    st.segments.len()
+  );
+  assert!(r >= 0.95, "recall {r} after a bulk load");
+  c.compact().unwrap();
+  let r = recall(&c, &docs, &queries, Metric::L2);
+  println!("bulk load compacted: recall@{K} = {r:.4}");
+  assert!(r >= 0.95, "recall {r} after compaction");
 }

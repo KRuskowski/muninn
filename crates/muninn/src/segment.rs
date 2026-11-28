@@ -106,18 +106,23 @@ impl std::fmt::Debug for Segment {
   }
 }
 
-/// Builds the vector index of a new segment from row-major `vectors`.
+/// Builds the vector index of a new segment from row-major `vectors`:
+/// HNSW if the schema asks for it, `graph` is set and the segment is
+/// large enough, else flat.
 fn build_vectors(
   schema: &Schema,
   opts: &Options,
   vectors: &[f32],
+  graph: bool,
 ) -> Result<Option<VecIndex>> {
   let Some(f) = &schema.vector else {
     return Ok(None);
   };
   let n = vectors.len() / f.dim;
   let idx = match f.index {
-    IndexKind::Hnsw { m, ef_construction } if n >= opts.hnsw_min_docs => {
+    IndexKind::Hnsw { m, ef_construction }
+      if graph && n >= opts.hnsw_min_docs =>
+    {
       let p = HnswParams::default()
         .with_m(m)
         .with_ef_construction(ef_construction)
@@ -177,7 +182,9 @@ impl<'a> FileSet<'a> {
 }
 
 /// Writes a frozen memtable as segment `id`. `g` must be the memtable's
-/// (no longer changing) contents.
+/// (no longer changing) contents. Without `graph` the vectors get a flat
+/// index even when the schema asks for HNSW, leaving the graph to a
+/// later merge.
 pub(crate) fn write_from_memtable(
   dir: &Path,
   id: u64,
@@ -185,6 +192,7 @@ pub(crate) fn write_from_memtable(
   g: &MemInner,
   schema: &Schema,
   opts: &Options,
+  graph: bool,
 ) -> Result<SegmentEntry> {
   let n = g.docs;
   let mut fs = FileSet::new(dir, id);
@@ -197,7 +205,7 @@ pub(crate) fn write_from_memtable(
       if v.len() != n as usize * a.dim() {
         return Err(Error::invalid("memtable vectors are not all published"));
       }
-      build_vectors(schema, opts, &v)?
+      build_vectors(schema, opts, &v, graph)?
     }
     None => None,
   };
@@ -231,9 +239,40 @@ pub(crate) fn write_from_memtable(
   Ok(fs.finish(n, vectors.as_ref()))
 }
 
+/// The HNSW graph of `seg` if a merge whose output starts with all of
+/// `seg`'s documents, unchanged, can extend it instead of building a new
+/// graph: same parameters as the schema asks for now.
+fn reusable_graph<'a>(
+  seg: &'a Segment,
+  schema: &Schema,
+) -> Option<&'a HnswIndex> {
+  let f = schema.vector.as_ref()?;
+  let IndexKind::Hnsw { m, ef_construction } = f.index else {
+    return None;
+  };
+  match &seg.vectors {
+    Some(VecIndex::Hnsw(h))
+      if h.params().m == m
+        && h.params().ef_construction == ef_construction
+        && h.params().quantization == f.quantization =>
+    {
+      Some(h)
+    }
+    _ => None,
+  }
+}
+
 /// Merges `inputs` (segments with the deletes to drop) into segment `id`,
 /// keeping their order. Returns the entry and, per input, the new id of
 /// each old doc ([`DELETED`] if dropped); `None` if nothing survives.
+///
+/// When the first input has an HNSW graph and no deletes, its documents
+/// keep their ids, so the merged graph is that graph with the other
+/// inputs' vectors inserted: a merge costs graph work only for the
+/// documents that were not in a graph yet (or were in a smaller one),
+/// not for all of them. Inserting into an existing graph is how every
+/// HNSW graph is built, so the result has the same quality as a fresh
+/// build.
 pub(crate) fn write_merged(
   dir: &Path,
   id: u64,
@@ -267,10 +306,15 @@ pub(crate) fn write_merged(
       .map(|(d, _)| d as DocId)
   };
   let mut fs = FileSet::new(dir, id);
+  let first_intact = !maps[0].contains(&DELETED);
+  let reuse = reusable_graph(inputs[0].0, schema)
+    .filter(|_| first_intact && n as usize >= opts.hnsw_min_docs);
   let vectors = match &schema.vector {
     Some(f) => {
-      let mut v = Vec::with_capacity(n as usize * f.dim);
-      for (i, (seg, _)) in inputs.iter().enumerate() {
+      let skip = usize::from(reuse.is_some());
+      let rows = n as usize - if skip == 1 { maps[0].len() } else { 0 };
+      let mut v = Vec::with_capacity(rows * f.dim);
+      for (i, (seg, _)) in inputs.iter().enumerate().skip(skip) {
         let vi = seg
           .vectors
           .as_ref()
@@ -279,7 +323,15 @@ pub(crate) fn write_merged(
           v.extend_from_slice(vi.vector(d));
         }
       }
-      build_vectors(schema, opts, &v)?
+      match reuse {
+        Some(h) => {
+          // A mapped index is copied into memory on the first insert.
+          let mut h = h.clone();
+          h.add_batch(&v)?;
+          Some(VecIndex::Hnsw(h))
+        }
+        None => build_vectors(schema, opts, &v, true)?,
+      }
     }
     None => None,
   };

@@ -24,6 +24,13 @@ pub struct Options {
   /// index even when the schema asks for HNSW: scanning is faster than a
   /// graph at that size. Default 10 000.
   pub hnsw_min_docs: usize,
+  /// While writes arrive faster than segments are built, flushed
+  /// segments skip the HNSW graph and background merging inserts their
+  /// vectors into a graph segment in bulk, so every vector goes into a
+  /// graph about once. Such segments are searched exactly until then.
+  /// When writes pause for this long, they are merged whatever their
+  /// size. Default 1 s.
+  pub merge_idle_delay: Duration,
   /// Merge segments in the background. Default true.
   pub auto_compact: bool,
   /// Background merging merges this many neighbouring segments of
@@ -52,6 +59,7 @@ impl Default for Options {
       memtable_max_bytes: 256 << 20,
       max_pending_flushes: 2,
       hnsw_min_docs: 10_000,
+      merge_idle_delay: Duration::from_secs(1),
       auto_compact: true,
       merge_factor: 4,
       compact_deleted_ratio: 0.3,
@@ -119,6 +127,10 @@ pub enum Failpoint {
   AfterManifestCommit,
   /// After a compaction wrote its segment, before the manifest commit.
   AfterCompactionWrite,
+  /// After a compaction committed the manifest and published the merged
+  /// segment, before the second commit that lets the merged-away
+  /// segments be deleted.
+  AfterCompactionCommit,
   /// Not a crash: the worker pauses 20 ms inside the windows where a
   /// flush or merge has captured state that concurrent writes may change
   /// before it publishes, so tests can hit those races reliably.

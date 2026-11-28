@@ -132,8 +132,27 @@ impl Schema {
     Ok(())
   }
 
-  /// The stored form, kept in every manifest.
-  pub(crate) fn to_json(&self) -> Value {
+  /// The canonical JSON form, as stored in every manifest, with every
+  /// setting spelled out:
+  ///
+  /// ```json
+  /// {
+  ///   "format": 1,
+  ///   "vector": {"dim": 3, "metric": "cosine",
+  ///              "index": {"kind": "hnsw", "m": 16, "ef_construction": 200},
+  ///              "quantization": "none"},
+  ///   "text_fields": ["title"],
+  ///   "analyzer": {"fold_diacritics": false, "english_stop_words": false,
+  ///                "stemmer": "none", "max_token_bytes": 255},
+  ///   "filterable": [{"name": "lang", "kind": "keyword"}]
+  /// }
+  /// ```
+  ///
+  /// `metric` is `l2`, `dot` or `cosine`; `index.kind` is `hnsw` or
+  /// `flat`; `quantization` is `none`, `sq8` or `binary`; `stemmer` is
+  /// `none` or `porter_english`; a filterable `kind` is `keyword`,
+  /// `integer`, `float` or `bool`. [`Schema::from_json`] reads it back.
+  pub fn to_json(&self) -> Value {
     let vector = self.vector.as_ref().map(|v| {
       let index = match v.index {
         IndexKind::Flat => json!({"kind": "flat"}),
@@ -171,116 +190,251 @@ impl Schema {
     })
   }
 
-  /// Parses [`Schema::to_json`].
-  pub(crate) fn from_json(v: &Value) -> Result<Self> {
-    let bad = |what: &str| Error::corrupt(format!("schema: bad {what}"));
-    if v.get("format").and_then(Value::as_u64) != Some(SCHEMA_FORMAT) {
-      return Err(bad("format version"));
-    }
-    let vector = match v.get("vector") {
-      None | Some(Value::Null) => None,
+  /// Parses the JSON form written by [`Schema::to_json`] and validates
+  /// the schema. Keys may be left out: `format` (the current one),
+  /// `vector` (none), `text_fields` and `filterable` (empty), `analyzer`
+  /// and each of its settings ([`AnalyzerConfig::default`]),
+  /// `vector.index` (HNSW with `m = 16`, `ef_construction = 200`) and
+  /// `vector.quantization` (`none`). Unknown keys are refused, so a typo
+  /// does not silently fall back to a default. Errors are
+  /// [`Error::InvalidArgument`] naming the offending key.
+  pub fn from_json(v: &Value) -> Result<Self> {
+    let o = object(v, "schema")?;
+    known(
+      o,
+      "schema",
+      &["format", "vector", "text_fields", "analyzer", "filterable"],
+    )?;
+    match o.get("format") {
+      None => {}
+      Some(f) if f.as_u64() == Some(SCHEMA_FORMAT) => {}
       Some(f) => {
-        let dim = f
-          .get("dim")
-          .and_then(Value::as_u64)
-          .ok_or_else(|| bad("dim"))? as usize;
-        let metric = f
-          .get("metric")
-          .and_then(Value::as_str)
-          .and_then(Metric::parse)
-          .ok_or_else(|| bad("metric"))?;
-        let quantization = f
-          .get("quantization")
-          .and_then(Value::as_str)
-          .and_then(parse_quant)
-          .ok_or_else(|| bad("quantization"))?;
-        let ix = f.get("index").ok_or_else(|| bad("index"))?;
-        let index = match ix.get("kind").and_then(Value::as_str) {
-          Some("flat") => IndexKind::Flat,
-          Some("hnsw") => IndexKind::Hnsw {
-            m: ix
-              .get("m")
-              .and_then(Value::as_u64)
-              .ok_or_else(|| bad("m"))? as usize,
-            ef_construction: ix
-              .get("ef_construction")
-              .and_then(Value::as_u64)
-              .ok_or_else(|| bad("ef_construction"))?
-              as usize,
-          },
-          _ => return Err(bad("index kind")),
-        };
-        Some(VectorField {
-          dim,
-          metric,
-          index,
-          quantization,
+        return Err(Error::invalid(format!(
+          "schema.format {f} is not supported (expected {SCHEMA_FORMAT})"
+        )));
+      }
+    }
+    let vector = match o.get("vector") {
+      None | Some(Value::Null) => None,
+      Some(f) => Some(parse_vector(f)?),
+    };
+    let text_fields = match o.get("text_fields") {
+      None | Some(Value::Null) => Vec::new(),
+      Some(Value::Array(a)) => a
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+          f.as_str().map(String::from).ok_or_else(|| {
+            Error::invalid(format!("schema.text_fields[{i}] must be a string"))
+          })
         })
+        .collect::<Result<Vec<_>>>()?,
+      Some(_) => {
+        return Err(Error::invalid(
+          "schema.text_fields must be an array of strings",
+        ));
       }
     };
-    let text_fields = v
-      .get("text_fields")
-      .and_then(Value::as_array)
-      .ok_or_else(|| bad("text_fields"))?
-      .iter()
-      .map(|f| {
-        f.as_str()
-          .map(String::from)
-          .ok_or_else(|| bad("text field"))
-      })
-      .collect::<Result<Vec<_>>>()?;
-    let a = v.get("analyzer").ok_or_else(|| bad("analyzer"))?;
-    let flag = |name: &str| {
-      a.get(name)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| bad(name))
+    let analyzer = match o.get("analyzer") {
+      None | Some(Value::Null) => AnalyzerConfig::default(),
+      Some(a) => parse_analyzer(a)?,
     };
-    let stemmer = match a.get("stemmer").and_then(Value::as_str) {
-      Some("none") => StemmerChoice::None,
-      Some("porter_english") => StemmerChoice::PorterEnglish,
-      _ => return Err(bad("stemmer")),
+    let filterable = match o.get("filterable") {
+      None | Some(Value::Null) => Vec::new(),
+      Some(Value::Array(a)) => a
+        .iter()
+        .enumerate()
+        .map(|(i, f)| parse_field(f, &format!("schema.filterable[{i}]")))
+        .collect::<Result<Vec<_>>>()?,
+      Some(_) => {
+        return Err(Error::invalid("schema.filterable must be an array"));
+      }
     };
-    let max_token_bytes = a
-      .get("max_token_bytes")
-      .and_then(Value::as_u64)
-      .and_then(|n| u16::try_from(n).ok())
-      .ok_or_else(|| bad("max_token_bytes"))?;
-    let analyzer = AnalyzerConfig {
-      fold_diacritics: flag("fold_diacritics")?,
-      english_stop_words: flag("english_stop_words")?,
-      stemmer,
-      max_token_bytes,
-    };
-    let filterable = v
-      .get("filterable")
-      .and_then(Value::as_array)
-      .ok_or_else(|| bad("filterable"))?
-      .iter()
-      .map(|f| {
-        let name = f.get("name").and_then(Value::as_str);
-        let kind = f
-          .get("kind")
-          .and_then(Value::as_str)
-          .and_then(FieldKind::parse);
-        match (name, kind) {
-          (Some(n), Some(k)) => Ok(FieldSpec {
-            name: n.into(),
-            kind: k,
-          }),
-          _ => Err(bad("filterable field")),
-        }
-      })
-      .collect::<Result<Vec<_>>>()?;
     let s = Schema {
       vector,
       text_fields,
       analyzer,
       filterable,
     };
-    s.validate()
-      .map_err(|e| Error::corrupt(format!("schema: {e}")))?;
+    s.validate()?;
     Ok(s)
   }
+
+  /// Parses the schema stored in a manifest; any problem means the file
+  /// is damaged.
+  pub(crate) fn from_stored(v: &Value) -> Result<Self> {
+    if v.get("format").and_then(Value::as_u64) != Some(SCHEMA_FORMAT) {
+      return Err(Error::corrupt("schema: bad format version"));
+    }
+    Self::from_json(v).map_err(|e| match e {
+      Error::InvalidArgument(m) => Error::corrupt(format!("stored {m}")),
+      e => e,
+    })
+  }
+}
+
+fn object<'a>(
+  v: &'a Value,
+  at: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+  v.as_object()
+    .ok_or_else(|| Error::invalid(format!("{at} must be an object")))
+}
+
+/// Refuses keys of `o` (at path `at`) not in `allowed`.
+fn known(
+  o: &serde_json::Map<String, Value>,
+  at: &str,
+  allowed: &[&str],
+) -> Result<()> {
+  match o.keys().find(|k| !allowed.contains(&k.as_str())) {
+    Some(k) => Err(Error::invalid(format!(
+      "{at} has unknown key {k:?} (known: {})",
+      allowed.join(", ")
+    ))),
+    None => Ok(()),
+  }
+}
+
+fn string<'a>(v: Option<&'a Value>, at: &str) -> Result<&'a str> {
+  v.and_then(Value::as_str)
+    .ok_or_else(|| Error::invalid(format!("{at} must be a string")))
+}
+
+fn uint(v: Option<&Value>, at: &str) -> Result<u64> {
+  v.and_then(Value::as_u64).ok_or_else(|| {
+    Error::invalid(format!("{at} must be a non-negative integer"))
+  })
+}
+
+fn usize_of(v: Option<&Value>, at: &str) -> Result<usize> {
+  usize::try_from(uint(v, at)?)
+    .map_err(|_| Error::invalid(format!("{at} is too large")))
+}
+
+fn parse_vector(v: &Value) -> Result<VectorField> {
+  let o = object(v, "schema.vector")?;
+  known(
+    o,
+    "schema.vector",
+    &["dim", "metric", "index", "quantization"],
+  )?;
+  let dim = usize_of(o.get("dim"), "schema.vector.dim")?;
+  let m = string(o.get("metric"), "schema.vector.metric")?;
+  let metric = Metric::parse(m).ok_or_else(|| {
+    Error::invalid(format!(
+      "schema.vector.metric {m:?} is not one of l2, dot, cosine"
+    ))
+  })?;
+  let quantization = match o.get("quantization") {
+    None | Some(Value::Null) => Quantization::None,
+    q => {
+      let q = string(q, "schema.vector.quantization")?;
+      parse_quant(q).ok_or_else(|| {
+        Error::invalid(format!(
+          "schema.vector.quantization {q:?} is not one of none, sq8, binary"
+        ))
+      })?
+    }
+  };
+  let index = match o.get("index") {
+    None | Some(Value::Null) => VectorField::hnsw(dim, metric).index,
+    Some(ix) => {
+      let at = "schema.vector.index";
+      let io = object(ix, at)?;
+      known(io, at, &["kind", "m", "ef_construction"])?;
+      match string(io.get("kind"), "schema.vector.index.kind")? {
+        "flat" => {
+          known(io, at, &["kind"])?;
+          IndexKind::Flat
+        }
+        "hnsw" => IndexKind::Hnsw {
+          m: match io.get("m") {
+            None => 16,
+            m => usize_of(m, "schema.vector.index.m")?,
+          },
+          ef_construction: match io.get("ef_construction") {
+            None => 200,
+            e => usize_of(e, "schema.vector.index.ef_construction")?,
+          },
+        },
+        k => {
+          return Err(Error::invalid(format!(
+            "schema.vector.index.kind {k:?} is not one of hnsw, flat"
+          )));
+        }
+      }
+    }
+  };
+  Ok(VectorField {
+    dim,
+    metric,
+    index,
+    quantization,
+  })
+}
+
+fn parse_analyzer(v: &Value) -> Result<AnalyzerConfig> {
+  let at = "schema.analyzer";
+  let o = object(v, at)?;
+  known(
+    o,
+    at,
+    &[
+      "fold_diacritics",
+      "english_stop_words",
+      "stemmer",
+      "max_token_bytes",
+    ],
+  )?;
+  let mut a = AnalyzerConfig::default();
+  let flag = |name: &str| -> Result<Option<bool>> {
+    match o.get(name) {
+      None => Ok(None),
+      Some(b) => b.as_bool().map(Some).ok_or_else(|| {
+        Error::invalid(format!("{at}.{name} must be true or false"))
+      }),
+    }
+  };
+  if let Some(b) = flag("fold_diacritics")? {
+    a.fold_diacritics = b;
+  }
+  if let Some(b) = flag("english_stop_words")? {
+    a.english_stop_words = b;
+  }
+  if let Some(st) = o.get("stemmer") {
+    a.stemmer = match string(Some(st), "schema.analyzer.stemmer")? {
+      "none" => StemmerChoice::None,
+      "porter_english" => StemmerChoice::PorterEnglish,
+      x => {
+        return Err(Error::invalid(format!(
+          "schema.analyzer.stemmer {x:?} is not one of none, porter_english"
+        )));
+      }
+    };
+  }
+  if let Some(n) = o.get("max_token_bytes") {
+    let at = "schema.analyzer.max_token_bytes";
+    a.max_token_bytes = u16::try_from(uint(Some(n), at)?)
+      .map_err(|_| Error::invalid(format!("{at} must be at most 65535")))?;
+  }
+  Ok(a)
+}
+
+fn parse_field(v: &Value, at: &str) -> Result<FieldSpec> {
+  let o = object(v, at)?;
+  known(o, at, &["name", "kind"])?;
+  let name = string(o.get("name"), &format!("{at}.name"))?;
+  let k = string(o.get("kind"), &format!("{at}.kind"))?;
+  let kind = FieldKind::parse(k).ok_or_else(|| {
+    Error::invalid(format!(
+      "{at}.kind {k:?} is not one of keyword, integer, float, bool"
+    ))
+  })?;
+  Ok(FieldSpec {
+    name: name.into(),
+    kind,
+  })
 }
 
 fn check_name(name: &str, what: &str) -> Result<()> {
@@ -501,5 +655,45 @@ mod tests {
     let mut bad = Schema::text(["a"]).to_json();
     bad["format"] = json!(99);
     assert!(Schema::from_json(&bad).is_err());
+    assert!(Schema::from_stored(&bad).is_err());
+  }
+
+  #[test]
+  fn json_defaults_and_errors() {
+    let s = Schema::from_json(&json!({
+      "vector": {"dim": 3, "metric": "cosine"},
+      "text_fields": ["title"],
+    }))
+    .unwrap();
+    assert_eq!(
+      s,
+      Schema::vector(VectorField::hnsw(3, Metric::Cosine))
+        .with_text_fields(["title"])
+    );
+    // The stored form needs its format version.
+    assert!(matches!(
+      Schema::from_stored(&json!({"text_fields": ["a"]})),
+      Err(Error::Corrupt(_))
+    ));
+    let err = |v: Value| match Schema::from_json(&v) {
+      Err(Error::InvalidArgument(m)) => m,
+      other => panic!("{other:?}"),
+    };
+    assert!(err(json!({"text_fields": ["a"], "vectr": {}})).contains("vectr"));
+    assert!(
+      err(json!({"vector": {"dim": 3, "metric": "manhattan"}}))
+        .contains("schema.vector.metric")
+    );
+    assert!(
+      err(json!({"vector": {"dim": 3, "metric": "l2",
+                 "index": {"kind": "flat", "m": 4}}}))
+      .contains("\"m\"")
+    );
+    assert!(
+      err(json!({"text_fields": ["a"],
+                 "filterable": [{"name": "x", "kind": "date"}]}))
+      .contains("schema.filterable[0].kind")
+    );
+    assert!(err(json!({})).contains("vector field"));
   }
 }
