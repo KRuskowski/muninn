@@ -83,3 +83,4 @@ All notable changes to muninn are recorded here, written for people who use muni
 - Searches on a collection held in a single part skip some internal coordination work, making each search slightly faster.
 - Server: deleting documents now also reports how many of the given ids existed (`"deleted"` next to `"count"` in the response). A collection that stopped accepting writes after a disk failure now answers `503 unavailable` instead of `500 internal`, with a message saying to restart the server.
 - For Rust users: muninn's error type may gain new kinds in later versions, so code that matches on it needs a catch-all arm.
+- The benchmark command (`bench_all.sh`) can download the GloVe and NYTimes datasets again; their host had started refusing its download requests.
