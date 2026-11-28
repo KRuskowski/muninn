@@ -36,6 +36,8 @@ Results go to `~/bench-results/<UTC timestamp>/` (`OUT=...` to change). A failin
 
 Single steps can be run by hand: `target/release/muninn-bench --help` (subcommands `hnsw`, `flat`, `verify-gt`, `text`, `engine-vector`, `engine-text`, `sysinfo`) and `scripts/run_ann.py --help`.
 
+For working on text search speed, `cargo build --release -p muninn-bench --example text_prof` builds a development aid (not part of the protocol, numbers from it are not reported): it keeps a muninn and a tantivy index on disk between runs, replays the MS MARCO queries one thread at a time (for `perf record`), checks pruned search against exhaustive BM25 on every query (`query ... check`), and compares per-query latencies with tantivy, listing the queries where muninn loses most (`cmp`). See the comment at the top of `crates/muninn-bench/examples/text_prof.rs`.
+
 ## Datasets
 
 | name | vectors | dim | metric | queries | source |
