@@ -69,6 +69,14 @@ pub const SEGMENT_SUFFIX: &str = ".wal";
 /// Suffix appended to segments set aside by recovery.
 pub const DISCARDED_SUFFIX: &str = ".discarded";
 
+/// In [`Durability::NoSync`] mode, segments rotated out without an fsync
+/// stay open until the next sync: an fsync through the handle that wrote
+/// a file is the one that reliably reports a writeback error (a closed
+/// file whose cached pages are dropped can lose it). When this many have
+/// accumulated, they are fsynced and closed, so a log that rotates often
+/// and is never synced holds a bounded number of files open.
+pub const MAX_UNSYNCED_SEGMENTS: usize = 16;
+
 /// Buffers above this size are freed after use rather than kept around.
 const MAX_KEPT_BUFFER: usize = 8 << 20;
 
@@ -88,6 +96,9 @@ pub enum Durability {
   },
   /// Never fsync unless [`Wal::sync`] is called (which then syncs every
   /// segment written since the last sync). Survives process crashes only.
+  /// One exception bounds the open files: once
+  /// [`MAX_UNSYNCED_SEGMENTS`] segments have been rotated out unsynced,
+  /// they are fsynced and closed (one fsync per that many segments).
   NoSync,
 }
 
@@ -178,10 +189,9 @@ struct Active {
   file: Arc<File>,
   len: u64,
   /// Segments rotated out without an fsync (`NoSync`), synced by the next
-  /// sync round before the active one. Kept by path, not as open files,
-  /// so a log that rotates often without ever syncing holds one file
-  /// handle, not one per segment (see [`Shared::fsync_path`]).
-  unsynced: Vec<PathBuf>,
+  /// sync round before the active one, or when
+  /// [`MAX_UNSYNCED_SEGMENTS`] have accumulated.
+  unsynced: Vec<Arc<File>>,
   /// A segment file was created without syncing the directory.
   dir_dirty: bool,
 }
@@ -427,8 +437,8 @@ impl Shared {
     if sync {
       // Older segments first: a record is durable only when everything
       // before it is.
-      for p in std::mem::take(&mut a.unsynced) {
-        self.fsync_path(&p)?;
+      for f in std::mem::take(&mut a.unsynced) {
+        self.fsync(&f, SyncSite::Leader)?;
       }
       if std::mem::take(&mut a.dir_dirty) {
         self.counters.sync_dir(&self.dir)?;
@@ -451,14 +461,19 @@ impl Shared {
       prev_lsn: first - 1,
     };
     let (file, path) = create_segment(&self.dir, header, sync, &self.counters)?;
-    // The old file is closed here (the background syncer may still hold
-    // a clone for a moment); unsynced, it is remembered by path.
-    drop(std::mem::replace(&mut a.file, Arc::new(file)));
+    let old = std::mem::replace(&mut a.file, Arc::new(file));
     a.len = HEADER_LEN as u64;
     if !sync {
-      let old = lock(&self.segments).last().map(|s| s.path.clone());
-      a.unsynced.extend(old);
+      a.unsynced.push(old);
       a.dir_dirty = true;
+      if a.unsynced.len() >= MAX_UNSYNCED_SEGMENTS {
+        // Oldest first, like a sync round. Durability is not claimed
+        // (the active segment is not synced); a failure is a real
+        // writeback error and poisons the log like any fsync failure.
+        for f in std::mem::take(&mut a.unsynced) {
+          self.fsync(&f, SyncSite::Leader)?;
+        }
+      }
     }
     lock(&self.segments).push(SegmentInfo {
       first_lsn: first,
@@ -498,28 +513,6 @@ impl Shared {
         Err(e.into())
       }
     }
-  }
-
-  /// Fsyncs a closed segment file by path (see [`Active::unsynced`]).
-  /// A file that is gone was deleted by [`Wal::truncate_before`], which
-  /// the caller may only use for records it has checkpointed elsewhere,
-  /// so there is nothing left to make durable.
-  ///
-  /// An fsync through a new handle flushes the file's dirty pages like
-  /// one through the handle that wrote them. Linux (4.14 and later)
-  /// reports a writeback error that no one has seen yet to handles opened
-  /// after it, so an earlier failure is not missed.
-  fn fsync_path(&self, path: &Path) -> Result<()> {
-    // Write access: Windows needs it to flush a file's buffers.
-    let f = match OpenOptions::new().write(true).open(path) {
-      Ok(f) => f,
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-      Err(e) => {
-        self.mark_failed(e.to_string());
-        return Err(e.into());
-      }
-    };
-    self.fsync(&f, SyncSite::Leader)
   }
 
   /// Poisons the WAL (first error wins) and wakes every waiter.

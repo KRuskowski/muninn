@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use common::TestDir;
 use muninn_core::Error;
-use muninn_store::wal::{DISCARDED_SUFFIX, SEGMENT_SUFFIX};
+use muninn_store::wal::{
+  DISCARDED_SUFFIX, MAX_UNSYNCED_SEGMENTS, SEGMENT_SUFFIX,
+};
 use muninn_store::{Durability, Lsn, Recovery, Wal, WalOptions};
 
 type Records = Vec<(Lsn, Vec<u8>)>;
@@ -568,12 +570,17 @@ fn no_sync_rotation_keeps_no_handle_per_segment() {
     after < before + 100,
     "{before} open files before, {after} after {rotated} rotations"
   );
-  // Sync still reaches every rotated segment, also when some of them
-  // were deleted in between.
+  // Every full group of rotated segments was synced and closed; nothing
+  // is claimed durable before a sync.
+  let eager = rotated / MAX_UNSYNCED_SEGMENTS * MAX_UNSYNCED_SEGMENTS;
+  assert_eq!(wal.stats().syncs as usize, eager);
+  assert_eq!(wal.durable_lsn(), 0);
+  // Sync reaches the remaining rotated segments, also when some of them
+  // were deleted in between, then the active one.
   wal.truncate_before(3000).unwrap();
   wal.sync().unwrap();
   assert_eq!(wal.durable_lsn(), 6000);
-  assert_eq!(wal.stats().syncs as usize, wal.segment_count());
+  assert_eq!(wal.stats().syncs as usize, rotated + 1);
   drop(wal);
   let (_, got, rec) =
     recover_all(d.path(), small_segments(Durability::NoSync, 4096), 3000);
