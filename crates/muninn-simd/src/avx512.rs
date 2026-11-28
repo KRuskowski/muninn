@@ -23,6 +23,16 @@ use crate::{finish, scalar};
 /// kernel is load-bound) and slower for short vectors.
 const ACC: usize = 4;
 
+/// Rows per kernel call in `distance_gather`: as many as `distance_batch`
+/// keeps in registers.
+const GATHER_ROWS: usize = BATCH_ROWS;
+
+/// How many groups of `GATHER_ROWS` ahead `distance_gather` prefetches.
+/// Two measured best on SIFT-1M graph search (Emerald Rapids, 4 threads):
+/// one group ahead arrives too late, and prefetching all rows up front
+/// stalls on the line fill buffers.
+const GATHER_AHEAD: usize = 2;
+
 /// Rows per iteration in `distance_batch`: 4 rows x 4 accumulators use 16
 /// of the 32 zmm registers for sums; the query vector is loaded once per
 /// group of rows.
@@ -83,6 +93,9 @@ pub(crate) unsafe fn build(extras: Extras) -> Kernels {
     dot,
     l2sq,
     distance_batch,
+    distance_gather,
+    dot_f32_u8,
+    dot_f32_u8_gather,
     dot_i8: if extras.vnni { dot_i8_vnni } else { dot_i8_bw },
     l2sq_u8: if extras.vnni {
       l2sq_u8_vnni
@@ -144,6 +157,210 @@ fn distance_batch(
       batch::<false>(metric, query, rows, out)
     }
   }
+}
+
+/// Distances to rows picked by id (see `crate::distance_gather`):
+/// `GATHER_ROWS` rows per kernel call with the query loaded once, while
+/// every line of the next group's rows is prefetched.
+fn distance_gather(
+  metric: Metric,
+  query: &[f32],
+  rows: &[f32],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = query.len();
+  let n = ids.len().min(out.len());
+  if dim == 0 {
+    out[..n].fill(finish(metric, 0.0));
+    return;
+  }
+  // Every id names a whole row (checked by the caller,
+  // `crate::distance_gather`); `get` keeps a broken caller from reading
+  // out of bounds.
+  let row = |i: usize| -> *const f32 {
+    let s = ids[i] as usize * dim;
+    rows
+      .get(s..s + dim)
+      .map_or(core::ptr::null(), |r| r.as_ptr())
+  };
+  // SAFETY: CPU features confirmed (see above).
+  unsafe {
+    if metric == Metric::L2 {
+      gather::<true>(metric, query.as_ptr(), dim, n, row, out)
+    } else {
+      gather::<false>(metric, query.as_ptr(), dim, n, row, out)
+    }
+  }
+}
+
+/// Prefetches every cache line of the row at `p` (`dim` floats). A null
+/// `p` is skipped.
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn prefetch_row(p: *const f32, dim: usize) {
+  if p.is_null() {
+    return;
+  }
+  let mut off = 0;
+  while off < dim {
+    prefetch(p.wrapping_add(off));
+    off += 16;
+  }
+  // The last line, when the row does not start on a line boundary.
+  prefetch(p.wrapping_add(dim - 1));
+}
+
+/// The body of `distance_gather`; `row(i)` is the start of row `ids[i]`,
+/// valid for `dim` reads, or null for an id out of range (scored as NaN).
+/// Every line of the rows `GATHER_AHEAD` groups ahead is prefetched while
+/// a group is scored.
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn gather<const L2: bool>(
+  metric: Metric,
+  q: *const f32,
+  dim: usize,
+  n: usize,
+  row: impl Fn(usize) -> *const f32,
+  out: &mut [f32],
+) {
+  let ahead = GATHER_ROWS * GATHER_AHEAD;
+  for i in 0..n.min(ahead) {
+    prefetch_row(row(i), dim);
+  }
+  let mut i = 0;
+  while i + GATHER_ROWS <= n {
+    let ptrs: [*const f32; GATHER_ROWS] = core::array::from_fn(|r| row(i + r));
+    for j in i + ahead..n.min(i + ahead + GATHER_ROWS) {
+      prefetch_row(row(j), dim);
+    }
+    if ptrs.iter().all(|p| !p.is_null()) {
+      // SAFETY: every pointer is valid for `dim` reads.
+      let d = unsafe { rows_f32::<GATHER_ROWS, L2, false>(q, ptrs, dim, 0) };
+      for r in 0..GATHER_ROWS {
+        out[i + r] = finish(metric, d[r]);
+      }
+    } else {
+      for r in 0..GATHER_ROWS {
+        out[i + r] = one::<L2>(metric, q, ptrs[r], dim);
+      }
+    }
+    i += GATHER_ROWS;
+  }
+  while i < n {
+    out[i] = one::<L2>(metric, q, row(i), dim);
+    i += 1;
+  }
+}
+
+/// One gathered row's distance; NaN for a null (out-of-range) row.
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn one<const L2: bool>(
+  metric: Metric,
+  q: *const f32,
+  p: *const f32,
+  dim: usize,
+) -> f32 {
+  if p.is_null() {
+    return f32::NAN;
+  }
+  // SAFETY: a non-null row pointer is valid for `dim` reads.
+  finish(metric, unsafe {
+    rows_f32::<1, L2, false>(q, [p], dim, 0)[0]
+  })
+}
+
+fn dot_f32_u8(a: &[f32], b: &[u8]) -> f32 {
+  debug_assert_eq!(a.len(), b.len());
+  let n = a.len().min(b.len());
+  // SAFETY: CPU features confirmed (see above); both pointers are valid
+  // for `n` reads.
+  unsafe { f32_u8_impl(a.as_ptr(), b.as_ptr(), n) }
+}
+
+fn dot_f32_u8_gather(w: &[f32], codes: &[u8], ids: &[u32], out: &mut [f32]) {
+  let dim = w.len();
+  let n = ids.len().min(out.len());
+  if dim == 0 {
+    out[..n].fill(0.0);
+    return;
+  }
+  // `get` keeps a caller with bad ids (only possible through the table;
+  // the free function checks) from reading out of bounds.
+  let row = |i: usize| -> *const u8 {
+    let s = ids[i] as usize * dim;
+    codes
+      .get(s..s + dim)
+      .map_or(core::ptr::null(), |r| r.as_ptr())
+  };
+  // SAFETY: CPU features confirmed (see above).
+  unsafe { gather_u8(w.as_ptr(), dim, n, row, out) }
+}
+
+/// The body of `dot_f32_u8_gather`, structured like `gather`.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn gather_u8(
+  w: *const f32,
+  dim: usize,
+  n: usize,
+  row: impl Fn(usize) -> *const u8,
+  out: &mut [f32],
+) {
+  let ahead = GATHER_ROWS * GATHER_AHEAD;
+  for i in 0..n.min(ahead) {
+    prefetch_bytes(row(i), dim);
+  }
+  let mut i = 0;
+  while i + GATHER_ROWS <= n {
+    let ptrs: [*const u8; GATHER_ROWS] = core::array::from_fn(|r| row(i + r));
+    for j in i + ahead..n.min(i + ahead + GATHER_ROWS) {
+      prefetch_bytes(row(j), dim);
+    }
+    if ptrs.iter().all(|p| !p.is_null()) {
+      // SAFETY: every pointer is valid for `dim` reads.
+      let d = unsafe { f32_u8_rows::<GATHER_ROWS>(w, ptrs, dim) };
+      out[i..i + GATHER_ROWS].copy_from_slice(&d);
+    } else {
+      for r in 0..GATHER_ROWS {
+        out[i + r] = one_u8(w, ptrs[r], dim);
+      }
+    }
+    i += GATHER_ROWS;
+  }
+  while i < n {
+    out[i] = one_u8(w, row(i), dim);
+    i += 1;
+  }
+}
+
+/// One gathered code row; NaN for a null (out-of-range) row.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
+fn one_u8(w: *const f32, p: *const u8, dim: usize) -> f32 {
+  if p.is_null() {
+    return f32::NAN;
+  }
+  // SAFETY: a non-null row pointer is valid for `dim` reads.
+  unsafe { f32_u8_rows::<1>(w, [p], dim)[0] }
+}
+
+/// Prefetches every cache line of the `len` bytes at `p`; null is
+/// skipped.
+#[inline]
+#[target_feature(enable = "avx512f")]
+fn prefetch_bytes(p: *const u8, len: usize) {
+  if p.is_null() {
+    return;
+  }
+  let mut off = 0;
+  while off < len {
+    prefetch(p.wrapping_add(off).cast());
+    off += 64;
+  }
+  prefetch(p.wrapping_add(len - 1).cast());
 }
 
 fn dot_i8_vnni(a: &[i8], b: &[i8]) -> i32 {
@@ -382,6 +599,93 @@ fn batch<const L2: bool>(
     out[i] = finish(metric, d[0]);
     i += 1;
   }
+}
+
+/// Loads sixteen codes and widens them to `f32` (exact).
+///
+/// # Safety
+/// The CPU supports AVX-512 F; `p` is valid for 16 reads.
+#[inline]
+#[target_feature(enable = "avx512f")]
+unsafe fn load_u8_f32(p: *const u8) -> __m512 {
+  // SAFETY: guaranteed by the caller.
+  let c = unsafe { _mm_loadu_si128(p.cast()) };
+  _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c))
+}
+
+/// `sum a_i * r_i` for each of `R` code rows, the codes widened to
+/// `f32`: sixteen codes per vector, four accumulators per row, masked
+/// tail. Each row is accumulated in the same order whatever `R` is, so
+/// gathered and single-row results are bit-identical.
+///
+/// # Safety
+/// The CPU supports AVX-512 F and BW; `a` and every row are valid for `n`
+/// reads.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn f32_u8_rows<const R: usize>(
+  a: *const f32,
+  rows: [*const u8; R],
+  n: usize,
+) -> [f32; R] {
+  let mut acc = [[_mm512_setzero_ps(); ACC]; R];
+  let mut j = 0;
+  while j + 16 * ACC <= n {
+    for u in 0..ACC {
+      // SAFETY: `j + 16 * u + 16 <= n`.
+      let x = unsafe { _mm512_loadu_ps(a.add(j + 16 * u)) };
+      for r in 0..R {
+        // SAFETY: as above.
+        let y = unsafe { load_u8_f32(rows[r].add(j + 16 * u)) };
+        acc[r][u] = _mm512_fmadd_ps(x, y, acc[r][u]);
+      }
+    }
+    j += 16 * ACC;
+  }
+  // Constant accumulator indices keep the accumulators in registers.
+  for u in 0..ACC - 1 {
+    if j + 16 <= n {
+      // SAFETY: `j + 16 <= n`.
+      let x = unsafe { _mm512_loadu_ps(a.add(j)) };
+      for r in 0..R {
+        // SAFETY: as above.
+        let y = unsafe { load_u8_f32(rows[r].add(j)) };
+        acc[r][u] = _mm512_fmadd_ps(x, y, acc[r][u]);
+      }
+      j += 16;
+    }
+  }
+  if j < n {
+    let m = mask16(n - j);
+    // SAFETY: masked loads access only the `n - j` in-bounds lanes; the
+    // masked-off lanes are zero and add nothing.
+    let x = unsafe { _mm512_maskz_loadu_ps(m, a.add(j)) };
+    for r in 0..R {
+      // SAFETY: as above.
+      let c = unsafe {
+        _mm512_maskz_loadu_epi8(m as __mmask64, rows[r].add(j).cast())
+      };
+      let y =
+        _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm512_castsi512_si128(c)));
+      acc[r][ACC - 1] = _mm512_fmadd_ps(x, y, acc[r][ACC - 1]);
+    }
+  }
+  let mut out = [0.0; R];
+  for r in 0..R {
+    out[r] = reduce(acc[r]);
+  }
+  out
+}
+
+/// `sum a_i * b_i` with the codes widened to `f32`.
+///
+/// # Safety
+/// The CPU supports AVX-512 F and BW; `a` and `b` are valid for `n`
+/// reads.
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn f32_u8_impl(a: *const f32, b: *const u8, n: usize) -> f32 {
+  // SAFETY: guaranteed by the caller.
+  unsafe { f32_u8_rows::<1>(a, [b], n)[0] }
 }
 
 /// Exact `i8` dot product with VNNI. `vpdpbusd` multiplies unsigned by

@@ -45,7 +45,7 @@ mod neon;
 #[cfg(test)]
 mod tests;
 
-pub use dispatch::{Isa, Kernels, kernels, kernels_for};
+pub use dispatch::{GatherFn, GatherU8Fn, Isa, Kernels, kernels, kernels_for};
 
 /// Dot product of two `f32` vectors.
 #[inline]
@@ -82,7 +82,9 @@ pub fn normalize(a: &mut [f32]) {
 pub(crate) fn finish(metric: Metric, raw: f32) -> f32 {
   match metric {
     Metric::L2 => raw,
-    Metric::Dot => -raw,
+    // `0.0 - raw`, not `-raw`: a zero dot product gives distance `+0.0`
+    // whatever its sign, so equal distances tie in every sort.
+    Metric::Dot => 0.0 - raw,
     Metric::Cosine => 1.0 - raw,
   }
 }
@@ -112,6 +114,75 @@ pub fn distance_batch(
 ) {
   debug_assert_eq!(rows.len(), query.len() * out.len());
   (kernels().distance_batch)(metric, query, rows, out)
+}
+
+/// Distances from one query to rows picked by id from a row-major array:
+/// `out[i] = distance(metric, query, row ids[i])`, where row `r` is
+/// `rows[r * query.len()..(r + 1) * query.len()]`.
+///
+/// This is graph search's inner loop: the unvisited neighbours of a node
+/// are scored together, several rows at a time with the query loaded
+/// once, while the rows of the next group are prefetched. Each `out[i]` is
+/// bit-identical to [`distance`] for that row.
+///
+/// # Panics
+/// If an id does not name a whole row of `rows`, or `out` is shorter than
+/// `ids`.
+#[inline]
+pub fn distance_gather(
+  metric: Metric,
+  query: &[f32],
+  rows: &[f32],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = query.len();
+  let n = rows.len().checked_div(dim).unwrap_or(usize::MAX);
+  assert!(out.len() >= ids.len(), "output shorter than ids");
+  assert!(
+    ids.iter().all(|&id| (id as usize) < n),
+    "row id out of range"
+  );
+  (kernels().distance_gather)(metric, query, rows, ids, &mut out[..ids.len()])
+}
+
+/// Dot product of `f32` weights with `u8` codes, each code widened to
+/// `f32`: `sum a_i * b_i`. This is the inner loop of asymmetric SQ8
+/// distances, where the query is kept in `f32` and each dimension's scale
+/// and offset are folded into the weights `a`, so codes are never decoded.
+/// Codes convert to `f32` exactly; results differ from the scalar
+/// reference only by float reassociation.
+#[inline]
+pub fn dot_f32_u8(a: &[f32], b: &[u8]) -> f32 {
+  debug_assert_eq!(a.len(), b.len());
+  (kernels().dot_f32_u8)(a, b)
+}
+
+/// [`dot_f32_u8`] of `weights` with code rows picked by id: `out[i] =
+/// dot_f32_u8(weights, row ids[i])`, where row `r` is
+/// `codes[r * weights.len()..(r + 1) * weights.len()]`. Graph search over
+/// SQ8 codes scores a node's unvisited neighbours this way, several rows
+/// per step with the weights loaded once. Each `out[i]` is bit-identical
+/// to [`dot_f32_u8`] for that row.
+///
+/// # Panics
+/// If an id does not name a whole row of `codes`, or `out` is shorter
+/// than `ids`.
+#[inline]
+pub fn dot_f32_u8_gather(
+  weights: &[f32],
+  codes: &[u8],
+  ids: &[u32],
+  out: &mut [f32],
+) {
+  let dim = weights.len();
+  let n = codes.len().checked_div(dim).unwrap_or(usize::MAX);
+  assert!(out.len() >= ids.len(), "output shorter than ids");
+  assert!(
+    ids.iter().all(|&id| (id as usize) < n),
+    "row id out of range"
+  );
+  (kernels().dot_f32_u8_gather)(weights, codes, ids, &mut out[..ids.len()])
 }
 
 /// Dot product of two `i8` vectors, accumulated exactly in `i32`.

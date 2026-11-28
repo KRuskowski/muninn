@@ -80,6 +80,23 @@ fn f16(rng: &mut Rng) -> u16 {
   muninn_simd::f32_to_f16(rng.f32())
 }
 
+/// `dot_f32_u8`: weights and codes of the same dimension.
+fn mixed(c: &mut Criterion) {
+  let mut rng = Rng(0x6a09_e667_f3bc_c908);
+  let mut g = c.benchmark_group("dot_f32_u8");
+  for dim in DIMS {
+    let a = rng.vec(dim, Rng::f32);
+    let b = rng.vec(dim, |r| r.next_u64() as u8);
+    g.throughput(Throughput::Elements(dim as u64));
+    for k in tables() {
+      let f = k.dot_f32_u8;
+      let id = BenchmarkId::new(k.isa.name(), dim);
+      g.bench_function(id, |bch| bch.iter(|| f(black_box(&a), black_box(&b))));
+    }
+  }
+  g.finish();
+}
+
 fn kernels(c: &mut Criterion) {
   for k in tables() {
     eprintln!("benchmarking {} ({})", k.isa.name(), k.features);
@@ -136,6 +153,6 @@ criterion_group! {
     .warm_up_time(Duration::from_millis(500))
     .measurement_time(Duration::from_secs(2))
     .sample_size(30);
-  targets = kernels, scan
+  targets = kernels, mixed, scan
 }
 criterion_main!(benches);

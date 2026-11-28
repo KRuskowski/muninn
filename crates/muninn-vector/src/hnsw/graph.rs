@@ -21,6 +21,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use muninn_core::DocId;
 
+use crate::dist::prefetch_lines;
 use crate::slab::Slab;
 
 /// "No node" / "no upper levels".
@@ -39,6 +40,10 @@ pub(crate) trait Neighbors: Sync {
     level: usize,
     buf: &'a mut Vec<u32>,
   ) -> &'a [u32];
+
+  /// Hints that `node`'s list at `level` will be read soon. Never faults.
+  #[inline]
+  fn prefetch(&self, _node: DocId, _level: usize) {}
 }
 
 /// Owned or mapped graph arrays.
@@ -133,6 +138,14 @@ impl Neighbors for GraphView<'_> {
       }
     }
   }
+
+  #[inline]
+  fn prefetch(&self, node: DocId, level: usize) {
+    if level == 0 {
+      let w = 1 + self.m0;
+      prefetch_lines(self.l0.as_ptr(), node as usize * w, w);
+    }
+  }
 }
 
 /// Views an exclusively borrowed `u32` slice as atomics.
@@ -223,17 +236,32 @@ impl Neighbors for BuildView<'_> {
     self.levels.len()
   }
 
+  /// Reads the list without taking the node's lock (writers still lock
+  /// each other out). A concurrent rewrite can be seen half done: the
+  /// snapshot may mix ids of the old and the new list, or repeat one, but
+  /// every id in it is a real node (slots only ever hold node ids, and
+  /// `read_record` drops anything out of range), which is all a search
+  /// needs: it skips repeats and treats the list as a hint. hnswlib locks
+  /// here; faiss does not. Skipping the lock took a tenth off build time.
+  #[inline]
   fn neighbors<'a>(
     &'a self,
     node: DocId,
     level: usize,
     buf: &'a mut Vec<u32>,
   ) -> &'a [u32] {
-    let _g = self.lock(node);
     match self.record(node, level) {
       Some((rec, cap)) => read_record(rec, cap, self.levels.len(), buf),
       None => buf.clear(),
     }
     buf
+  }
+
+  #[inline]
+  fn prefetch(&self, node: DocId, level: usize) {
+    if level == 0 {
+      let w = 1 + self.m0;
+      prefetch_lines(self.l0.as_ptr(), node as usize * w, w);
+    }
   }
 }

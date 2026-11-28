@@ -25,7 +25,7 @@ Index crates never depend on each other or on `muninn-store`. They read from a `
 - **Scores.** `Hit::score` is always higher-is-better. Indexes compute internal *distances* (lower is closer) and convert with `Metric::score`. See the table in `crates/muninn-core/src/metric.rs`.
 - **Cosine.** Vectors are normalised once at insert; the index normalises the query. Cosine search is then one dot product per candidate.
 - **Determinism.** `TopK` breaks distance ties by smaller id. Results must not depend on thread count or segment order.
-- **Filters.** Every search takes `Option<&dyn DocFilter>`. The engine passes "user filter AND NOT deleted". Indexes must apply it *during* search, not after, so that `k` results come back whenever they exist.
+- **Filters.** Every search takes `Option<&dyn DocFilter>`. The engine passes "user filter AND NOT deleted". Indexes must apply it *during* search, not after, so that `k` results come back whenever they exist. A filter may offer `DocFilter::candidates()`, a `BitSet` holding every passing id (possibly more); exact scans over a selective filter then visit only those ids. `BitSet` caches its population count, so `selectivity_hint()` is free after the first call.
 - **Errors.** `muninn_core::Error`. Never panic on bad input or bad files; panics are for broken invariants only.
 - **Files.** Every index file is a container (`muninn_core::container`): header, 64-byte-aligned sections, table and footer at the end, CRC-32C. Write it in one streaming pass; open it from a `Region` and read arrays in place with `Region::cast`. Bump your `version` on any format change. Little-endian only.
 - **Unsafe.** Allowed where it buys speed (SIMD, zero-copy casts). Every `unsafe` block has a `// SAFETY:` comment, and every SIMD path is tested against the scalar reference.
@@ -67,11 +67,13 @@ How the design above is realised; the module docs in `crates/muninn/src` hold th
 ## Component requirements
 
 ### muninn-simd
-Kernels for `dot`, `l2sq`, `distance_batch`, `dot_i8`, `l2sq_u8`, `hamming`, chosen once at runtime: AVX-512 (F/BW/VL/VNNI where useful), AVX2+FMA, NEON, scalar. Every kernel must equal the scalar reference within float reassociation tolerance for all lengths 0..=1024 and random data. Criterion benchmarks per kernel and dimension (32, 96, 128, 384, 768, 1536).
+Kernels for `dot`, `l2sq`, `distance_batch`, `dot_f32_u8` (SQ8 query x codes), `dot_i8`, `l2sq_u8`, `hamming`, chosen once at runtime: AVX-512 (F/BW/VL/VNNI where useful), AVX2+FMA, NEON, scalar. Every kernel must equal the scalar reference within float reassociation tolerance for all lengths 0..=1024 and random data. Criterion benchmarks per kernel and dimension (32, 96, 128, 384, 768, 1536).
 
 ### muninn-vector
 - `FlatIndex`: blocked, multi-threaded, filter-aware exact scan; the recall oracle.
 - HNSW: parallel batch build, incremental insert, filter-aware search (keep traversing through filtered-out nodes; fall back to brute force when the filter is very selective), configurable `M`, `ef_construction` and `ef`. Graph stored as flat arrays (fixed-width level-0 adjacency) so it serialises as container sections and opens zero-copy.
+- Quantised codes (SQ8): ranges are fitted on clipped per-dimension quantiles of a hashed row sample and checked on a second sample; vectors far outside the ranges are marked and scored at full precision, and if the bulk itself cannot be resolved every vector is (`HnswStats::exact_rows`). Large builds search with such codes while linking (re-scored exactly before neighbour selection), or with full vectors when SQ8 cannot stand in for them.
+- HNSW node order (format version 3): a bulk build into an empty index renumbers its nodes breadth-first for memory locality and keeps an internal/external id map inside the index, so callers (the engine) see exactly the `DocId`s they inserted. Nodes inserted later keep equal ids. Version 1 and 2 files still open; at open the maps are checked to be inverse permutations (one O(n) pass), else the file is rejected as corrupt. Ties: results tie-break on the caller's id over everything the beam found, but the beam itself (`ef` candidates) is ordered by internal id, so when more than `ef` vectors are exactly equidistant at the cut-off, which of them reach the results depends on the node order. Distances and scores are never `-0.0` (a zero inner product gives distance `+0.0`, a zero distance scores `+0.0`), so zeros tie like any equal values in results, `TopK` and the engine's merge.
 - Quantisation: SQ8 (per-dimension min/max to u8 or i8) and binary (sign bits, Hamming), each with full-precision re-ranking.
 - Recall tests against `FlatIndex` on clustered synthetic data.
 

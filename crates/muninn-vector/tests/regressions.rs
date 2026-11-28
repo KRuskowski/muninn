@@ -242,17 +242,140 @@ fn scores_consistent_flat_vs_hnsw() {
   }
 }
 
-/// Format version 2 adds the protected-edge section; version 1 files
-/// (without it) still open, unknown versions do not.
+/// Format version 2 adds the protected-edge section and version 3 the
+/// node-order maps; version 1 and 2 files (without them) still open,
+/// unknown versions do not.
 #[test]
 fn hnsw_format_versions() {
   let d = data(200, 4);
   let idx = HnswIndex::build(4, Metric::L2, HnswParams::default(), &d).unwrap();
   let buf = idx.write_to(AlignedBuf::new()).unwrap();
-  for (version, ok) in [(1u32, true), (2, true), (3, false), (0, false)] {
+  for (version, ok) in
+    [(1u32, true), (2, true), (3, true), (4, false), (0, false)]
+  {
     let mut b = buf.clone();
     b.as_mut_slice()[16..20].copy_from_slice(&version.to_le_bytes());
     let r = HnswIndex::open(Region::new(b));
     assert_eq!(r.is_ok(), ok, "version {version}");
+  }
+}
+
+/// Review of the node-order maps: a file whose maps are not inverse
+/// permutations must be rejected at open. Before the check, an
+/// out-of-range `ext` entry came back as a hit id, a duplicated one gave
+/// duplicate hits, a swap gave silently wrong ids, and an out-of-range
+/// `int` entry made `vector(id)` panic.
+#[test]
+fn corrupt_order_maps_are_rejected() {
+  let (n, dim) = (500usize, 8);
+  let d = data(n, dim);
+  let idx =
+    HnswIndex::build(dim, Metric::L2, HnswParams::default(), &d).unwrap();
+  let buf = idx.write_to(AlignedBuf::new()).unwrap();
+  assert!(HnswIndex::open(Region::new(buf.clone())).is_ok());
+  type Edit<'a> = Box<dyn Fn(usize, u32) -> u32 + 'a>;
+  let cases: Vec<(&str, &str, Edit<'_>)> = vec![
+    (
+      "ext",
+      "out of range",
+      Box::new(|i, v| if i == 0 { 1 << 30 } else { v }),
+    ),
+    (
+      "ext",
+      "duplicate",
+      Box::new(|i, v| if i <= 1 { 0 } else { v }),
+    ),
+    (
+      "ext",
+      "swap",
+      Box::new(|i, v| match i {
+        0 => 1,
+        1 => 0,
+        _ => v,
+      }),
+    ),
+    (
+      "int",
+      "out of range",
+      Box::new(move |i, v| if i < n { (1 << 30) + i as u32 } else { v }),
+    ),
+  ];
+  for (sec, what, f) in cases {
+    let mut b = buf.clone();
+    let r = section_range(&b, sec);
+    let before = b.as_slice()[r.clone()].to_vec();
+    edit_u32s(&mut b.as_mut_slice()[r.clone()], f);
+    assert_ne!(b.as_slice()[r].to_vec(), before, "{sec} {what}: no edit");
+    let res = HnswIndex::open(Region::new(b));
+    assert!(res.is_err(), "{sec} {what}: opened");
+  }
+}
+
+/// A filter whose selectivity hint overestimates (deletes concentrated in
+/// the selection, say) sends a search to the graph; while fewer than `ef`
+/// documents pass, the beam's threshold stays infinite and it used to
+/// walk every reachable node before giving up. The observed pass rate now
+/// stops the walk early and the filter's id set is scanned instead.
+#[test]
+fn overestimated_hint_does_not_walk_the_whole_graph() {
+  use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+  struct Lying {
+    bits: BitSet,
+    calls: AtomicUsize,
+  }
+  impl DocFilter for Lying {
+    fn matches(&self, id: DocId) -> bool {
+      self.calls.fetch_add(1, Relaxed);
+      self.bits.contains(id)
+    }
+    fn selectivity_hint(&self) -> Option<f32> {
+      Some(0.5)
+    }
+    fn candidates(&self) -> Option<&BitSet> {
+      Some(&self.bits)
+    }
+  }
+  let (n, dim) = (20_000, 16);
+  let d = data(n, dim);
+  let idx =
+    HnswIndex::build(dim, Metric::L2, HnswParams::default(), &d).unwrap();
+  let mut bits = BitSet::new(n);
+  for id in (5..n as DocId).step_by(400) {
+    bits.insert(id);
+  }
+  let f = Lying {
+    bits,
+    calls: AtomicUsize::new(0),
+  };
+  let flat = FlatIndex::from_vectors(dim, Metric::L2, &d).unwrap();
+  for q in d.chunks_exact(dim).step_by(997).take(10) {
+    f.calls.store(0, Relaxed);
+    let sp = SearchParams::new(10);
+    let got = idx.search(q, &sp, Some(&f)).unwrap();
+    let calls = f.calls.load(Relaxed);
+    assert!(calls < n / 4, "{calls} filter checks for {n} documents");
+    assert_eq!(got, flat.search(q, &sp, Some(&f.bits)).unwrap());
+  }
+}
+
+/// Distances of `+0.0` and `-0.0` (inner product of orthogonal vectors,
+/// with or without a negative zero) tie, so the smaller id ranks first.
+#[test]
+fn negative_zero_distances_tie() {
+  let d = [-0.0f32, 0.0, 0.0, -0.0];
+  for metric in [Metric::Dot, Metric::L2] {
+    let flat = FlatIndex::from_vectors(1, metric, &d).unwrap();
+    let hnsw = HnswIndex::build(1, metric, HnswParams::default(), &d).unwrap();
+    let q = if metric == Metric::Dot {
+      [1.0f32]
+    } else {
+      [0.0]
+    };
+    for idx in [&flat as &dyn VectorIndex, &hnsw] {
+      let hits = idx.search(&q, &SearchParams::new(4), None).unwrap();
+      let ids: Vec<DocId> = hits.iter().map(|h| h.id).collect();
+      assert_eq!(ids, vec![0, 1, 2, 3], "{metric:?}");
+      assert!(hits.iter().all(|h| h.score.to_bits() == 0), "{hits:?}");
+    }
   }
 }

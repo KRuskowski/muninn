@@ -147,6 +147,12 @@ pub struct HnswRun {
   pub work_dir: PathBuf,
   /// Where result JSON goes.
   pub out_dir: PathBuf,
+  /// Keep the built index here; reuse it instead of building when it
+  /// already holds a readable index with the same parameters.
+  pub reuse_index: Option<PathBuf>,
+  /// Search a copy of the index file in anonymous memory rather than the
+  /// mapped file.
+  pub in_memory: bool,
 }
 
 fn engine_name(q: Quantization) -> &'static str {
@@ -232,10 +238,38 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
     .with_ef_construction(cfg.ef_construction);
   let rss0 = rss_bytes();
   let t = Instant::now();
-  let mut built = pools
-    .all
-    .install(|| HnswIndex::build(ds.dim(), metric, params, &ds.base.data))?;
-  let build_s = t.elapsed().as_secs_f64();
+  let reused = cfg
+    .reuse_index
+    .as_deref()
+    .filter(|p| p.exists())
+    .and_then(|p| HnswIndex::open(map_file(p).ok()?).ok())
+    .filter(|i| {
+      i.len() == ds.base.rows
+        && i.params().m == cfg.m
+        && i.params().ef_construction == cfg.ef_construction
+        && i.params().quantization == Quantization::None
+    });
+  let was_reused = reused.is_some();
+  let mut built = match reused {
+    Some(i) => i,
+    None => {
+      let b = pools.all.install(|| {
+        HnswIndex::build(ds.dim(), metric, params, &ds.base.data)
+      })?;
+      if let Some(p) = &cfg.reuse_index {
+        write_file(p, |w| b.write_to(w))?;
+      }
+      b
+    }
+  };
+  let build_s = if was_reused {
+    0.0
+  } else {
+    t.elapsed().as_secs_f64()
+  };
+  if was_reused {
+    eprintln!("  reused the index in {:?}", cfg.reuse_index);
+  }
   let rss_build = rss_delta(rss0, rss_bytes());
   let st = built.stats();
   eprintln!(
@@ -258,14 +292,28 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
       cfg.m, cfg.ef_construction
     ));
     let (write_s, bytes) = write_file(&file, |w| built.write_to(w))?;
-    let opened = HnswIndex::open(map_file(&file)?)?;
+    let region = if cfg.in_memory {
+      let bytes = std::fs::read(&file)?;
+      let mut buf = muninn_core::AlignedBuf::with_capacity(bytes.len());
+      buf.extend_from_slice(&bytes);
+      muninn_core::Region::new(buf)
+    } else {
+      map_file(&file)?
+    };
+    let opened = HnswIndex::open(region)?;
     eprintln!(
       "  {engine}: quantiser {quant_s:.2} s, file {:.1} MB written in \
        {write_s:.2} s",
       bytes as f64 / 1e6
     );
-    let results = sweep(&opened, &qs, &ds, cfg.k, &cfg.efs, cfg.runs, pools)?;
     let stats = opened.stats();
+    if q != Quantization::None {
+      eprintln!(
+        "  {engine}: {} vectors scored at full precision",
+        stats.exact_rows
+      );
+    }
+    let results = sweep(&opened, &qs, &ds, cfg.k, &cfg.efs, cfg.runs, pools)?;
     drop(opened);
     let report = VectorReport {
       kind: "vector",
@@ -297,6 +345,7 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
           "vector_bytes": stats.vector_bytes,
           "graph_bytes": stats.graph_bytes,
           "code_bytes": stats.code_bytes,
+          "exact_rows": stats.exact_rows,
           "max_level": stats.max_level,
           "avg_level0_degree": stats.avg_degree,
         }),
@@ -304,7 +353,11 @@ pub fn run_hnsw(cfg: &HnswRun, pools: &Pools) -> Result<Vec<PathBuf>> {
       results,
       system: SystemInfo::collect(),
       notes: vec![
-        "Searched from the memory-mapped index file.".into(),
+        if cfg.in_memory {
+          "Searched from an in-memory copy of the index file.".into()
+        } else {
+          "Searched from the memory-mapped index file.".into()
+        },
         "Graph built in parallel with all threads; queries measured one \
          at a time on one thread, and spread over all threads."
           .into(),
@@ -608,6 +661,8 @@ pub(crate) mod tests {
       runs: 1,
       work_dir: root.join("work"),
       out_dir: root.join("out"),
+      reuse_index: None,
+      in_memory: false,
     };
     let files = run_hnsw(&cfg, &pools).unwrap();
     assert_eq!(files.len(), 2);

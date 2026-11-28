@@ -67,6 +67,14 @@ impl Isa {
   }
 }
 
+/// Signature of [`Kernels::distance_gather`]: metric, query, rows, ids,
+/// output.
+pub type GatherFn = fn(Metric, &[f32], &[f32], &[u32], &mut [f32]);
+
+/// Signature of [`Kernels::dot_f32_u8_gather`]: weights, codes, ids,
+/// output.
+pub type GatherU8Fn = fn(&[f32], &[u8], &[u32], &mut [f32]);
+
 /// Function pointers to one instruction set's kernels.
 ///
 /// Every field has the contract of the free function of the same name in
@@ -87,6 +95,16 @@ pub struct Kernels {
   pub l2sq: fn(&[f32], &[f32]) -> f32,
   /// See [`crate::distance_batch`].
   pub distance_batch: fn(Metric, &[f32], &[f32], &mut [f32]),
+  /// See [`crate::distance_gather`], which checks its arguments; called
+  /// directly, an id that does not name a whole row scores NaN, and ids
+  /// beyond `out` are ignored.
+  pub distance_gather: GatherFn,
+  /// See [`crate::dot_f32_u8`].
+  pub dot_f32_u8: fn(&[f32], &[u8]) -> f32,
+  /// See [`crate::dot_f32_u8_gather`], which checks its arguments; called
+  /// directly, an id that does not name a whole row scores NaN, and ids
+  /// beyond `out` are ignored.
+  pub dot_f32_u8_gather: GatherU8Fn,
   /// See [`crate::dot_i8`].
   pub dot_i8: fn(&[i8], &[i8]) -> i32,
   /// See [`crate::l2sq_u8`].
@@ -109,6 +127,9 @@ pub(crate) static SCALAR: Kernels = Kernels {
   dot: scalar::dot,
   l2sq: scalar::l2sq,
   distance_batch: scalar::distance_batch,
+  distance_gather: scalar::distance_gather,
+  dot_f32_u8: scalar::dot_f32_u8,
+  dot_f32_u8_gather: scalar::dot_f32_u8_gather,
   dot_i8: scalar::dot_i8,
   l2sq_u8: scalar::l2sq_u8,
   hamming: scalar::hamming,

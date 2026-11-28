@@ -332,6 +332,20 @@ impl DocFilter for SourceFilter<'_> {
     d < self.len && !self.tomb.contains(d) && self.sel.matches(d)
   }
 
+  /// The selection's id set when it has one (alone, or as one term of an
+  /// AND): every passing doc is in it, so exact scans over a selective
+  /// filter visit only its ids.
+  fn candidates(&self) -> Option<&BitSet> {
+    match self.sel {
+      Selection::Bits(b, _) => Some(b),
+      Selection::And(parts) => parts.iter().find_map(|p| match p {
+        Selection::Bits(b, _) => Some(b),
+        _ => None,
+      }),
+      _ => None,
+    }
+  }
+
   fn selectivity_hint(&self) -> Option<f32> {
     let live = if self.len == 0 {
       0.0
@@ -342,6 +356,47 @@ impl DocFilter for SourceFilter<'_> {
       Selection::All => Some(live),
       // Assume deletes are independent of the selection.
       s => s.hint(self.len).map(|h| h * live),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The engine's per-source filter hands its id set to the index (so a
+  /// selective filter is scanned by its ids), and every doc that passes
+  /// is in that set.
+  #[test]
+  fn source_filter_offers_its_id_set() {
+    let len = 200u32;
+    let mut b = BitSet::new(len as usize);
+    for d in [3, 70, 150] {
+      b.insert(d);
+    }
+    let mut tomb = BitSet::new(len as usize);
+    tomb.insert(70);
+    let bits = Selection::bits(b.clone());
+    let and = Selection::and(vec![
+      Selection::bits(b.clone()),
+      Selection::Pred(Box::new(|d| d != 150)),
+    ]);
+    let pred = Selection::Pred(Box::new(|d| d % 2 == 0));
+    for (sel, has) in [(&bits, true), (&and, true), (&pred, false)] {
+      let f = SourceFilter {
+        sel,
+        tomb: &tomb,
+        deleted: 1,
+        len,
+      };
+      match f.candidates() {
+        Some(c) => {
+          assert!(has);
+          assert_eq!(c, &b);
+          assert!((0..len).filter(|&d| f.matches(d)).all(|d| c.contains(d)));
+        }
+        None => assert!(!has),
+      }
     }
   }
 }
