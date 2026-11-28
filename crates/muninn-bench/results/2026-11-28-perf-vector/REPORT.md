@@ -85,3 +85,16 @@
 | 256 | 0.9070: 2,355/6,076 | 0.9072: 2,011/5,060 | 0.9085: 1,940/4,757 | 0.9049: 2,098/4,943 | 0.9172: 4,981/13,656 | 0.9170: 2,217/5,185 |
 | 384 | 0.9222: 1,634/4,227 | 0.9219: 1,394/3,551 | 0.9233: 1,312/3,284 | 0.9213: 1,466/3,392 | 0.9316: 3,364/9,187 | 0.9313: 1,471/3,521 |
 | 512 | 0.9316: 1,257/3,230 | 0.9319: 1,062/2,663 | 0.9327: 989/2,475 | 0.9311: 1,081/2,570 | 0.9405: 2,515/6,825 | 0.9408: 1,107/2,657 |
+
+## Re-check after the review fixes (3b98953)
+
+The review fixes (outlier-robust build codes with a quality check, order-map validation at open, Dot always re-prunes, engine filters offering their id set) were re-measured once on SIFT and GloVe, muninn only, same VM and pinning, fresh builds, 3 runs per point. The competitor rows above are from the earlier session and were not re-run. Files: `*__after-review-3b98953.json`.
+
+| engine | build s | r>=0.8 | r>=0.9 | r>=0.95 | r>=0.98 | r>=0.99 |
+|---|---|---|---|---|---|---|
+| SIFT muninn-hnsw | 63.2 | 33,193 (16) / 87,824 (16) | 20,434 (32) / 54,473 (32) | 14,925 (48) / 39,902 (48) | 8,433 (96) / 22,565 (96) | 6,616 (128) / 17,580 (128) |
+| SIFT muninn-hnsw-sq8 | 63.6 | 29,171 (24) / 82,190 (24) | 29,171 (24) / 82,190 (24) | 25,186 (48) / 71,977 (48) | 14,628 (96) / 41,482 (96) | 11,576 (128) / 33,166 (128) |
+| GloVe muninn-hnsw | 122.8 | 6,669 (96) / 17,699 (96) | 1,919 (384) / 5,185 (384) | - | - | - |
+| GloVe muninn-hnsw-sq8 | 123.2 | 10,714 (96) / 27,931 (96) | 3,150 (384) / 8,318 (384) | - | - | - |
+
+Recall at equal `ef` is unchanged within build-to-build variation (SIFT ef 128: 0.9918 both runs; GloVe ef 384: 0.9185 vs 0.9198).
