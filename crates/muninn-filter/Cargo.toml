@@ -1,0 +1,27 @@
+[package]
+name = "muninn-filter"
+description = "Payload filters for muninn: filter language and payload indexes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+muninn-core.workspace = true
+serde = "1"
+# Correctly rounded float parsing: filter values and payload numbers
+# must survive a JSON text round trip bit for bit, or `eq` misses.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+[[bench]]
+name = "filter"
+harness = false
+
+[lints]
+workspace = true
