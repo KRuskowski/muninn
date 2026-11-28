@@ -340,3 +340,81 @@ fn damaged_log_refuses_to_open_instead_of_losing_writes() {
     assert_eq!(version(&db.collection("ok").unwrap(), 1), Some(1));
   }
 }
+
+/// CPU time (user + system, in clock ticks) of this process's thread
+/// named `name`.
+#[cfg(target_os = "linux")]
+fn thread_ticks(name: &str) -> u64 {
+  for e in std::fs::read_dir("/proc/self/task").unwrap() {
+    let p = e.unwrap().path();
+    let comm = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+    if comm.trim() != name {
+      continue;
+    }
+    let stat = std::fs::read_to_string(p.join("stat")).unwrap();
+    // Fields after the parenthesised name: state is field 3, utime 14,
+    // stime 15.
+    let rest = &stat[stat.rfind(')').unwrap() + 2..];
+    let f: Vec<&str> = rest.split(' ').collect();
+    return f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap();
+  }
+  panic!("no thread named {name}");
+}
+
+/// Segments waiting for a graph are merged once writes pause for
+/// `merge_idle_delay`. While writes go on, the background worker must
+/// sleep, not poll, also with a zero delay (which merges at once).
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_merge_wait_does_not_spin_under_writes() {
+  for delay in [Duration::ZERO, Duration::from_micros(1)] {
+    let dir = TestDir::new("idle-spin");
+    let opts = Options {
+      durability: Durability::NoSync,
+      memtable_max_docs: 1_000_000,
+      hnsw_min_docs: 50,
+      merge_idle_delay: delay,
+      ..Options::default()
+    };
+    let db = Database::open(dir.path(), opts).unwrap();
+    let field = muninn::VectorField::hnsw(4, muninn::Metric::L2);
+    let c = db.create_collection("s", Schema::vector(field)).unwrap();
+    let vdoc = |id: u64| {
+      Document::new(id).vector(vec![id as f32, 1.0, 2.0, (id % 7) as f32])
+    };
+    // A graph segment, then a small graphless one that waits for a merge.
+    c.upsert(&(0..100).map(vdoc).collect::<Vec<_>>()).unwrap();
+    c.flush().unwrap();
+    // Deletes of unknown ids: a steady stream of writes that adds no
+    // documents and fills no memtable.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..3)
+      .map(|_| {
+        let (c, stop) = (c.clone(), stop.clone());
+        std::thread::spawn(move || {
+          while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            c.delete(&[Id::U64(u64::MAX)]).unwrap();
+          }
+        })
+      })
+      .collect();
+    c.upsert(&(100..110).map(vdoc).collect::<Vec<_>>()).unwrap();
+    c.flush().unwrap();
+    let before = thread_ticks("muninn-s");
+    std::thread::sleep(Duration::from_millis(500));
+    let used = thread_ticks("muninn-s") - before;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+      w.join().unwrap();
+    }
+    // 100 ticks per second on Linux: a spinning worker uses about 50.
+    assert!(used < 15, "{delay:?}: worker used {used} ticks in 0.5 s");
+    if delay.is_zero() {
+      let st = c.stats().unwrap();
+      assert!(
+        st.segments.iter().all(|s| s.vector_index == "hnsw"),
+        "{st:?}"
+      );
+    }
+  }
+}

@@ -3,8 +3,10 @@ use std::fmt;
 /// Result alias used across muninn.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Every error muninn reports.
+/// Every error muninn reports. More kinds may be added in later
+/// versions, so a `match` on it needs a catch-all arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
   /// An operating system I/O error.
   Io(std::io::Error),
@@ -18,6 +20,10 @@ pub enum Error {
   NotFound(String),
   /// A named thing already exists.
   AlreadyExists(String),
+  /// The target cannot serve the request right now, for example a
+  /// collection that refuses writes after a background failure until it
+  /// is reopened. Retrying after recovery may succeed.
+  Unavailable(String),
 }
 
 impl Error {
@@ -42,6 +48,7 @@ impl fmt::Display for Error {
       ),
       Self::NotFound(m) => write!(f, "not found: {m}"),
       Self::AlreadyExists(m) => write!(f, "already exists: {m}"),
+      Self::Unavailable(m) => write!(f, "unavailable: {m}"),
     }
   }
 }

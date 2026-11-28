@@ -188,3 +188,31 @@ fn leftovers_of_drops_are_swept_at_open() {
   // The marked name is free again.
   db.create_collection("marked", schema()).unwrap();
 }
+
+#[test]
+fn delete_counted_reports_documents_that_existed() {
+  let dir = TestDir::new("delete-count");
+  let db = Database::open(dir.path(), Options::default()).unwrap();
+  let c = db.create_collection("c", Schema::text(["body"])).unwrap();
+  let doc = |id: u64| Document::new(id).text("body", format!("doc {id}"));
+  c.upsert(&[doc(1), doc(2), doc(3)]).unwrap();
+  c.flush().unwrap();
+  c.upsert(&[doc(4), doc(1)]).unwrap();
+  let ids = |v: &[u64]| v.iter().map(|&i| Id::U64(i)).collect::<Vec<_>>();
+  // 1 (replaced, in memory), 2 (in a segment), 9 missing, 1 again.
+  assert_eq!(c.delete_counted(&ids(&[1, 2, 9, 1])).unwrap(), 2);
+  assert_eq!(c.delete_counted(&ids(&[1, 2])).unwrap(), 0);
+  assert_eq!(c.delete_counted(&[]).unwrap(), 0);
+  c.delete(&ids(&[3])).unwrap();
+  assert_eq!(c.stats().unwrap().live_docs, 1);
+}
+
+#[test]
+fn schema_json_round_trips_through_the_public_api() {
+  let s = schema();
+  assert_eq!(Schema::from_json(&s.to_json()).unwrap(), s);
+  assert!(matches!(
+    Schema::from_json(&json!({"text_fields": "body"})),
+    Err(Error::InvalidArgument(_))
+  ));
+}
