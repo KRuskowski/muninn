@@ -1,0 +1,282 @@
+{
+  "kind": "vector",
+  "engine": "faiss-hnsw",
+  "engine_version": "1.16.0",
+  "dataset": {
+    "name": "nytimes-256-angular",
+    "metric": "cosine",
+    "n": 290000,
+    "dim": 256,
+    "queries": 10000,
+    "meta": {
+      "n": 290000,
+      "dim": 256,
+      "queries": 10000,
+      "gt_k": 100,
+      "sources": [
+        {
+          "url": "http://ann-benchmarks.com/nytimes-256-angular.hdf5",
+          "file": "nytimes-256-angular.hdf5",
+          "bytes": 315208288,
+          "sha256": "6ad5d2cde6d6a6f21528d541901304ebfd40885d6ce6afae37bccbe278254a93",
+          "verified": true
+        }
+      ],
+      "files": {
+        "base.fbin": {
+          "bytes": 296960008,
+          "sha256": "41946febafc33e004f4b74527a2da28e7d6ad2d652cc6d970c250fb54ea3474c"
+        },
+        "query.fbin": {
+          "bytes": 10240008,
+          "sha256": "672baa6adc1cf21d056f93d1b396b7efcbbcdef323d8a46cbe94c0bcb8e21af0"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "279a85141e96744df0d7bc624c43015d7f5b3e93ff3aac9bd177c051461a5d3e"
+        }
+      },
+      "prepared": "2026-11-27T23:38:42Z",
+      "origin": "ann-benchmarks",
+      "source_distance": "angular"
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "metric": "inner_product",
+    "compile_options": "OPTIMIZE DD AVX2 AVX512 AVX512_SPR AVX512_VPOPCNT "
+  },
+  "build": {
+    "seconds": 55.28088183500222,
+    "threads": 4,
+    "index_bytes": 338802554,
+    "rss_delta_bytes": 351858688,
+    "peak_rss_bytes": 713007104,
+    "details": {
+      "write_seconds": 1.071434022000176
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.60811,
+      "qps_1t": 27294.851412269396,
+      "qps_nt": 63218.6774322352,
+      "latency": {
+        "mean_us": 40.4616755,
+        "p50_us": 38.289,
+        "p95_us": 62.016,
+        "p99_us": 73.837,
+        "max_us": 105.57
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 3.8247293999568654
+    },
+    {
+      "ef": 16,
+      "recall": 0.69222,
+      "qps_1t": 19665.19420846866,
+      "qps_nt": 44324.0982138486,
+      "latency": {
+        "mean_us": 55.049090400000004,
+        "p50_us": 52.032,
+        "p95_us": 83.753,
+        "p99_us": 99.797,
+        "max_us": 144.044
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 4.197825500243361
+    },
+    {
+      "ef": 24,
+      "recall": 0.75231,
+      "qps_1t": 14459.739711240662,
+      "qps_nt": 32931.897889293235,
+      "latency": {
+        "mean_us": 73.12890230000001,
+        "p50_us": 69.247,
+        "p95_us": 110.023,
+        "p99_us": 130.579,
+        "max_us": 277.161
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 3.9713641997378346
+    },
+    {
+      "ef": 32,
+      "recall": 0.784,
+      "qps_1t": 11503.086609431779,
+      "qps_nt": 26662.49921155483,
+      "latency": {
+        "mean_us": 92.72001540000001,
+        "p50_us": 88.535,
+        "p95_us": 137.724,
+        "p99_us": 162.86,
+        "max_us": 220.789
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 5.786826600042147
+    },
+    {
+      "ef": 48,
+      "recall": 0.82162,
+      "qps_1t": 8389.899820768338,
+      "qps_nt": 19570.558613636334,
+      "latency": {
+        "mean_us": 126.0540548,
+        "p50_us": 121.455,
+        "p95_us": 182.659,
+        "p99_us": 215.337,
+        "max_us": 286.238
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 6.863120299852298
+    },
+    {
+      "ef": 64,
+      "recall": 0.84278,
+      "qps_1t": 6689.21665818815,
+      "qps_nt": 15691.726246217562,
+      "latency": {
+        "mean_us": 157.9451499,
+        "p50_us": 153.807,
+        "p95_us": 222.965,
+        "p99_us": 261.048,
+        "max_us": 349.352
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 8.450814300043305
+    },
+    {
+      "ef": 96,
+      "recall": 0.86654,
+      "qps_1t": 4732.463343491071,
+      "qps_nt": 11186.55755587134,
+      "latency": {
+        "mean_us": 221.4949902,
+        "p50_us": 218.543,
+        "p95_us": 299.373,
+        "p99_us": 350.316,
+        "max_us": 452.239
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 10.18854630004276
+    },
+    {
+      "ef": 128,
+      "recall": 0.88094,
+      "qps_1t": 3605.4815488750314,
+      "qps_nt": 8801.183119801655,
+      "latency": {
+        "mean_us": 285.7746738,
+        "p50_us": 285.225,
+        "p95_us": 376.787,
+        "p99_us": 429.107,
+        "max_us": 583.726
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 8.419211999892866
+    },
+    {
+      "ef": 192,
+      "recall": 0.89802,
+      "qps_1t": 2537.0246534309213,
+      "qps_nt": 6181.092317486534,
+      "latency": {
+        "mean_us": 407.7854309,
+        "p50_us": 412.972,
+        "p95_us": 518.698,
+        "p99_us": 568.817,
+        "max_us": 716.531
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 13.622923000181402
+    },
+    {
+      "ef": 256,
+      "recall": 0.90854,
+      "qps_1t": 1939.675545110483,
+      "qps_nt": 4757.062464207428,
+      "latency": {
+        "mean_us": 528.7975772000001,
+        "p50_us": 541.289,
+        "p95_us": 656.787,
+        "p99_us": 708.589,
+        "max_us": 881.478
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 13.247436600047081
+    },
+    {
+      "ef": 384,
+      "recall": 0.92326,
+      "qps_1t": 1312.2935717843511,
+      "qps_nt": 3284.2824738657364,
+      "latency": {
+        "mean_us": 772.9938498,
+        "p50_us": 799.567,
+        "p95_us": 938.586,
+        "p99_us": 991.814,
+        "max_us": 1146.299
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 10.969237700223744
+    },
+    {
+      "ef": 512,
+      "recall": 0.93268,
+      "qps_1t": 989.2278181175127,
+      "qps_nt": 2474.7735682470766,
+      "latency": {
+        "mean_us": 1017.5233618,
+        "p50_us": 1055.831,
+        "p95_us": 1222.171,
+        "p99_us": 1277.718,
+        "max_us": 1492.261
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 6.633876400179133
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": null,
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": null,
+    "git_commit": null,
+    "rustflags": null,
+    "rustc": null,
+    "label": null,
+    "python": "3.11.2",
+    "numpy": "2.4.6",
+    "timestamp": 1795842852
+  },
+  "notes": [
+    "faiss IndexHNSWFlat from the faiss-cpu wheel.",
+    "Cosine: base and query vectors are L2-normalised with numpy before (outside) the timed regions.",
+    "qps_1t: one batch call with one thread; latency: one call per query, including the Python call (see python_call_overhead_us)."
+  ]
+}

@@ -1,0 +1,275 @@
+{
+  "kind": "vector",
+  "engine": "muninn-hnsw-sq8",
+  "engine_version": "0.1.0",
+  "dataset": {
+    "name": "glove-100-angular",
+    "metric": "cosine",
+    "n": 1183514,
+    "dim": 100,
+    "queries": 10000,
+    "meta": {
+      "dim": 100,
+      "files": {
+        "base.fbin": {
+          "bytes": 473405608,
+          "sha256": "e2fdc4d26bf3156a47f0baecbf7d61a58671f92b851e52040a67c8593546219e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "3f43ac9b7edd0b06b197c3e86615d94a333a8994bbd6f50e339ac98234890e43"
+        },
+        "query.fbin": {
+          "bytes": 4000008,
+          "sha256": "9fe959d97e44ccd8fefb889499a06bf9222c0493536c7f585ae103ea52987d3b"
+        }
+      },
+      "gt_k": 100,
+      "n": 1183514,
+      "origin": "ann-benchmarks",
+      "prepared": "2026-11-27T23:38:42Z",
+      "queries": 10000,
+      "source_distance": "angular",
+      "sources": [
+        {
+          "bytes": 485413888,
+          "file": "glove-100-angular.hdf5",
+          "sha256": "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4",
+          "url": "http://ann-benchmarks.com/glove-100-angular.hdf5",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "quantization": "Sq8",
+    "rerank": 40
+  },
+  "build": {
+    "seconds": 127.121559722,
+    "threads": 4,
+    "index_bytes": 773470456,
+    "rss_delta_bytes": 683446272,
+    "peak_rss_bytes": 2067595264,
+    "details": {
+      "avg_level0_degree": 26,
+      "code_bytes": 118352200,
+      "graph_bytes": 167509610,
+      "graph_seconds": 126.737468013,
+      "max_level": 5,
+      "quantizer_seconds": 0.384091709,
+      "vector_bytes": 473405600,
+      "write_seconds": 3.062832193
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.72383,
+      "qps_1t": 19643.68917235885,
+      "qps_nt": 54564.43979584518,
+      "latency": {
+        "mean_us": 50.8587925,
+        "p50_us": 49.131,
+        "p95_us": 71.069,
+        "p99_us": 83.318,
+        "max_us": 187.101
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 16,
+      "recall": 0.72383,
+      "qps_1t": 19555.668842848874,
+      "qps_nt": 54186.79265746201,
+      "latency": {
+        "mean_us": 51.08797250000001,
+        "p50_us": 49.295,
+        "p95_us": 71.533,
+        "p99_us": 84.232,
+        "max_us": 241.56
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 24,
+      "recall": 0.72383,
+      "qps_1t": 19260.60698527862,
+      "qps_nt": 54806.17188962726,
+      "latency": {
+        "mean_us": 51.8709154,
+        "p50_us": 50.102,
+        "p95_us": 72.547,
+        "p99_us": 84.733,
+        "max_us": 155.968
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 32,
+      "recall": 0.72383,
+      "qps_1t": 19110.921700642702,
+      "qps_nt": 54550.09606435567,
+      "latency": {
+        "mean_us": 52.2785444,
+        "p50_us": 50.546,
+        "p95_us": 72.97,
+        "p99_us": 85.189,
+        "max_us": 177.471
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 48,
+      "recall": 0.74595,
+      "qps_1t": 16720.9524370886,
+      "qps_nt": 47474.14342141917,
+      "latency": {
+        "mean_us": 59.755326800000006,
+        "p50_us": 58.038,
+        "p95_us": 82.205,
+        "p99_us": 96.007,
+        "max_us": 147.689
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 64,
+      "recall": 0.77974,
+      "qps_1t": 14537.737808496793,
+      "qps_nt": 33518.675295294335,
+      "latency": {
+        "mean_us": 68.7341514,
+        "p50_us": 67.287,
+        "p95_us": 93.343,
+        "p99_us": 109.934,
+        "max_us": 152.724
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 96,
+      "recall": 0.82117,
+      "qps_1t": 9151.824818317195,
+      "qps_nt": 24964.79514518217,
+      "latency": {
+        "mean_us": 109.2122621,
+        "p50_us": 107.6,
+        "p95_us": 148.423,
+        "p99_us": 172.797,
+        "max_us": 235.392
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 128,
+      "recall": 0.84624,
+      "qps_1t": 6969.206174333922,
+      "qps_nt": 19613.541601790792,
+      "latency": {
+        "mean_us": 143.4325124,
+        "p50_us": 141.753,
+        "p95_us": 194.202,
+        "p99_us": 221.996,
+        "max_us": 312.971
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 192,
+      "recall": 0.87809,
+      "qps_1t": 4748.542113403276,
+      "qps_nt": 14033.660166145231,
+      "latency": {
+        "mean_us": 210.52929509999998,
+        "p50_us": 210.637,
+        "p95_us": 278.655,
+        "p99_us": 310.031,
+        "max_us": 417.221
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 256,
+      "recall": 0.89673,
+      "qps_1t": 3942.8643998905814,
+      "qps_nt": 11217.25657007505,
+      "latency": {
+        "mean_us": 253.554498,
+        "p50_us": 253.54,
+        "p95_us": 337.572,
+        "p99_us": 371.434,
+        "max_us": 472.191
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 384,
+      "recall": 0.9197,
+      "qps_1t": 2755.61802610205,
+      "qps_nt": 8128.032521181462,
+      "latency": {
+        "mean_us": 362.8096803,
+        "p50_us": 364.757,
+        "p95_us": 482.835,
+        "p99_us": 522.659,
+        "max_us": 627.362
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 512,
+      "recall": 0.93428,
+      "qps_1t": 2281.8593448742618,
+      "qps_nt": 6187.793144805223,
+      "latency": {
+        "mean_us": 438.1503003,
+        "p50_us": 440.774,
+        "p95_us": 580.094,
+        "p99_us": 620.626,
+        "max_us": 746.132
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": null,
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": null,
+    "git_commit": null,
+    "rustflags": null,
+    "rustc": null,
+    "label": null,
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795841110
+  },
+  "notes": [
+    "Searched from the memory-mapped index file.",
+    "Graph built in parallel with all threads; queries measured one at a time on one thread, and spread over all threads."
+  ]
+}
