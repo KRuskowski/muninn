@@ -1,0 +1,3 @@
+glove-100-angular: flat scan, 1000 queries on 16 threads
+  ef    0: recall 0.9999  1t        35 q/s  16t       326 q/s  p50 28351.9 us  p99 28827.1 us
+/home/karl/bench-results/final/glove-100-angular__muninn-flat.json

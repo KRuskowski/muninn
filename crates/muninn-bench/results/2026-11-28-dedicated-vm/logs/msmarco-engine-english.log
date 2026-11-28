@@ -1,0 +1,7 @@
+msmarco-passage: engine ingest of 1000000 passages in batches of 1000 (durability each), analyzer english
+  upserted 1000000 docs in 12.4 s (80755 docs/s)
+  flush 1.4 s (5 segments), compact 3.4 s (1 segments); 458.3 MB on disk after compact, 458.3 MB after reopening (0.00 s), 458.3 MB live
+  muninn-engine: 1t 2398 q/s, 16t 23486 q/s, p50 301.1 us, p99 1873.9 us
+  muninn: indexed in 8.2 s + write 0.43 s (116399 docs/s), 67.2 MB, 343514 terms
+  overlap@10 with the component index: mean 1.0000, identical sets 1.0000
+/home/karl/bench-results/final/msmarco-passage-1000000__engine-text-english.json

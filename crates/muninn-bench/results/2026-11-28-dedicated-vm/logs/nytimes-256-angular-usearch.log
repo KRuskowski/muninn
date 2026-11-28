@@ -1,0 +1,15 @@
+nytimes-256-angular: 290000 x 256 (cosine), 10000 queries; usearch 2.26.6 M=16 efC=200 on 16 threads
+  built in 17.8 s, file 340.0 MB
+  ef   10: recall 0.5867  1t     14739 q/s  16t    150246 q/s  p50    73.5 us  p99   138.5 us
+  ef   16: recall 0.6774  1t     10559 q/s  16t    107674 q/s  p50   100.2 us  p99   186.0 us
+  ef   24: recall 0.7382  1t      7903 q/s  16t     81129 q/s  p50   131.0 us  p99   241.8 us
+  ef   32: recall 0.7739  1t      6388 q/s  16t     65905 q/s  p50   160.4 us  p99   295.8 us
+  ef   48: recall 0.8142  1t      4716 q/s  16t     48586 q/s  p50   217.6 us  p99   396.8 us
+  ef   64: recall 0.8347  1t      3793 q/s  16t     38947 q/s  p50   272.4 us  p99   479.7 us
+  ef   96: recall 0.8606  1t      2747 q/s  16t     28095 q/s  p50   377.9 us  p99   626.6 us
+  ef  128: recall 0.8746  1t      2164 q/s  16t     22097 q/s  p50   482.2 us  p99   756.7 us
+  ef  192: recall 0.8932  1t      1516 q/s  16t     15565 q/s  p50   692.1 us  p99  1007.8 us
+  ef  256: recall 0.9050  1t      1168 q/s  16t     11976 q/s  p50   904.3 us  p99  1242.4 us
+  ef  384: recall 0.9202  1t       796 q/s  16t      8237 q/s  p50  1332.2 us  p99  1708.4 us
+  ef  512: recall 0.9308  1t       602 q/s  16t      6241 q/s  p50  1775.4 us  p99  2220.9 us
+/home/karl/bench-results/final/nytimes-256-angular__usearch__M16_efc200.json

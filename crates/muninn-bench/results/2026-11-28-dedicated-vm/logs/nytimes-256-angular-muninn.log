@@ -1,0 +1,31 @@
+nytimes-256-angular: 290000 x 256 (Cosine), 10000 queries; HNSW M=16 efC=200 on 16 threads
+  built in 16.5 s (graph 41.0 MB, max level 4, avg degree 28)
+  muninn-hnsw: quantiser 0.00 s, file 341.5 MB written in 1.42 s
+  ef   10: recall 0.6304  1t     31562 q/s  16t    303407 q/s  p50    30.2 us  p99    58.0 us
+  ef   16: recall 0.7145  1t     22982 q/s  16t    218735 q/s  p50    41.3 us  p99    79.1 us
+  ef   24: recall 0.7715  1t     17106 q/s  16t    166322 q/s  p50    55.8 us  p99   103.8 us
+  ef   32: recall 0.8005  1t     13994 q/s  16t    135506 q/s  p50    68.6 us  p99   126.5 us
+  ef   48: recall 0.8347  1t     10246 q/s  16t    100010 q/s  p50    94.8 us  p99   166.5 us
+  ef   64: recall 0.8561  1t      8173 q/s  16t     80582 q/s  p50   119.9 us  p99   205.8 us
+  ef   96: recall 0.8784  1t      5825 q/s  16t     58133 q/s  p50   170.7 us  p99   276.9 us
+  ef  128: recall 0.8905  1t      4566 q/s  16t     45604 q/s  p50   220.6 us  p99   337.1 us
+  ef  192: recall 0.9064  1t      3176 q/s  16t     31933 q/s  p50   321.1 us  p99   449.3 us
+  ef  256: recall 0.9162  1t      2430 q/s  16t     24508 q/s  p50   423.5 us  p99   573.8 us
+  ef  384: recall 0.9298  1t      1641 q/s  16t     16644 q/s  p50   633.0 us  p99   816.5 us
+  ef  512: recall 0.9396  1t      1231 q/s  16t     12502 q/s  p50   849.2 us  p99  1072.4 us
+  muninn-hnsw-sq8: quantiser 0.41 s, file 415.8 MB written in 1.80 s
+  muninn-hnsw-sq8: 99 vectors scored at full precision
+  ef   10: recall 0.8209  1t     20019 q/s  16t    205708 q/s  p50    48.4 us  p99    83.0 us
+  ef   16: recall 0.8209  1t     20029 q/s  16t    207454 q/s  p50    48.4 us  p99    82.5 us
+  ef   24: recall 0.8209  1t     19949 q/s  16t    207904 q/s  p50    48.6 us  p99    82.9 us
+  ef   32: recall 0.8209  1t     20066 q/s  16t    206951 q/s  p50    48.3 us  p99    82.7 us
+  ef   48: recall 0.8346  1t     17500 q/s  16t    181503 q/s  p50    55.7 us  p99    92.9 us
+  ef   64: recall 0.8557  1t     14009 q/s  16t    145399 q/s  p50    70.0 us  p99   115.0 us
+  ef   96: recall 0.8775  1t     10001 q/s  16t    104967 q/s  p50    99.0 us  p99   156.7 us
+  ef  128: recall 0.8900  1t      7893 q/s  16t     82719 q/s  p50   127.0 us  p99   190.7 us
+  ef  192: recall 0.9061  1t      5476 q/s  16t     57882 q/s  p50   185.3 us  p99   260.1 us
+  ef  256: recall 0.9163  1t      4210 q/s  16t     44712 q/s  p50   242.8 us  p99   328.3 us
+  ef  384: recall 0.9299  1t      2848 q/s  16t     30139 q/s  p50   361.5 us  p99   472.5 us
+  ef  512: recall 0.9394  1t      2133 q/s  16t     22498 q/s  p50   485.8 us  p99   623.5 us
+/home/karl/bench-results/final/nytimes-256-angular__muninn-hnsw__M16_efc200.json
+/home/karl/bench-results/final/nytimes-256-angular__muninn-hnsw-sq8__M16_efc200.json

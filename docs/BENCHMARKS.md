@@ -38,6 +38,13 @@ Single steps can be run by hand: `target/release/muninn-bench --help` (subcomman
 
 For working on text search speed, `cargo build --release -p muninn-bench --example text_prof` builds a development aid (not part of the protocol, numbers from it are not reported): it keeps a muninn and a tantivy index on disk between runs, replays the MS MARCO queries one thread at a time (for `perf record`), checks pruned search against exhaustive BM25 on every query (`query ... check`), and compares per-query latencies with tantivy, listing the queries where muninn loses most (`cmp`). See the comment at the top of `crates/muninn-bench/examples/text_prof.rs`.
 
+## Latest results
+
+- `crates/muninn-bench/results/2026-11-28-dedicated-vm/`: the authoritative run on a dedicated GCP c4-standard-16 (europe-west4-a, nothing else running), commit ac3828c, all 16 vCPUs, all engines, SIFT1M, GloVe-100, NYTimes-256 and 1M MS MARCO passages. The README summarises it.
+- Earlier runs on a shared VM (`2026-11-28-shared-vm/`, `2026-11-28-perf-vector/`) are kept for history; they were pinned to 4 vCPUs on a busy machine and are indicative only.
+
+If rustup reports a conflict on `bin/cargo-fmt` when the build installs the toolchain from `rust-toolchain.toml`, reinstall it with its components in one step: `rustup toolchain uninstall 1.91.0 && rustup toolchain install 1.91.0 --profile minimal -c rustfmt -c clippy`.
+
 ## Datasets
 
 | name | vectors | dim | metric | queries | source |

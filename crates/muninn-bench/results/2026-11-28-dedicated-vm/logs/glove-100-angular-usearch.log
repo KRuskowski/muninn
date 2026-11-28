@@ -1,0 +1,15 @@
+glove-100-angular: 1183514 x 100 (cosine), 10000 queries; usearch 2.26.6 M=16 efC=200 on 16 threads
+  built in 47.6 s, file 649.2 MB
+  ef   10: recall 0.4623  1t     20921 q/s  16t    223269 q/s  p50    53.6 us  p99   101.7 us
+  ef   16: recall 0.5530  1t     14946 q/s  16t    161274 q/s  p50    72.4 us  p99   134.0 us
+  ef   24: recall 0.6214  1t     11146 q/s  16t    119541 q/s  p50    94.4 us  p99   173.1 us
+  ef   32: recall 0.6655  1t      9005 q/s  16t     96264 q/s  p50   116.4 us  p99   209.4 us
+  ef   48: recall 0.7234  1t      6551 q/s  16t     69642 q/s  p50   157.8 us  p99   274.0 us
+  ef   64: recall 0.7593  1t      5194 q/s  16t     55431 q/s  p50   198.1 us  p99   334.0 us
+  ef   96: recall 0.8030  1t      3729 q/s  16t     39978 q/s  p50   276.4 us  p99   443.4 us
+  ef  128: recall 0.8297  1t      2917 q/s  16t     31288 q/s  p50   354.6 us  p99   540.6 us
+  ef  192: recall 0.8630  1t      2052 q/s  16t     21971 q/s  p50   508.2 us  p99   737.2 us
+  ef  256: recall 0.8840  1t      1582 q/s  16t     16856 q/s  p50   660.1 us  p99   921.6 us
+  ef  384: recall 0.9097  1t      1098 q/s  16t     11743 q/s  p50   945.7 us  p99  1281.0 us
+  ef  512: recall 0.9248  1t       855 q/s  16t      9024 q/s  p50  1228.0 us  p99  1657.3 us
+/home/karl/bench-results/final/glove-100-angular__usearch__M16_efc200.json

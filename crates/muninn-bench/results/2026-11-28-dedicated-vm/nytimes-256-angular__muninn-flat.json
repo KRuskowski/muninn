@@ -1,0 +1,110 @@
+{
+  "kind": "vector",
+  "engine": "muninn-flat",
+  "engine_version": "0.1.0 (ac3828c8c74a)",
+  "dataset": {
+    "name": "nytimes-256-angular",
+    "metric": "cosine",
+    "n": 290000,
+    "dim": 256,
+    "queries": 1000,
+    "meta": {
+      "dim": 256,
+      "files": {
+        "base.fbin": {
+          "bytes": 296960008,
+          "sha256": "41946febafc33e004f4b74527a2da28e7d6ad2d652cc6d970c250fb54ea3474c"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "279a85141e96744df0d7bc624c43015d7f5b3e93ff3aac9bd177c051461a5d3e"
+        },
+        "query.fbin": {
+          "bytes": 10240008,
+          "sha256": "672baa6adc1cf21d056f93d1b396b7efcbbcdef323d8a46cbe94c0bcb8e21af0"
+        }
+      },
+      "gt_k": 100,
+      "n": 290000,
+      "origin": "ann-benchmarks",
+      "prepared": "2026-11-28T06:59:02Z",
+      "queries": 10000,
+      "source_distance": "angular",
+      "sources": [
+        {
+          "bytes": 315208288,
+          "file": "nytimes-256-angular.hdf5",
+          "sha256": "6ad5d2cde6d6a6f21528d541901304ebfd40885d6ce6afae37bccbe278254a93",
+          "url": "http://ann-benchmarks.com/nytimes-256-angular.hdf5",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 16,
+  "params": {
+    "exact": true
+  },
+  "build": {
+    "seconds": 0.107285831,
+    "threads": 1,
+    "index_bytes": 296960240,
+    "rss_delta_bytes": 297193472,
+    "peak_rss_bytes": 623730688,
+    "details": {
+      "write_seconds": 1.232787188
+    }
+  },
+  "results": [
+    {
+      "ef": 0,
+      "recall": 0.9848,
+      "qps_1t": 77.52188317079559,
+      "qps_nt": 609.3835353304876,
+      "latency": {
+        "mean_us": 12899.49129,
+        "p50_us": 12909.438,
+        "p95_us": 13104.201,
+        "p99_us": 13243.551,
+        "max_us": 13556.062
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-bench-final",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 16,
+    "cpu_pinning": null,
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "ac3828c8c74ad6b01aa6b0285779c6df2fd0e952",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "dedicated GCP c4-standard-16 (16 vCPUs, Xeon Platinum 8581C), europe-west4-a, nothing else running; commit ac3828c",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795865937
+  },
+  "notes": [
+    "Exact scan; recall below 1 only from distance ties.",
+    "Searched from the memory-mapped index file."
+  ]
+}

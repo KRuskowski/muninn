@@ -1,0 +1,8 @@
+msmarco-passage: 1000000 passages (335 MB of text), 6980 queries loaded in 1.1 s; analyzer default
+  muninn: indexed in 6.3 s + write 0.57 s (145990 docs/s), 83.2 MB, 418033 terms
+  muninn: 1t 1990 q/s, 16t 19695 q/s, p50 367.0 us, p99 2250.7 us, 10.00 hits/query
+  tantivy (16 indexing threads): indexed in 2.6 s (16 segments) + merge 2.1 s (215866 docs/s), 75.0 MB
+  tantivy (1 indexing threads): indexed in 7.0 s (1 segments) + merge 0.0 s (142302 docs/s), 74.1 MB
+  tantivy: 1t 1089 q/s, 16t 12023 q/s, p50 537.3 us, p99 5547.5 us, 10.00 hits/query
+  overlap@10: mean 0.9997, identical sets 0.9977, same top-1 0.9994
+/home/karl/bench-results/final/msmarco-passage-1000000__text-default.json
