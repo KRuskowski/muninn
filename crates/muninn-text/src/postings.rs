@@ -9,6 +9,11 @@
 //! tf - 1 packed at tf_bits
 //! ```
 //!
+//! Full blocks (128 documents) are packed in the interleaved lanes
+//! layout, the term's last, partial block in the plain layout (see
+//! [`crate::bitpack`]). Format-1 files use the plain layout for every
+//! block; their cursors have `lanes == false`.
+//!
 //! and each block has a [`SkipRec`]: its last doc id, its byte offset in
 //! the term's data, and its impacts (see [`crate::impacts`]). Every block
 //! holds 128 documents except the term's last one.
@@ -25,9 +30,13 @@
 use muninn_core::{DocId, Pod};
 
 use crate::bitpack::{self, BLOCK, packed_len};
-use crate::bm25::{LenNorms, bound};
+use crate::bm25::{LenNorms, bound, bound_from_qmin, fmin};
+use crate::delta;
 use crate::impacts::{Impacts, frontier};
 use crate::varint;
+
+/// Blocks per group whose bound `Cursor::window_bound` caches.
+const GROUP: usize = 16;
 
 /// Sentinel doc id: the cursor is exhausted. Never a valid document.
 pub(crate) const END: DocId = DocId::MAX;
@@ -72,8 +81,13 @@ pub(crate) fn pack_block(
   let wt = bitpack::bits_needed(max_t);
   out.push(wd as u8);
   out.push(wt as u8);
-  bitpack::pack(&deltas[..docs.len()], wd, out);
-  bitpack::pack(&tfm[..docs.len()], wt, out);
+  if docs.len() == BLOCK {
+    bitpack::pack_lanes(&deltas, wd, out);
+    bitpack::pack_lanes(&tfm, wt, out);
+  } else {
+    bitpack::pack(&deltas[..docs.len()], wd, out);
+    bitpack::pack(&tfm[..docs.len()], wt, out);
+  }
 }
 
 /// Full (packed) blocks of a live posting list.
@@ -289,13 +303,19 @@ pub(crate) struct Cursor<'a> {
   tfs_ready: bool,
   bound_block: usize,
   bound: f32,
-  /// Impacts `bound` was computed from: consecutive blocks often share
-  /// them, which saves the evaluation.
-  bound_imp: Impacts,
+  /// Cached `qmin` per group of [`GROUP`] blocks (NaN: not computed),
+  /// for `window_bound`. Empty until first needed.
+  groups: Vec<f32>,
   /// Query weight `idf * (k1 + 1)`.
   pub weight: f32,
   /// Position of the term in the query, for canonical summation.
   pub idx: usize,
+  /// Whether the term drew candidates in the last window (search
+  /// state; decides which terms end the next window).
+  pub essential: bool,
+  /// Full blocks use the lanes layout (false only for format-1 files).
+  /// Set before `start`.
+  pub lanes: bool,
   pub corrupt: bool,
   docs: [u32; BLOCK],
   tfs: [u32; BLOCK],
@@ -328,10 +348,12 @@ impl<'a> Cursor<'a> {
       tf_bits: 0,
       tfs_ready: false,
       bound_block: usize::MAX,
-      bound_imp: [0; crate::impacts::IMPACTS],
       bound: 0.0,
+      groups: Vec::new(),
       weight: 0.0,
       idx: 0,
+      essential: true,
+      lanes: true,
       corrupt: false,
       docs: [0; BLOCK],
       tfs: [0; BLOCK],
@@ -345,8 +367,10 @@ impl<'a> Cursor<'a> {
     last_doc: DocId,
     impacts: Impacts,
     num_docs: usize,
+    lanes: bool,
   ) -> Self {
     let mut c = Self::empty(data, &[], df, num_docs);
+    c.lanes = lanes;
     c.last = SkipRec {
       last_doc,
       offset: 0,
@@ -423,41 +447,154 @@ impl<'a> Cursor<'a> {
   #[inline]
   pub fn block_bound(&mut self, norms: &LenNorms) -> f32 {
     if self.bound_block != self.block {
-      let imp = self.rec(self.block).impacts;
-      if imp != self.bound_imp {
-        // `bound_imp` starts all-zero, whose bound is 0.
-        self.bound = bound(&imp, self.weight, norms);
-        self.bound_imp = imp;
-      }
+      self.bound = bound(&self.rec(self.block).impacts, self.weight, norms);
       self.bound_block = self.block;
     }
     self.bound
   }
 
-  /// Skips the current block and every following block whose bound is
-  /// at most `theta`, without decoding them. Returns the first doc id
-  /// after the skipped range ([`END`] when the list is exhausted).
-  pub fn skip_blocks_at_most(&mut self, theta: f32, norms: &LenNorms) -> DocId {
-    loop {
-      let last = self.rec(self.block).last_doc;
-      self.block += 1;
-      if self.block >= self.nblocks || last >= END - 1 {
-        self.block = self.nblocks;
-        self.doc = END;
-        return END;
+  /// Largest block bound from the current block through the block that
+  /// contains `last` (or the list's end). Does not move the cursor.
+  ///
+  /// Groups of [`GROUP`] blocks entirely inside the range use a cached
+  /// minimum, so ranges that are scanned again (windows that shrink
+  /// after their bounds were taken) cost one load per group.
+  pub fn window_bound(&mut self, last: DocId, norms: &LenNorms) -> f32 {
+    let b0 = self.block;
+    let mut q = norms.qmin(&self.rec(b0).impacts);
+    if self.rec(b0).last_doc >= last {
+      return bound_from_qmin(self.weight, q);
+    }
+    // Last block of the range: the first whose last doc is >= `last`.
+    let n = self.skips.len();
+    let b1 = if b0 + 1 < n {
+      let rest = &self.skips[b0 + 1..];
+      let p = b0 + 1 + rest.partition_point(|r| r.last_doc < last);
+      p.min(self.nblocks - 1)
+    } else {
+      self.nblocks - 1
+    };
+    let mut b = b0 + 1;
+    while b <= b1 {
+      if b.is_multiple_of(GROUP) && b + GROUP - 1 <= b1 {
+        q = fmin(q, self.group_qmin(b / GROUP, norms));
+        b += GROUP;
+      } else {
+        q = fmin(q, norms.qmin(&self.rec(b).impacts));
+        b += 1;
       }
-      if self.block_bound(norms) > theta {
-        return last + 1;
-      }
+    }
+    bound_from_qmin(self.weight, q)
+  }
+
+  /// Minimum quotient over the blocks of group `g` (all in `skips`),
+  /// computed once per cursor.
+  fn group_qmin(&mut self, g: usize, norms: &LenNorms) -> f32 {
+    if self.groups.is_empty() {
+      self.groups = vec![f32::NAN; self.skips.len() / GROUP];
+    }
+    let v = self.groups[g];
+    if !v.is_nan() {
+      return v;
+    }
+    let mut q = f32::INFINITY;
+    for r in &self.skips[g * GROUP..(g + 1) * GROUP] {
+      q = fmin(q, norms.qmin(&r.impacts));
+    }
+    self.groups[g] = q;
+    q
+  }
+
+  /// An upper bound of the term's contribution to document `d`, which
+  /// must not be below any target the cursor was moved to: the exact
+  /// contribution if the cursor is on `d`, 0 if it is past `d` or
+  /// exhausted, else the bound of the block that would hold `d`. Moves
+  /// the cursor shallowly; never decodes.
+  #[inline]
+  pub fn peek_bound(&mut self, d: DocId, n: u8, norms: &LenNorms) -> f32 {
+    // A cursor's doc is either current or a stale doc of an earlier
+    // block, which lies below every later target.
+    if self.doc >= d {
+      return if self.doc == d {
+        norms.score(self.weight, self.tf(), n)
+      } else {
+        0.0
+      };
+    }
+    self.shallow_advance(d);
+    if self.block >= self.nblocks {
+      return 0.0;
+    }
+    self.block_bound(norms)
+  }
+
+  /// Leaves the current block without decoding the next one. The
+  /// cursor's doc goes stale (below every doc still ahead) or to [`END`];
+  /// only `advance`, `shallow_advance` and `peek_bound` may follow.
+  #[inline]
+  pub fn end_block(&mut self) {
+    self.block += 1;
+    if self.block >= self.nblocks {
+      self.block = self.nblocks;
+      self.doc = END;
+    }
+  }
+
+  /// First doc id the current block can hold.
+  #[inline]
+  pub fn block_first(&self) -> DocId {
+    if self.block == 0 {
+      0
+    } else {
+      self.rec(self.block - 1).last_doc + 1
+    }
+  }
+
+  /// The decoded block's doc ids and term frequencies, and the cursor's
+  /// position in them. Only valid right after `advance` returned a doc.
+  #[inline]
+  pub fn decoded_block(&mut self) -> (&[u32], &[u32], usize) {
+    if !self.tfs_ready {
+      self.decode_tfs();
+    }
+    (&self.docs[..self.len], &self.tfs[..self.len], self.pos)
+  }
+
+  /// Term frequency of `d` in the decoded block, if it is there.
+  #[inline]
+  pub fn decoded_tf(&mut self, d: DocId) -> Option<u32> {
+    if !self.tfs_ready {
+      self.decode_tfs();
+    }
+    let i = self.docs[..self.len].binary_search(&d).ok()?;
+    Some(self.tfs[i])
+  }
+
+  /// Moves to position `p` of the decoded block (`p` at most its
+  /// length; at the length, the block is left with `end_block`).
+  #[inline]
+  pub fn seek_pos(&mut self, p: usize) {
+    if p < self.len {
+      self.pos = p;
+      self.doc = self.docs[p];
+    } else {
+      self.end_block();
     }
   }
 
   /// Moves to the first block whose last doc is `>= target`, without
   /// decoding it. Never moves backwards.
+  #[inline]
   pub fn shallow_advance(&mut self, target: DocId) {
     if self.block >= self.nblocks || self.rec(self.block).last_doc >= target {
       return;
     }
+    self.shallow_seek(target);
+  }
+
+  /// `shallow_advance` past the current block.
+  #[inline(never)]
+  fn shallow_seek(&mut self, target: DocId) {
     let mut b = self.block + 1;
     let n = self.skips.len();
     if b < n {
@@ -497,11 +634,14 @@ impl<'a> Cursor<'a> {
       }
       self.pos = 0;
     }
-    let mut p = self.pos;
-    // The block's last doc is >= target (validated by `decode`).
-    while p + 1 < self.len && self.docs[p] < target {
-      p += 1;
+    // Ids are increasing and the block's last doc is >= target
+    // (validated by `decode`), so the first doc >= target is at the
+    // number of docs below it; counting is branch-free and vectorises.
+    let mut below = 0u32;
+    for &d in &self.docs[..self.len] {
+      below += u32::from(d < target);
     }
+    let p = below as usize;
     self.pos = p;
     self.doc = self.docs[p];
     self.doc
@@ -538,7 +678,12 @@ impl<'a> Cursor<'a> {
   #[cold]
   fn decode_tfs(&mut self) {
     let src = self.data.get(self.tf_off..).unwrap_or(&[]);
-    if !bitpack::unpack(src, self.tf_bits, self.len, &mut self.tfs) {
+    let ok = if self.len == BLOCK && self.lanes {
+      bitpack::unpack_lanes(src, self.tf_bits, &mut self.tfs)
+    } else {
+      bitpack::unpack(src, self.tf_bits, self.len, &mut self.tfs)
+    };
+    if !ok {
       // Lengths were checked in `decode`; unreachable on any input.
       self.tfs.fill(1);
       self.corrupt = true;
@@ -565,24 +710,18 @@ impl<'a> Cursor<'a> {
       self.fail();
       return false;
     }
-    // Prefix sums with validation: strictly increasing ids ending exactly
-    // at the skip record's last doc, inside the id space.
-    let mut acc = u64::from(base);
-    let mut min_delta = u32::MAX;
-    for (k, d) in self.docs[..n].iter_mut().enumerate() {
-      if k > 0 || i > 0 {
-        min_delta = min_delta.min(*d);
-      }
-      acc += u64::from(*d);
-      *d = acc as u32;
-    }
+    // Validation before any id is trusted: strictly increasing ids
+    // ending exactly at the skip record's last doc, inside the id space.
+    // Then no prefix sum can wrap.
+    let (min_delta, total) = delta::check(&self.docs[..n], usize::from(i == 0));
     if min_delta == 0
-      || acc != u64::from(rec_last)
+      || u64::from(base) + total != u64::from(rec_last)
       || rec_last as usize >= self.num_docs
     {
       self.fail();
       return false;
     }
+    delta::prefix_sum(&mut self.docs, base);
     self.decoded = i;
     self.len = n;
     true
@@ -604,7 +743,12 @@ impl<'a> Cursor<'a> {
     if src.len() < 2 + dlen + tlen {
       return false;
     }
-    if !bitpack::unpack(&src[2..], wd, n, &mut self.docs) {
+    let ok = if n == BLOCK && self.lanes {
+      bitpack::unpack_lanes(&src[2..], wd, &mut self.docs)
+    } else {
+      bitpack::unpack(&src[2..], wd, n, &mut self.docs)
+    };
+    if !ok {
       return false;
     }
     self.tf_off = off + 2 + dlen;
@@ -671,7 +815,14 @@ mod tests {
       let mut data = f.head.to_vec();
       data.extend_from_slice(&f.tail_block);
       let c = if f.skips.len() == 1 {
-        Cursor::single(&data, f.df, f.last_doc, f.skips[0].impacts, num_docs)
+        Cursor::single(
+          &data,
+          f.df,
+          f.last_doc,
+          f.skips[0].impacts,
+          num_docs,
+          true,
+        )
       } else {
         let mut c = Cursor::empty(&data, &f.skips, f.df, num_docs);
         c.start();
@@ -703,6 +854,69 @@ mod tests {
     c.shallow_advance(END - 1);
     assert!(c.exhausted());
     assert_eq!(c.doc(), END);
+  }
+
+  /// `window_bound`, with and without cached block groups, equals the
+  /// largest `block_bound` over the blocks the range touches, including
+  /// when the same blocks are scanned again for a later, shorter range.
+  #[test]
+  fn window_bound_equals_max_of_block_bounds() {
+    // Mostly small tfs; a few blocks deep inside groups hold the
+    // list's largest ones, so only a group can supply the maximum.
+    let docs: Vec<(u32, u32)> = (0..6000u32)
+      .map(|i| {
+        let hot = (2600..2700).contains(&i) || (4500..4510).contains(&i);
+        (
+          i * 3 + i % 2,
+          if hot { 40 + i % 9 } else { 1 + (i * 31) % 3 },
+        )
+      })
+      .collect();
+    let num_docs = docs.last().unwrap().0 as usize + 1;
+    let (p, norms) = build(&docs, num_docs);
+    let f = p.freeze(&norms);
+    let mut data = f.head.to_vec();
+    data.extend_from_slice(&f.tail_block);
+    let lens = crate::bm25::LenNorms::new(17.0);
+    let open = || {
+      let mut c = Cursor::empty(&data, &f.skips, f.df, num_docs);
+      c.weight = 3.7;
+      c.start();
+      c
+    };
+    let naive = |from: u32, last: u32| {
+      let mut c = open();
+      c.shallow_advance(from);
+      let mut best = 0f32;
+      loop {
+        best = best.max(c.block_bound(&lens));
+        let end = c.block_last();
+        c.end_block();
+        if end >= last || c.exhausted() {
+          break;
+        }
+      }
+      best
+    };
+    let mut c = open();
+    let mut reused_from = 0;
+    for (from, len) in [(0, 10), (0, 5000), (5000, 9000), (3000, 17_999)]
+      .into_iter()
+      .chain((0..18_000).step_by(997).map(|s| (s, 2500 + s % 4000)))
+    {
+      let last = from + len;
+      let mut fresh = open();
+      fresh.shallow_advance(from);
+      let want = naive(from, last);
+      assert_eq!(fresh.window_bound(last, &lens), want, "{from}..{last}");
+      // A long-lived cursor (which only moves forward) reuses its cached
+      // groups.
+      if from >= reused_from {
+        c.shallow_advance(from);
+        assert_eq!(c.window_bound(last, &lens), want, "reuse {from}");
+        reused_from = from;
+      }
+    }
   }
 
   #[test]

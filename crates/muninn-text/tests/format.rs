@@ -447,3 +447,42 @@ fn queries_with_too_many_distinct_terms_are_rejected() {
     assert_eq!(idx.search(&repeated, 5, None).unwrap().len(), 1);
   }
 }
+
+/// Format-1 files (plain bit layout in every block, written by muninn
+/// before the lanes layout) still open, rank exactly like a current index
+/// of the same documents, and merge into a current-format file
+/// byte-identical to building it from scratch.
+#[test]
+fn reads_format_1_files() {
+  let bytes = include_bytes!("data/v1-zipf-2026-1500-120.text");
+  assert_eq!(&bytes[16..20], &1u32.to_le_bytes(), "fixture is version 1");
+  let mut buf = AlignedBuf::new();
+  buf.extend_from_slice(bytes);
+  let v1 = TextIndex::open(Region::new(buf)).unwrap();
+  v1.verify_checksum().unwrap();
+  let corpus = zipf_corpus(2026, 1500, 120);
+  let mem = mem_from(&corpus.docs, &Analyzer::default());
+  let v2 = mem.freeze().unwrap();
+  // The fixture has terms with many full blocks.
+  let top = v1.stats_for(&common::word(0)).unwrap();
+  assert!(top.terms[0].doc_freq >= 512, "{top:?}");
+  let mut rng = Rng::new(77);
+  for qi in 0..200 {
+    let q = random_query(&mut rng, 120);
+    let k = [1, 10, 100][qi % 3];
+    assert_eq!(v1.stats_for(&q).unwrap(), v2.stats_for(&q).unwrap());
+    let want = v2.search(&q, k, None).unwrap();
+    assert_eq!(v1.search(&q, k, None).unwrap(), want, "q={q:?}");
+    let ex = v1.search_exhaustive(&q, k, None, None).unwrap();
+    assert_eq!(ex, want, "q={q:?}");
+  }
+  let map: Vec<DocId> = (0..v1.num_docs() as DocId).collect();
+  let input = [MergeInput {
+    index: &v1,
+    doc_map: &map,
+  }];
+  let merged =
+    TextIndex::merge(&input, v1.num_docs(), AlignedBuf::new()).unwrap();
+  assert_eq!(&merged.as_slice()[16..20], &FORMAT_VERSION.to_le_bytes());
+  assert_eq!(merged.as_slice(), bytes_of(&mem).as_slice());
+}
