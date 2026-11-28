@@ -288,6 +288,14 @@ impl ManifestStore {
     self.retained.last()
   }
 
+  /// The retained generations, oldest first (at most [`KEEP_MANIFESTS`]).
+  /// [`ManifestStore::open`] falls back to an older one if the newest is
+  /// unreadable, so its files and the log from its checkpoint on must be
+  /// kept.
+  pub fn retained(&self) -> &[Manifest] {
+    &self.retained
+  }
+
   /// Atomically publishes `manifest` as the next generation and sets its
   /// `generation` field. When this returns, the new manifest is durable.
   /// Manifest files beyond the [`KEEP_MANIFESTS`] newest are then deleted;

@@ -1,0 +1,71 @@
+[package]
+name = "muninn-server"
+description = "HTTP/JSON server and command-line tool for the muninn database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "muninn_server"
+
+[[bin]]
+name = "muninn"
+path = "src/main.rs"
+# The library crate `muninn` documents to the same directory.
+doc = false
+
+[dependencies]
+muninn.workspace = true
+axum = { version = "0.8", default-features = false }
+clap = { version = "4.5", default-features = false, features = [
+  "derive",
+  "env",
+  "error-context",
+  "help",
+  "std",
+  "usage",
+] }
+# Streams the NDJSON bulk body frame by frame (already used by axum).
+http-body-util = "0.1"
+# The connection loop: header timeouts need hyper's own builder with a
+# timer, which axum::serve does not set (both already used by axum).
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = [
+  "http1",
+  "server",
+  "server-graceful",
+  "service",
+  "tokio",
+] }
+# Parses import batches on all cores (already used by the engine).
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+# raw_value: vectors are parsed from their JSON text (see model.rs).
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1.40", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing = { version = "0.1.40", default-features = false, features = [
+  "std",
+] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "std",
+] }
+
+[dev-dependencies]
+# HTTP/1.1 keep-alive client for the load generator.
+hyper = { version = "1", features = ["client", "http1"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# write_all and shutdown in the lingering-close tests.
+tokio = { version = "1.40", features = ["io-util"] }
+
+[lints]
+workspace = true

@@ -546,6 +546,47 @@ fn no_sync_sync_covers_rotated_segments() {
   assert_eq!(wal.stats().syncs, after.syncs);
 }
 
+/// A log that rotates often without ever syncing must not keep one open
+/// file per rotated segment until the next sync.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_sync_rotation_keeps_no_handle_per_segment() {
+  // Other tests run in parallel and open files too: allow some slack,
+  // far below the one handle per segment of a leak.
+  let open_files = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+  let d = TestDir::new("wal-nosync-handles");
+  let wal =
+    Wal::open(d.path(), small_segments(Durability::NoSync, 4096)).unwrap();
+  let before = open_files();
+  for _ in 0..6000 {
+    wal.append(&[7u8; 200]).unwrap();
+  }
+  let rotated = wal.segment_count() - 1;
+  assert!(rotated >= 250, "{rotated} segments");
+  let after = open_files();
+  assert!(
+    after < before + 100,
+    "{before} open files before, {after} after {rotated} rotations"
+  );
+  // Every full group of rotated segments was synced and closed; nothing
+  // is claimed durable before a sync.
+  let group = muninn_store::wal::MAX_UNSYNCED_SEGMENTS;
+  let eager = rotated / group * group;
+  assert_eq!(wal.stats().syncs as usize, eager);
+  assert_eq!(wal.durable_lsn(), 0);
+  // Sync reaches the remaining rotated segments, also when some of them
+  // were deleted in between, then the active one.
+  wal.truncate_before(3000).unwrap();
+  wal.sync().unwrap();
+  assert_eq!(wal.durable_lsn(), 6000);
+  assert_eq!(wal.stats().syncs as usize, rotated + 1);
+  drop(wal);
+  let (_, got, rec) =
+    recover_all(d.path(), small_segments(Durability::NoSync, 4096), 3000);
+  assert!(rec.truncated.is_none(), "{rec:?}");
+  assert_eq!(got.last().unwrap().0, 6000);
+}
+
 #[test]
 fn segment_named_zero_is_corrupt_not_a_panic() {
   let d = TestDir::new("wal-seg-zero");

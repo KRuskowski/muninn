@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use common::{Rng, TestDir, copy_dir, files_with_prefix};
 use muninn::{
-  Collection, Database, Document, Durability, Failpoint, Id, Metric, Options,
-  Query, Schema, VectorField,
+  Collection, Database, Document, Durability, Error, Failpoint, Id, Metric,
+  Options, Query, Schema, VectorField,
 };
 use serde_json::json;
 
@@ -228,7 +228,7 @@ fn crash_between_segment_write_and_manifest_commit() {
     want = fill(&c, 0);
     assert!(c.flush().is_err(), "the failpoint must stop the flush");
     assert!(
-      c.upsert(&[doc(9999, 1)]).is_err(),
+      matches!(c.upsert(&[doc(9999, 1)]), Err(Error::Unavailable(_))),
       "writes refused after it"
     );
     verify(&c, &want, "after the failed flush");
@@ -343,8 +343,136 @@ fn corrupt_newest_manifest_falls_back_to_the_previous_one() {
   std::fs::write(newest, bytes).unwrap();
   let db = Database::open(dir.path(), opts).unwrap();
   let c = db.collection("c").unwrap();
-  assert_eq!(c.stats().unwrap().segments.len(), 1, "previous manifest");
+  // Every commit is followed by a second, identical one, so the previous
+  // generation describes the same two segments.
+  assert_eq!(c.stats().unwrap().segments.len(), 2, "previous manifest");
   verify(&c, &want, "after falling back");
+}
+
+/// Corrupts the newest manifest file of `cdir`.
+fn corrupt_newest_manifest(cdir: &std::path::Path) {
+  let manifests = files_with_prefix(cdir, "MANIFEST-");
+  assert_eq!(manifests.len(), 2, "two generations are kept");
+  let newest = manifests.last().unwrap();
+  let mut bytes = std::fs::read(newest).unwrap();
+  let mid = bytes.len() / 2;
+  bytes[mid] ^= 0x55;
+  std::fs::write(newest, bytes).unwrap();
+}
+
+/// A crash right after a flush's manifest commit, then a corrupt newest
+/// manifest: the previous generation takes over, and the log from its
+/// checkpoint on must still be there.
+#[test]
+fn crash_after_flush_commit_with_corrupt_manifest_replays_the_log() {
+  let dir = TestDir::new("fp-flush-fallback");
+  let mut want;
+  {
+    let db = Database::open(
+      dir.path(),
+      with_failpoint(Failpoint::AfterManifestCommit),
+    )
+    .unwrap();
+    let c = db.create_collection("c", schema()).unwrap();
+    want = fill(&c, 0);
+    want.extend(fill(&c, 1000));
+    assert!(c.flush().is_err());
+  }
+  corrupt_newest_manifest(&coll_dir(dir.path()));
+  let opts = Options::default().durability(Durability::NoSync);
+  let db = Database::open(dir.path(), opts).unwrap();
+  let c = db.collection("c").unwrap();
+  let st = c.stats().unwrap();
+  assert_eq!(st.segments.len(), 0, "{st:?}");
+  verify(&c, &want, "after falling back");
+}
+
+/// A crash after a compaction committed but before its second commit,
+/// then a corrupt newest manifest: the generation before the compaction
+/// takes over, so none of the merged-away segments may be gone yet.
+#[test]
+fn crash_after_compaction_commit_keeps_the_merged_segments() {
+  let dir = TestDir::new("fp-compact-commit");
+  let mut want;
+  {
+    let db = Database::open(
+      dir.path(),
+      with_failpoint(Failpoint::AfterCompactionCommit),
+    )
+    .unwrap();
+    let c = db.create_collection("c", schema()).unwrap();
+    want = fill(&c, 0);
+    c.flush().unwrap();
+    want.extend(fill(&c, 1000));
+    c.flush().unwrap();
+    assert!(c.compact().is_err());
+    verify(&c, &want, "after the failed compaction");
+  }
+  corrupt_newest_manifest(&coll_dir(dir.path()));
+  let opts = Options::default().durability(Durability::NoSync);
+  let db = Database::open(dir.path(), opts.clone()).unwrap();
+  let c = db.collection("c").unwrap();
+  assert_eq!(c.stats().unwrap().segments.len(), 2, "pre-compaction state");
+  verify(&c, &want, "after falling back");
+  c.compact().unwrap();
+  verify(&c, &want, "after compacting again");
+  drop(c);
+  drop(db);
+  let db = Database::open(dir.path(), opts).unwrap();
+  verify(&db.collection("c").unwrap(), &want, "after reopen");
+}
+
+/// Files in `cdir` not named by the newest manifest: segment files and
+/// log files beyond the active one.
+fn obsolete_files(cdir: &std::path::Path) -> Vec<String> {
+  use muninn::store::{Manifest, map_file};
+  let newest = files_with_prefix(cdir, "MANIFEST-").pop().unwrap();
+  let m = Manifest::decode(map_file(&newest).unwrap()).unwrap();
+  let live: std::collections::HashSet<&str> = m.referenced_files().collect();
+  let mut extra: Vec<String> = files_with_prefix(cdir, "seg-")
+    .iter()
+    .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+    .filter(|n| !live.contains(n.as_str()))
+    .collect();
+  let wal = files_with_prefix(&cdir.join("wal"), "0");
+  extra.extend(wal[..wal.len() - 1].iter().map(|p| p.display().to_string()));
+  extra
+}
+
+/// Disk space is bounded: right after `flush` the log holds nothing but
+/// the empty active file, and right after `compact` only the merged
+/// segment is on disk, not the segments it replaced.
+#[test]
+fn flush_and_compaction_release_the_log_and_merged_segments() {
+  let dir = TestDir::new("space");
+  let opts = Options {
+    durability: Durability::NoSync,
+    memtable_max_docs: 40,
+    auto_compact: false,
+    ..Options::default()
+  };
+  let cdir = coll_dir(dir.path());
+  let mut want;
+  {
+    let db = Database::open(dir.path(), opts.clone()).unwrap();
+    let c = db.create_collection("c", schema()).unwrap();
+    want = fill(&c, 0);
+    want.extend(fill(&c, 1000));
+    want.extend(fill(&c, 2000));
+    c.flush().unwrap();
+    assert!(c.stats().unwrap().segments.len() >= 3);
+    assert_eq!(obsolete_files(&cdir), Vec::<String>::new(), "after flush");
+    c.compact().unwrap();
+    assert_eq!(c.stats().unwrap().segments.len(), 1);
+    assert_eq!(obsolete_files(&cdir), Vec::<String>::new(), "after compact");
+    verify(&c, &want, "after compact");
+  }
+  let db = Database::open(dir.path(), opts).unwrap();
+  verify(&db.collection("c").unwrap(), &want, "after reopen");
+  drop(db);
+  corrupt_newest_manifest(&cdir);
+  let db = Database::open(dir.path(), Options::default()).unwrap();
+  verify(&db.collection("c").unwrap(), &want, "after falling back");
 }
 
 /// Copies the data directory while writers run: the copy is what a
