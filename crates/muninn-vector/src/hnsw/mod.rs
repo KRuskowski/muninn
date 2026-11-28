@@ -9,7 +9,9 @@ use std::ops::Range;
 use std::sync::Mutex;
 
 use muninn_core::container::{Container, ContainerWriter, tag};
-use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Region, Result, TopK};
+use muninn_core::{
+  BitSet, DocFilter, DocId, Error, Hit, Metric, Region, Result, TopK,
+};
 use rayon::prelude::*;
 
 use self::build::{Builder, MAX_LEVEL, level_for};
@@ -35,8 +37,9 @@ const T_LEVELS: [u8; 8] = tag("levels");
 const T_L0: [u8; 8] = tag("l0");
 const T_UPOFF: [u8; 8] = tag("upoff");
 const T_UPPER: [u8; 8] = tag("upper");
-/// Since version 2: per node, the neighbour whose edge to it is
-/// protected (see `Builder::ensure_backlink`). Version 1 files have none.
+/// Since version 2: per node, its parent in the protected spanning tree
+/// (see `Builder::anchor`). Version 1 files have none; their tree is built
+/// on the first insert after opening.
 const T_PROT: [u8; 8] = tag("prot");
 const META_FIELDS: usize = 12;
 
@@ -207,15 +210,13 @@ pub struct HnswIndex {
   /// Opened from a file whose graph has not been checked yet; see
   /// [`HnswIndex::repair`].
   from_file: bool,
-  /// Level-0 in-degree per node, maintained by builds so orphaned nodes
-  /// can be re-linked. Not persisted: rebuilt from the graph on the first
-  /// insert after opening a file (`indeg_ready == false`).
-  indeg: Vec<u32>,
-  /// Per node, the neighbour whose edge to it is protected ([`NONE`] =
-  /// none); see `Builder::ensure_backlink`. Persisted (mapped after
-  /// open); empty or shorter than `len()` means "none" for the rest.
+  /// Per node, its parent in the protected spanning tree ([`NONE`] for
+  /// the root); see `Builder::anchor`. Persisted (mapped after open);
+  /// empty or shorter than `len()` means "none" for the rest.
   prot: Slab<u32>,
-  indeg_ready: bool,
+  /// Whether every node is known to hang in the protected tree; false
+  /// after opening a file until [`HnswIndex::check_tree`] has run.
+  tree_ready: bool,
 }
 
 /// Index structure sizes, for capacity planning and reports.
@@ -256,9 +257,8 @@ impl HnswIndex {
       quant: Quantizer::train(params.quantization, dim, metric, &[]),
       trained_on: 0,
       from_file: false,
-      indeg: Vec::new(),
       prot: Slab::default(),
-      indeg_ready: true,
+      tree_ready: true,
     })
   }
 
@@ -460,6 +460,12 @@ impl HnswIndex {
   /// Links stored nodes `first..end` into the graph.
   fn link(&mut self, first: usize, end: usize) {
     let rows = end - first;
+    let old_root = self.entry;
+    let reanchor = if self.tree_ready {
+      Vec::new()
+    } else {
+      self.check_tree()
+    };
     let stripes = if rows < PAR_MIN_BATCH {
       1
     } else {
@@ -489,22 +495,23 @@ impl HnswIndex {
           .into_par_iter()
           .for_each(|id| b.insert(id as DocId));
       }
-      // Every new node gets an in-edge from its nearest neighbour, then
-      // any node left without an in-edge gets one.
-      if rows < PAR_MIN_BATCH {
-        (start..end).for_each(|id| b.ensure_backlink(id as DocId));
-      } else {
-        (start..end)
-          .into_par_iter()
-          .for_each(|id| b.ensure_backlink(id as DocId));
+      // Serially, once every concurrent insert of the batch is done:
+      // hang every new node (and any node of an opened file that is not
+      // yet in it) in the protected tree.
+      let mut unanchored = BitSet::new(end);
+      for &x in &reanchor {
+        unanchored.insert(x);
       }
-      b.reconnect_orphans();
-      // The full reachability walk costs O(n * M): worth it for batches
-      // that are a noticeable share of the index (any bulk build), not
-      // for every single insert into a large one.
-      if rows >= PAR_MIN_BATCH && end <= rows.saturating_mul(1024) {
-        b.reconnect_unreachable();
+      for x in first..end {
+        unanchored.insert(x as DocId);
       }
+      unanchored.remove(old_root);
+      let pending: Vec<DocId> = reanchor
+        .iter()
+        .copied()
+        .chain(first as DocId..end as DocId)
+        .collect();
+      b.anchor(old_root, &pending, &mut unanchored);
     });
   }
 
@@ -517,23 +524,10 @@ impl HnswIndex {
   ) -> R {
     let (m, m0) = (self.params.m, 2 * self.params.m);
     let n = self.len();
-    if !self.indeg_ready {
-      self.indeg = vec![0; n];
-      for rec in self.graph.l0.as_slice().chunks_exact(1 + m0) {
-        for &id in &rec[1..1 + (rec[0] as usize).min(m0)] {
-          if let Some(d) = self.indeg.get_mut(id as usize) {
-            *d += 1;
-          }
-        }
-      }
-      self.indeg_ready = true;
-    }
-    // Nodes appended since the last build have no edges yet.
-    self.indeg.resize(n, 0);
+    // Nodes appended since the last build have no parent yet.
     self.prot.to_mut().resize(n, NONE);
     let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
     let entry = Mutex::new((self.entry, self.max_level));
-    let orphans = Mutex::new(Vec::new());
     let r = {
       let b = Builder {
         view: BuildView {
@@ -550,8 +544,6 @@ impl HnswIndex {
         metric: self.metric,
         ef_construction: self.params.ef_construction,
         entry: &entry,
-        indeg: as_atomic(&mut self.indeg),
-        orphans: &orphans,
         prot: as_atomic(self.prot.to_mut()),
       };
       f(&b)
@@ -559,6 +551,56 @@ impl HnswIndex {
     (self.entry, self.max_level) =
       entry.into_inner().unwrap_or_else(|e| e.into_inner());
     r
+  }
+
+  /// Checks the protected tree of a graph read from a file, once, before
+  /// its first insert: a node is in the tree if its parent chain reaches
+  /// the entry point through edges that really are in the lists. Parents
+  /// whose edge is missing are cleared (so "protected" always means
+  /// "present"); returns the nodes not in the tree, to be re-attached.
+  fn check_tree(&mut self) -> Vec<DocId> {
+    let n = self.len();
+    let m0 = 2 * self.params.m;
+    let root = self.entry;
+    let prot = self.prot.to_mut();
+    prot.resize(n, NONE);
+    let l0 = self.graph.l0.as_slice();
+    let links = |p: usize, x: u32| {
+      let r = &l0[p * (1 + m0)..(p + 1) * (1 + m0)];
+      r[1..1 + (r[0] as usize).min(m0)].contains(&x)
+    };
+    // 0 unknown, 1 in the tree, 2 not, 3 on the chain being followed.
+    let mut state = vec![0u8; n];
+    if n > 0 {
+      state[root as usize] = 1;
+    }
+    let mut chain = Vec::new();
+    for x in 0..n {
+      chain.clear();
+      let mut y = x;
+      let result = loop {
+        match state[y] {
+          1 => break 1,
+          2 | 3 => break 2,
+          _ => {}
+        }
+        chain.push(y);
+        let p = prot[y];
+        if p == NONE || p as usize >= n || !links(p as usize, y as u32) {
+          prot[y] = NONE;
+          break 2;
+        }
+        state[y] = 3;
+        y = p as usize;
+      };
+      for &z in &chain {
+        state[z] = result;
+      }
+    }
+    self.tree_ready = true;
+    (0..n as DocId)
+      .filter(|&x| state[x as usize] == 2)
+      .collect()
   }
 
   /// Makes a graph read from a file safe to build on. Search tolerates
@@ -711,9 +753,8 @@ impl HnswIndex {
       quant,
       trained_on: meta::usize_field(f[11], "training size")?,
       from_file: true,
-      indeg: Vec::new(),
       prot,
-      indeg_ready: false,
+      tree_ready: false,
     })
   }
 
@@ -910,6 +951,52 @@ mod tests {
     assert_eq!(idx.len(), 100);
     assert_eq!(idx.write_to(Vec::new()).unwrap(), before);
     assert_eq!(idx.add_batch(&more).unwrap(), 100..300);
+  }
+
+  /// Nodes whose protected parent chain does not reach the entry point
+  /// through edges that are really in the lists (should be none).
+  fn outside_tree(idx: &HnswIndex) -> usize {
+    let mut c = idx.clone();
+    c.prot.to_mut();
+    c.check_tree().len()
+  }
+
+  /// Reachability holds by construction after every insert pattern:
+  /// parallel bulk builds, single inserts (which never ran the old
+  /// reachability walk), small batches into a large index (which skipped
+  /// it too), and inserts after reopening. A deliberately sparse graph
+  /// (M = 4) on 8 threads makes stranded nodes likely without the tree.
+  #[test]
+  fn protected_tree_spans_every_node_after_any_insert_pattern() {
+    let dim = 16;
+    let pool = rayon::ThreadPoolBuilder::new()
+      .num_threads(8)
+      .build()
+      .unwrap();
+    pool.install(|| {
+      let p = HnswParams::default().with_m(4).with_ef_construction(32);
+      let check = |idx: &HnswIndex, step: &str| {
+        assert_eq!(outside_tree(idx), 0, "{step}: nodes outside the tree");
+        assert_eq!(idx.stats().unreachable, 0, "{step}: unreachable");
+      };
+      let mut idx =
+        HnswIndex::build(dim, Metric::L2, p, &data(6000, dim, 7)).unwrap();
+      check(&idx, "bulk build");
+      for row in data(300, dim, 8).chunks_exact(dim) {
+        idx.insert(row).unwrap();
+      }
+      check(&idx, "single inserts");
+      idx.add_batch(&data(70, dim, 9)).unwrap();
+      check(&idx, "small batch into a large index");
+      let buf = idx.write_to(muninn_core::AlignedBuf::new()).unwrap();
+      let mut back = HnswIndex::open(Region::new(buf)).unwrap();
+      back.add_batch(&data(2000, dim, 10)).unwrap();
+      check(&back, "batch after reopen");
+      for row in data(100, dim, 11).chunks_exact(dim) {
+        back.insert(row).unwrap();
+      }
+      check(&back, "single inserts after reopen");
+    });
   }
 
   /// Review item 6: in a parallel build another thread can add a
