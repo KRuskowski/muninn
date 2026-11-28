@@ -13,7 +13,7 @@ use muninn_core::{DocFilter, DocId, Error, Hit, Metric, Region, Result, TopK};
 use rayon::prelude::*;
 
 use self::build::{Builder, MAX_LEVEL, level_for};
-use self::graph::{BuildView, Graph, GraphView, NONE, as_atomic};
+use self::graph::{BuildView, Graph, GraphView, NONE, Neighbors, as_atomic};
 use self::search::{Abort, Beam, beam, greedy, prefer_exact, with_scratch};
 use crate::dist::{Dist, FullDist};
 use crate::flat::{
@@ -27,7 +27,7 @@ use crate::{SearchParams, VectorIndex, meta};
 /// Container kind of an [`HnswIndex`] file.
 pub const HNSW_KIND: [u8; 8] = tag("hnsw");
 /// Current [`HnswIndex`] file format version.
-pub const HNSW_VERSION: u32 = 1;
+pub const HNSW_VERSION: u32 = 2;
 
 const T_META: [u8; 8] = tag("meta");
 const T_VECTORS: [u8; 8] = tag("vectors");
@@ -35,6 +35,9 @@ const T_LEVELS: [u8; 8] = tag("levels");
 const T_L0: [u8; 8] = tag("l0");
 const T_UPOFF: [u8; 8] = tag("upoff");
 const T_UPPER: [u8; 8] = tag("upper");
+/// Since version 2: per node, the neighbour whose edge to it is
+/// protected (see `Builder::ensure_backlink`). Version 1 files have none.
+const T_PROT: [u8; 8] = tag("prot");
 const META_FIELDS: usize = 12;
 
 /// Nodes a filtered search scores before judging the filter's
@@ -201,6 +204,18 @@ pub struct HnswIndex {
   max_level: u8,
   quant: Option<Quantizer>,
   trained_on: usize,
+  /// Opened from a file whose graph has not been checked yet; see
+  /// [`HnswIndex::repair`].
+  from_file: bool,
+  /// Level-0 in-degree per node, maintained by builds so orphaned nodes
+  /// can be re-linked. Not persisted: rebuilt from the graph on the first
+  /// insert after opening a file (`indeg_ready == false`).
+  indeg: Vec<u32>,
+  /// Per node, the neighbour whose edge to it is protected ([`NONE`] =
+  /// none); see `Builder::ensure_backlink`. Persisted (mapped after
+  /// open); empty or shorter than `len()` means "none" for the rest.
+  prot: Slab<u32>,
+  indeg_ready: bool,
 }
 
 /// Index structure sizes, for capacity planning and reports.
@@ -218,6 +233,9 @@ pub struct HnswStats {
   pub code_bytes: usize,
   /// Average level-0 out-degree.
   pub avg_degree: usize,
+  /// Nodes that a level-0 walk from the entry point cannot reach, so no
+  /// search can find them. Zero in a healthy graph.
+  pub unreachable: usize,
 }
 
 impl HnswIndex {
@@ -235,8 +253,12 @@ impl HnswIndex {
       graph: Graph::default(),
       entry: NONE,
       max_level: 0,
-      quant: None,
+      quant: Quantizer::train(params.quantization, dim, metric, &[]),
       trained_on: 0,
+      from_file: false,
+      indeg: Vec::new(),
+      prot: Slab::default(),
+      indeg_ready: true,
     })
   }
 
@@ -318,7 +340,33 @@ impl HnswIndex {
       graph_bytes: self.graph.bytes(),
       code_bytes: self.quant.as_ref().map_or(0, |q| q.bytes()),
       avg_degree: edges.checked_div(len).unwrap_or(0),
+      unreachable: len - self.reachable_at_level0(),
     }
+  }
+
+  /// How many nodes a breadth-first walk over level 0 from the entry
+  /// point reaches.
+  fn reachable_at_level0(&self) -> usize {
+    let n = self.len();
+    if n == 0 {
+      return 0;
+    }
+    let g = self.view();
+    let mut seen = vec![false; n];
+    let mut queue = vec![self.entry];
+    seen[self.entry as usize] = true;
+    let mut buf = Vec::new();
+    let mut count = 1;
+    while let Some(x) = queue.pop() {
+      for &y in g.neighbors(x, 0, &mut buf) {
+        if (y as usize) < n && !seen[y as usize] {
+          seen[y as usize] = true;
+          count += 1;
+          queue.push(y);
+        }
+      }
+    }
+    count
   }
 
   /// Adds one vector and returns its id.
@@ -330,15 +378,42 @@ impl HnswIndex {
   /// Adds row-major `vectors` (`dim` floats per row) and returns their
   /// ids. Large batches are linked into the graph in parallel on the
   /// current rayon pool. A mapped index is copied into memory first.
+  /// On error the index is unchanged.
   pub fn add_batch(&mut self, vectors: &[f32]) -> Result<Range<DocId>> {
+    let range = self.append(vectors)?;
+    let (first, end) = (range.start as usize, range.end as usize);
+    if end > first {
+      self.link(first, end);
+    }
+    Ok(range)
+  }
+
+  /// Stores `vectors` (codes, levels, empty graph records) without
+  /// linking them. Everything that can fail is checked before anything
+  /// is changed.
+  fn append(&mut self, vectors: &[f32]) -> Result<Range<DocId>> {
     let rows = check_rows(self.dim, vectors)?;
     let first = self.len();
     check_capacity(first, rows)?;
+    let end = first + rows;
+    let (m, m0, dim) = (self.params.m, 2 * self.params.m, self.dim);
+    let new_levels: Vec<u8> = (first..end)
+      .map(|id| level_for(self.params.seed, id as DocId, m))
+      .collect();
+    let grow: usize = new_levels.iter().map(|&l| l as usize * (1 + m)).sum();
+    self
+      .graph
+      .upper
+      .len()
+      .checked_add(grow)
+      .filter(|&e| e < upper_limit())
+      .ok_or_else(|| Error::invalid("HNSW upper levels exceed u32 range"))?;
     if rows == 0 {
       return Ok(first as DocId..first as DocId);
     }
-    let (m, m0, dim) = (self.params.m, 2 * self.params.m, self.dim);
-    let end = first + rows;
+    if self.from_file {
+      self.repair();
+    }
 
     let data = self.vectors.to_mut();
     data.extend_from_slice(vectors);
@@ -364,74 +439,166 @@ impl HnswIndex {
     let levels = self.graph.levels.to_mut();
     let upoff = self.graph.upoff.to_mut();
     let upper = self.graph.upper.to_mut();
-    for id in first..end {
-      let l = level_for(self.params.seed, id as DocId, m);
+    for l in new_levels {
       levels.push(l);
       if l == 0 {
         upoff.push(NONE);
       } else {
-        let off = upper.len();
-        let grow = l as usize * (1 + m);
-        if off + grow >= NONE as usize {
-          return Err(Error::invalid("HNSW upper levels exceed u32 range"));
-        }
-        upoff.push(off as u32);
-        upper.resize(off + grow, 0);
+        // Below `upper_limit()`, checked above.
+        upoff.push(upper.len() as u32);
+        upper.resize(upper.len() + l as usize * (1 + m), 0);
       }
     }
-    let l0 = self.graph.l0.to_mut();
-    l0.resize(end * (1 + m0), 0);
-
-    let mut start = first;
+    self.graph.l0.to_mut().resize(end * (1 + m0), 0);
     if self.entry == NONE {
       self.entry = first as DocId;
-      self.max_level = levels[first];
-      start += 1;
+      self.max_level = self.graph.levels.as_slice()[first];
     }
+    Ok(first as DocId..end as DocId)
+  }
+
+  /// Links stored nodes `first..end` into the graph.
+  fn link(&mut self, first: usize, end: usize) {
+    let rows = end - first;
     let stripes = if rows < PAR_MIN_BATCH {
       1
     } else {
       end.next_power_of_two().min(1 << 16)
     };
-    let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
-    let entry = Mutex::new((self.entry, self.max_level));
-    let b = Builder {
-      view: BuildView {
-        m,
-        m0,
-        levels,
-        upoff,
-        l0: as_atomic(l0),
-        upper: as_atomic(upper),
-        locks: &locks,
-      },
-      data,
-      dim,
-      metric: self.metric,
-      ef_construction: self.params.ef_construction,
-      entry: &entry,
-    };
-    let warm = if first < SERIAL_WARMUP {
-      end.min(SERIAL_WARMUP)
-    } else {
-      start
-    };
-    for id in start..warm.max(start) {
-      b.insert(id as DocId);
-    }
-    let start = warm.max(start);
-    if rows < PAR_MIN_BATCH {
-      for id in start..end {
+    self.with_builder(stripes, |b| {
+      // The entry point (the very first node) has nothing to link to.
+      let start = if b.is_entry(first as DocId) {
+        first + 1
+      } else {
+        first
+      };
+      let warm = if first < SERIAL_WARMUP {
+        end.min(SERIAL_WARMUP).max(start)
+      } else {
+        start
+      };
+      for id in start..warm {
         b.insert(id as DocId);
       }
-    } else {
-      (start..end)
-        .into_par_iter()
-        .for_each(|id| b.insert(id as DocId));
+      if rows < PAR_MIN_BATCH {
+        for id in warm..end {
+          b.insert(id as DocId);
+        }
+      } else {
+        (warm..end)
+          .into_par_iter()
+          .for_each(|id| b.insert(id as DocId));
+      }
+      // Every new node gets an in-edge from its nearest neighbour, then
+      // any node left without an in-edge gets one.
+      if rows < PAR_MIN_BATCH {
+        (start..end).for_each(|id| b.ensure_backlink(id as DocId));
+      } else {
+        (start..end)
+          .into_par_iter()
+          .for_each(|id| b.ensure_backlink(id as DocId));
+      }
+      b.reconnect_orphans();
+      // The full reachability walk costs O(n * M): worth it for batches
+      // that are a noticeable share of the index (any bulk build), not
+      // for every single insert into a large one.
+      if rows >= PAR_MIN_BATCH && end <= rows.saturating_mul(1024) {
+        b.reconnect_unreachable();
+      }
+    });
+  }
+
+  /// Runs `f` with a [`Builder`] over this index's (owned) arrays, then
+  /// stores the possibly updated entry point.
+  fn with_builder<R>(
+    &mut self,
+    stripes: usize,
+    f: impl FnOnce(&Builder<'_>) -> R,
+  ) -> R {
+    let (m, m0) = (self.params.m, 2 * self.params.m);
+    let n = self.len();
+    if !self.indeg_ready {
+      self.indeg = vec![0; n];
+      for rec in self.graph.l0.as_slice().chunks_exact(1 + m0) {
+        for &id in &rec[1..1 + (rec[0] as usize).min(m0)] {
+          if let Some(d) = self.indeg.get_mut(id as usize) {
+            *d += 1;
+          }
+        }
+      }
+      self.indeg_ready = true;
     }
+    // Nodes appended since the last build have no edges yet.
+    self.indeg.resize(n, 0);
+    self.prot.to_mut().resize(n, NONE);
+    let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
+    let entry = Mutex::new((self.entry, self.max_level));
+    let orphans = Mutex::new(Vec::new());
+    let r = {
+      let b = Builder {
+        view: BuildView {
+          m,
+          m0,
+          levels: self.graph.levels.to_mut(),
+          upoff: self.graph.upoff.to_mut(),
+          l0: as_atomic(self.graph.l0.to_mut()),
+          upper: as_atomic(self.graph.upper.to_mut()),
+          locks: &locks,
+        },
+        data: self.vectors.to_mut(),
+        dim: self.dim,
+        metric: self.metric,
+        ef_construction: self.params.ef_construction,
+        entry: &entry,
+        indeg: as_atomic(&mut self.indeg),
+        orphans: &orphans,
+        prot: as_atomic(self.prot.to_mut()),
+      };
+      f(&b)
+    };
     (self.entry, self.max_level) =
       entry.into_inner().unwrap_or_else(|e| e.into_inner());
-    Ok(first as DocId..end as DocId)
+    r
+  }
+
+  /// Makes a graph read from a file safe to build on. Search tolerates
+  /// any bytes (it bounds-checks and skips bad ids), but inserting writes
+  /// into records, so before the first insert into an opened index (which
+  /// copies the arrays anyway) every level, upper offset, count and
+  /// neighbour id is checked once: bad levels or offsets drop the node's
+  /// upper levels, bad counts are clamped and bad ids removed.
+  fn repair(&mut self) {
+    let n = self.len();
+    let (m, m0) = (self.params.m, 2 * self.params.m);
+    let levels = self.graph.levels.to_mut();
+    let upoff = self.graph.upoff.to_mut();
+    let upper = self.graph.upper.to_mut();
+    let ulen = upper.len();
+    for i in 0..n {
+      let l = levels[i] as usize;
+      let fits = l <= MAX_LEVEL as usize
+        && upoff[i] != NONE
+        && (upoff[i] as usize)
+          .checked_add(l * (1 + m))
+          .is_some_and(|e| e <= ulen);
+      if l == 0 || !fits {
+        levels[i] = 0;
+        upoff[i] = NONE;
+        continue;
+      }
+      let off = upoff[i] as usize;
+      for rec in upper[off..off + l * (1 + m)].chunks_exact_mut(1 + m) {
+        clean_record(rec, m, n, i);
+      }
+    }
+    for (i, rec) in self.graph.l0.to_mut().chunks_exact_mut(1 + m0).enumerate()
+    {
+      clean_record(rec, m0, n, i);
+    }
+    if n > 0 {
+      self.max_level = levels[self.entry as usize];
+    }
+    self.from_file = false;
   }
 
   /// Writes the index as one container file in a single streaming pass.
@@ -446,7 +613,7 @@ impl HnswIndex {
       p.ef_construction as u64,
       p.ef_search as u64,
       p.seed,
-      p.quantization.to_u8() as u64,
+      self.quant.as_ref().map_or(0, |q| q.kind().to_u8()) as u64,
       p.filter.to_u8() as u64,
       self.entry as u64,
       self.max_level as u64,
@@ -458,6 +625,10 @@ impl HnswIndex {
     w.pod_section(T_L0, self.graph.l0.as_slice())?;
     w.pod_section(T_UPOFF, self.graph.upoff.as_slice())?;
     w.pod_section(T_UPPER, self.graph.upper.as_slice())?;
+    // Shorter than `len()` only for an index that was never built on.
+    let prot = self.prot.as_slice();
+    let prot = if prot.len() == self.len() { prot } else { &[] };
+    w.pod_section(T_PROT, prot)?;
     if let Some(q) = &self.quant {
       q.write_sections(&mut w)?;
     }
@@ -468,7 +639,16 @@ impl HnswIndex {
   /// codes are read in place from `region`: opening costs a few header
   /// reads, whatever the index size.
   pub fn open(region: Region) -> Result<Self> {
-    let c = Container::open_kind(region, HNSW_KIND, HNSW_VERSION)?;
+    let c = Container::open(region)?;
+    if c.kind() != HNSW_KIND {
+      return Err(Error::corrupt("not an HNSW index file"));
+    }
+    if !(1..=HNSW_VERSION).contains(&c.version()) {
+      return Err(Error::corrupt(format!(
+        "HNSW format version {} is not supported (expected 1..={HNSW_VERSION})",
+        c.version()
+      )));
+    }
     let f = meta::read(c.section(T_META)?, META_FIELDS)?;
     let dim = meta::usize_field(f[0], "dimension")?;
     let metric = meta::metric(f[1])?;
@@ -497,7 +677,12 @@ impl HnswIndex {
       upoff: Slab::from_region(c.section(T_UPOFF)?)?,
       upper: Slab::from_region(c.section(T_UPPER)?)?,
     };
+    let prot = match c.try_section(T_PROT) {
+      Some(r) => Slab::from_region(r)?,
+      None => Slab::default(),
+    };
     let sizes_ok = Some(vectors.len()) == n.checked_mul(dim)
+      && (prot.len() == n || prot.len() == 0)
       && graph.levels.len() == n
       && graph.upoff.len() == n
       && Some(graph.l0.len()) == n.checked_mul(1 + m0);
@@ -525,6 +710,10 @@ impl HnswIndex {
       max_level: max_level as u8,
       quant,
       trained_on: meta::usize_field(f[11], "training size")?,
+      from_file: true,
+      indeg: Vec::new(),
+      prot,
+      indeg_ready: false,
     })
   }
 
@@ -581,8 +770,12 @@ impl VectorIndex for HnswIndex {
     filter: Option<&dyn DocFilter>,
   ) -> Result<Vec<Hit>> {
     check_dim(self.dim, query)?;
-    let k = params.k;
-    if k == 0 || self.is_empty() {
+    // Nothing can return more than every vector: clamping `k`, `ef` and
+    // `rerank` to the index size keeps absurd values from sizing
+    // allocations.
+    let n = self.len();
+    let k = params.k.min(n);
+    if k == 0 {
       return Ok(Vec::new());
     }
     let q = prepare_query(self.metric, query);
@@ -590,7 +783,7 @@ impl VectorIndex for HnswIndex {
       0 => self.params.ef_search,
       ef => ef,
     }
-    .max(k);
+    .clamp(k, n);
     // With a selectivity hint, Auto decides up front; without one it
     // judges the filter from the pass rate seen during traversal.
     let mut adaptive = false;
@@ -635,7 +828,7 @@ impl VectorIndex for HnswIndex {
           0 => qz.kind().default_rerank(k),
           r => r,
         }
-        .max(k);
+        .clamp(k, n);
         let qc = qz.prepare(self.metric, &q);
         let b = with_code_dist!(qz.dist(&qc), |d| {
           self.graph_search(&d, ef.max(r), filter, adaptive)
@@ -650,5 +843,102 @@ impl VectorIndex for HnswIndex {
       }
     };
     Ok(top.into_hits(self.metric))
+  }
+}
+
+/// Clamps a record's count and removes ids that are out of range or the
+/// node itself.
+fn clean_record(rec: &mut [u32], cap: usize, n: usize, me: usize) {
+  let c = (rec[0] as usize).min(cap);
+  let mut kept = 0;
+  for i in 1..=c {
+    let id = rec[i];
+    if (id as usize) < n && id as usize != me {
+      rec[1 + kept] = id;
+      kept += 1;
+    }
+  }
+  rec[0] = kept as u32;
+}
+
+/// Upper-array size limit: offsets must stay below [`NONE`].
+#[cfg(not(test))]
+fn upper_limit() -> usize {
+  NONE as usize
+}
+
+#[cfg(test)]
+thread_local! {
+  static UPPER_LIMIT: std::cell::Cell<usize> =
+    const { std::cell::Cell::new(NONE as usize) };
+}
+
+/// Test builds can lower the limit to exercise the overflow error.
+#[cfg(test)]
+fn upper_limit() -> usize {
+  UPPER_LIMIT.with(|c| c.get())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn data(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    (0..n * dim)
+      .map(|_| {
+        s = s
+          .wrapping_mul(6364136223846793005)
+          .wrapping_add(1442695040888963407);
+        ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+      })
+      .collect()
+  }
+
+  /// Review item 5: a batch rejected for overflowing the upper-level
+  /// array must leave the index exactly as it was.
+  #[test]
+  fn failed_add_batch_leaves_index_unchanged() {
+    let p = HnswParams::default().with_quantization(Quantization::Sq8);
+    let mut idx = HnswIndex::build(8, Metric::L2, p, &data(100, 8, 1)).unwrap();
+    let before = idx.write_to(Vec::new()).unwrap();
+    let more = data(200, 8, 2);
+    UPPER_LIMIT.with(|c| c.set(idx.graph.upper.len()));
+    let res = idx.add_batch(&more);
+    UPPER_LIMIT.with(|c| c.set(NONE as usize));
+    assert!(res.is_err());
+    assert_eq!(idx.len(), 100);
+    assert_eq!(idx.write_to(Vec::new()).unwrap(), before);
+    assert_eq!(idx.add_batch(&more).unwrap(), 100..300);
+  }
+
+  /// Review item 6: in a parallel build another thread can add a
+  /// back-link into a new node's list (it found the node as a search
+  /// entry) before the node's own insert writes that list. The insert
+  /// must keep it, not overwrite it.
+  #[test]
+  fn back_links_added_while_a_node_is_inserted_are_kept() {
+    let dim = 8;
+    let d = data(400, dim, 3);
+    let p = HnswParams::default();
+    let mut idx = HnswIndex::build(dim, Metric::L2, p, &d).unwrap();
+    // A new node right next to node 0, and the node farthest from it,
+    // which the new node's own search would never select.
+    let v: Vec<f32> = d[..dim].iter().map(|x| x + 1e-3).collect();
+    let far = (0..400u32)
+      .max_by(|&a, &b| {
+        let da = muninn_simd::l2sq(&v, idx.vector(a));
+        da.total_cmp(&muninn_simd::l2sq(&v, idx.vector(b)))
+      })
+      .unwrap();
+    let q = idx.append(&v).unwrap().start;
+    idx.with_builder(1, |b| {
+      b.connect(q, far, 0);
+      b.insert(q);
+    });
+    let mut buf = Vec::new();
+    let nb = idx.view().neighbors(q, 0, &mut buf).to_vec();
+    assert!(nb.contains(&far), "back-link lost: {nb:?}");
+    assert!(nb.len() > 1);
   }
 }

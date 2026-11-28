@@ -44,7 +44,7 @@ impl<T: Pod> Slab<T> {
   /// caller did not allocate aligned). Fails if the length is ragged.
   pub(crate) fn from_region(region: Region) -> Result<Self> {
     let size = std::mem::size_of::<T>();
-    if region.len() % size != 0 {
+    if !region.len().is_multiple_of(size) {
       return Err(Error::corrupt(format!(
         "section of {} bytes is not a whole number of {size}-byte values",
         region.len()
