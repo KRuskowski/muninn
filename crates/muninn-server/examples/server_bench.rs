@@ -454,7 +454,10 @@ fn main() {
     "| embedded, batches of {up_batch} | {up_conc} | {:.0} | {:.0} | {:.0} |",
     s.per_sec, s.p50_us, s.p99_us
   );
-  fresh("up_http");
+  // Untimed: the segment build (HNSW, on all cores) of one phase must not
+  // run during the next.
+  ce.flush().unwrap();
+  let ch = fresh("up_http");
   let (w, l) = client_rt.block_on(http_load(
     addr,
     "/v1/collections/up_http/documents",
@@ -467,6 +470,8 @@ fn main() {
     "| HTTP JSON, batches of {up_batch} | {up_conc} | {:.0} | {:.0} | {:.0} |",
     s.per_sec, s.p50_us, s.p99_us
   );
+  ch.flush().unwrap();
+  drop(ch);
   fresh("up_bulk");
   let ndjson = Bytes::from(ndjson);
   let (w, _) = client_rt.block_on(async {

@@ -1,8 +1,9 @@
 //! The router and its handlers.
 //!
 //! Every engine call (and the JSON parsing and encoding around it) runs
-//! on tokio's blocking thread pool, so the async workers only move bytes
-//! and are never held up by a search, an fsync or a large body.
+//! as blocking work (see `blocking`), so the async runtime keeps moving
+//! bytes for other connections and is never held up by a search, an
+//! fsync or a large body.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -162,10 +163,18 @@ impl FromRequest<AppState> for Body {
   }
 }
 
-/// Runs `f` on the blocking pool.
+/// Runs blocking `f` without stalling other tasks. On a multi-threaded
+/// runtime it runs in place: tokio hands this worker's other tasks to
+/// another thread first ([`tokio::task::block_in_place`]), which saves a
+/// cross-thread wake-up per request (about 25 us per search measured with
+/// `examples/server_bench.rs`). Elsewhere it goes to the blocking pool.
 pub(crate) async fn blocking<T: Send + 'static>(
   f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
+  use tokio::runtime::{Handle, RuntimeFlavor};
+  if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
+    return tokio::task::block_in_place(f);
+  }
   tokio::task::spawn_blocking(f)
     .await
     .map_err(|e| ApiError::internal(format!("request worker failed: {e}")))?

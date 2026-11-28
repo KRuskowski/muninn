@@ -19,6 +19,7 @@ use rayon::prelude::*;
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 /// Largest `k` a search may ask for.
@@ -515,34 +516,94 @@ impl Serialize for IdOut<'_> {
   }
 }
 
-/// The fields of a document as JSON; moved into a [`Document`].
+/// Parses a JSON array of numbers into `f32`s from its text.
+///
+/// serde_json in this build parses every number with correct rounding to
+/// `f64` first (the `float_roundtrip` feature, needed by payload filters),
+/// which dominates the cost of decoding a vector. The standard library's
+/// parser rounds correctly straight to `f32` (no double rounding) and is
+/// several times faster. `raw` must be valid JSON (as a [`RawValue`] is);
+/// anything but an array of numbers is an error.
+pub fn parse_f32_array(raw: &str) -> std::result::Result<Vec<f32>, String> {
+  let short = |s: &str| {
+    let s = s.trim();
+    match s.char_indices().nth(24) {
+      Some((i, _)) => format!("{}...", &s[..i]),
+      None => s.to_string(),
+    }
+  };
+  let t = raw.trim();
+  let inner = t
+    .strip_prefix('[')
+    .and_then(|s| s.strip_suffix(']'))
+    .ok_or_else(|| format!("expected an array of numbers, got {}", short(t)))?;
+  if inner.trim().is_empty() {
+    return Ok(Vec::new());
+  }
+  let mut out = Vec::with_capacity(inner.len() / 8 + 1);
+  for tok in inner.split(',') {
+    let tok = tok.trim();
+    // Valid JSON, so a token starting like a number is a JSON number,
+    // which Rust's grammar accepts; strings, arrays, objects, true,
+    // false and null all start otherwise.
+    let numeric = tok
+      .as_bytes()
+      .first()
+      .is_some_and(|&b| b == b'-' || b.is_ascii_digit());
+    match tok.parse::<f32>() {
+      Ok(x) if numeric => out.push(x),
+      _ => return Err(format!("expected a number, got {}", short(tok))),
+    }
+  }
+  Ok(out)
+}
+
+fn fast_vector<E: de::Error>(
+  raw: Option<&RawValue>,
+) -> std::result::Result<Option<Vec<f32>>, E> {
+  raw
+    .map(|r| parse_f32_array(r.get()))
+    .transpose()
+    .map_err(|e| E::custom(format!("vector: {e}")))
+}
+
+fn de_fast_vector<'de, D: Deserializer<'de>>(
+  d: D,
+) -> std::result::Result<Option<Vec<f32>>, D::Error> {
+  let raw = Option::<Box<RawValue>>::deserialize(d)?;
+  fast_vector(raw.as_deref())
+}
+
+/// The fields of a document as JSON, the vector still as text.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawDoc {
+struct RawDoc<'a> {
   id: IdIn,
-  #[serde(default)]
-  vector: Option<Vec<f32>>,
+  #[serde(default, borrow)]
+  vector: Option<&'a RawValue>,
   #[serde(default)]
   text: BTreeMap<String, String>,
   #[serde(default)]
   payload: Value,
 }
 
-/// A [`Document`] deserialized from JSON. Same layout as `Document`, so a
-/// `Vec<DocIn>` turns into a `Vec<Document>` in place.
-#[derive(Deserialize)]
-#[serde(from = "RawDoc")]
+/// A [`Document`] deserialized from JSON (from a byte slice, which the
+/// vector borrows from while it is parsed). Same layout as `Document`, so
+/// a `Vec<DocIn>` turns into a `Vec<Document>` in place.
 #[repr(transparent)]
 struct DocIn(Document);
 
-impl From<RawDoc> for DocIn {
-  fn from(r: RawDoc) -> Self {
-    DocIn(Document {
+impl<'de> Deserialize<'de> for DocIn {
+  fn deserialize<D: Deserializer<'de>>(
+    d: D,
+  ) -> std::result::Result<Self, D::Error> {
+    let r = RawDoc::deserialize(d)?;
+    Ok(DocIn(Document {
       id: r.id.0,
-      vector: r.vector,
+      vector: fast_vector(r.vector)?,
       text: r.text,
       payload: r.payload,
-    })
+    }))
   }
 }
 
@@ -669,6 +730,7 @@ impl Serialize for DocOut<'_> {
 #[serde(deny_unknown_fields)]
 pub struct SearchRequest {
   /// Query vector.
+  #[serde(default, deserialize_with = "de_fast_vector")]
   pub vector: Option<Vec<f32>>,
   /// Query text.
   pub text: Option<String>,
@@ -923,6 +985,57 @@ mod tests {
         .enumerate()
         .all(|(i, d)| d.id == Id::U64(i as u64))
     );
+  }
+
+  #[test]
+  fn f32_arrays_parse_like_serde_but_round_once() {
+    assert_eq!(parse_f32_array("[]"), Ok(vec![]));
+    assert_eq!(parse_f32_array(" [ ] "), Ok(vec![]));
+    assert_eq!(
+      parse_f32_array("[1, -2.5e3,0.125 ,\n3E-2]"),
+      Ok(vec![1.0, -2500.0, 0.125, 0.03])
+    );
+    for bad in ["{}", "1", "[1, \"2\"]", "[[1]]", "[null]", "[true]"] {
+      assert!(parse_f32_array(bad).is_err(), "{bad}");
+    }
+    // Every f32, printed shortest, parses back to the same bits; and
+    // decimal text agrees with serde_json up to its double rounding.
+    let mut rng = 0x1234_5678_9abc_def0u64;
+    let mut vals = Vec::new();
+    let mut text = String::from("[");
+    for i in 0..20_000 {
+      rng ^= rng << 13;
+      rng ^= rng >> 7;
+      rng ^= rng << 17;
+      let x = f32::from_bits(rng as u32);
+      if !x.is_finite() {
+        continue;
+      }
+      if i > 0 {
+        text.push(',');
+      }
+      text += &serde_json::to_string(&x).unwrap();
+      vals.push(x);
+    }
+    text.push(']');
+    let got = parse_f32_array(&text).unwrap();
+    assert_eq!(got.len(), vals.len());
+    assert!(
+      got
+        .iter()
+        .zip(&vals)
+        .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    let serde: Vec<f32> = serde_json::from_str(&text).unwrap();
+    assert!(got.iter().zip(&serde).all(|(a, b)| {
+      a.to_bits() == b.to_bits() || (a - b).abs() <= a.abs() * 1e-7
+    }));
+    let e = parse_document(br#"{"id": 1, "vector": [1, "x"]}"#).unwrap_err();
+    assert!(e.to_string().contains("vector: expected a number"), "{e}");
+    let q = SearchRequest::parse(br#"{"vector": [0.5, 2], "k": 1}"#).unwrap();
+    assert_eq!(q.vector, Some(vec![0.5, 2.0]));
+    let q = SearchRequest::parse(br#"{"vector": null, "text": "a"}"#).unwrap();
+    assert_eq!(q.vector, None);
   }
 
   #[test]

@@ -476,7 +476,7 @@ async fn invalid_requests_are_rejected_clearly() {
       "POST",
       up,
       r#"{"documents": [{"id": 1, "vector": [1, "a", 0]}]}"#,
-      "invalid type",
+      "vector: expected a number, got \"a\"",
     ),
     ("DELETE", up, r#"{"ids": [1.5]}"#, "document id"),
     ("DELETE", up, "{}", "missing field `ids`"),

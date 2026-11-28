@@ -119,7 +119,7 @@ The batch is all-or-nothing: if any document is invalid nothing is stored, and a
 
 Newline-delimited JSON: one document per line, blank lines ignored. The body is streamed, so its total size is unlimited; one line may not exceed `--body-limit`. Documents are stored in batches of `N` (default `--bulk-batch`, 1000; at most 100000), each all-or-nothing; reading, parsing (on all cores) and writing overlap. Response: `{"count": 50000, "batches": 50, "took_us": 1234567}`.
 
-If a line is invalid, the request fails with an error naming the line, and the batches before it stay stored, as the message says: `line 1203: invalid type: string "x", expected f32 at line 1 column 30; the 1000 documents before it were stored`.
+If a line is invalid, the request fails with an error naming the line, and the batches before it stay stored, as the message says: `line 1203: vector: expected a number, got "x" at line 1 column 30; the 1000 documents before it were stored`.
 
 ```sh
 curl -sS -X POST --data-binary @docs.jsonl 'http://127.0.0.1:7700/v1/collections/docs/documents:bulk'
