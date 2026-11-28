@@ -10,6 +10,7 @@
 //! against that single segment with the same protocol as every other
 //! engine (see [`crate::run`]).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -65,19 +66,56 @@ pub struct Ingest {
   pub segments_after_flush: usize,
   /// Segments after `compact`.
   pub segments_after_compact: usize,
-  /// Size of the database directory after `compact`.
+  /// Size of the database directory right after `compact`, while the
+  /// database is still open (may include files that are no longer
+  /// live but not yet removed).
+  pub dir_bytes_after_compact: u64,
+  /// Time to close the database and open it again.
+  pub reopen_seconds: f64,
+  /// Size of the database directory after reopening: the on-disk
+  /// footprint of the data.
   pub dir_bytes: u64,
+  /// `dir_bytes` by file extension (`vec`, `ids`, `docs`, `wal`, ...).
+  pub bytes_by_kind: BTreeMap<String, u64>,
   /// Resident memory growth over the whole ingest, when measurable.
   pub rss_delta_bytes: Option<i64>,
 }
 
+fn bytes_by_kind(dir: &Path, out: &mut BTreeMap<String, u64>) -> Result<()> {
+  for entry in std::fs::read_dir(dir)? {
+    let p = entry?.path();
+    if p.is_dir() {
+      bytes_by_kind(&p, out)?;
+    } else {
+      let kind = p
+        .extension()
+        .map_or("other".to_string(), |e| e.to_string_lossy().into_owned());
+      *out.entry(kind).or_default() += std::fs::metadata(&p)?.len();
+    }
+  }
+  Ok(())
+}
+
+/// Creates a fresh database in `work_dir/name` with one collection,
+/// ingests `n` documents, flushes, compacts to one segment, closes and
+/// reopens it. Returns the reopened database and collection.
 fn ingest(
-  db_dir: &Path,
-  coll: &Collection,
+  work_dir: &Path,
+  name: &str,
+  durability: Durability,
+  schema: Schema,
   n: usize,
   batch: usize,
   make: impl Fn(usize) -> Document,
-) -> Result<Ingest> {
+) -> Result<(PathBuf, Database, Collection, Ingest)> {
+  let dir = work_dir.join(name);
+  if dir.exists() {
+    std::fs::remove_dir_all(&dir)?;
+  }
+  std::fs::create_dir_all(&dir)?;
+  let opts = Options::default().durability(durability);
+  let db = Database::open(&dir, opts.clone())?;
+  let coll = db.create_collection("bench", schema)?;
   let rss0 = rss_bytes();
   let t = Instant::now();
   let mut start = 0;
@@ -100,14 +138,8 @@ fn ingest(
   coll.compact()?;
   let compact_s = t.elapsed().as_secs_f64();
   let stats = coll.stats()?;
-  let bytes = dir_size(db_dir)?;
-  eprintln!(
-    "  flush {flush_s:.1} s ({after_flush} segments), compact \
-     {compact_s:.1} s ({} segments, {} live docs), {:.1} MB on disk",
-    stats.segments.len(),
-    stats.live_docs,
-    bytes as f64 / 1e6
-  );
+  let raw_bytes = dir_size(&dir)?;
+  let rss = rss_delta(rss0, rss_bytes());
   if stats.live_docs != n as u64 {
     return Err(
       format!(
@@ -117,7 +149,24 @@ fn ingest(
       .into(),
     );
   }
-  Ok(Ingest {
+  drop(coll);
+  drop(db);
+  let t = Instant::now();
+  let db = Database::open(&dir, opts)?;
+  let coll = db.collection("bench")?;
+  let reopen_s = t.elapsed().as_secs_f64();
+  let bytes = dir_size(&dir)?;
+  let mut kinds = BTreeMap::new();
+  bytes_by_kind(&dir, &mut kinds)?;
+  eprintln!(
+    "  flush {flush_s:.1} s ({after_flush} segments), compact \
+     {compact_s:.1} s ({} segments); {:.1} MB on disk after compact, \
+     {:.1} MB after reopening ({reopen_s:.2} s)",
+    stats.segments.len(),
+    raw_bytes as f64 / 1e6,
+    bytes as f64 / 1e6
+  );
+  let ing = Ingest {
     docs: n,
     batch,
     upsert_seconds: upsert_s,
@@ -125,23 +174,13 @@ fn ingest(
     compact_seconds: compact_s,
     segments_after_flush: after_flush,
     segments_after_compact: stats.segments.len(),
+    dir_bytes_after_compact: raw_bytes,
+    reopen_seconds: reopen_s,
     dir_bytes: bytes,
-    rss_delta_bytes: rss_delta(rss0, rss_bytes()),
-  })
-}
-
-fn fresh_db(
-  work_dir: &Path,
-  name: &str,
-  durability: Durability,
-) -> Result<(PathBuf, Database)> {
-  let dir = work_dir.join(name);
-  if dir.exists() {
-    std::fs::remove_dir_all(&dir)?;
-  }
-  std::fs::create_dir_all(&dir)?;
-  let db = Database::open(&dir, Options::default().durability(durability))?;
-  Ok((dir, db))
+    bytes_by_kind: kinds,
+    rss_delta_bytes: rss,
+  };
+  Ok((dir, db, coll, ing))
 }
 
 fn hit_ids(hits: Vec<muninn::SearchHit>) -> Vec<u32> {
@@ -198,11 +237,6 @@ pub fn run_engine_vector(
      {}), HNSW M={} efC={}",
     ds.base.rows, cfg.batch, cfg.durability, cfg.m, cfg.ef_construction
   );
-  let (dir, db) = fresh_db(
-    &cfg.work_dir,
-    &format!("engine-{name}"),
-    parse_durability(&cfg.durability)?,
-  )?;
   let field = VectorField {
     index: IndexKind::Hnsw {
       m: cfg.m,
@@ -210,11 +244,17 @@ pub fn run_engine_vector(
     },
     ..VectorField::hnsw(ds.dim(), metric)
   };
-  let coll = db.create_collection("bench", Schema::vector(field))?;
-  let ing = pools.all.install(|| {
-    ingest(&dir, &coll, ds.base.rows, cfg.batch, |i| {
-      Document::new(i as u64).vector(ds.base.row(i).to_vec())
-    })
+  let durability = parse_durability(&cfg.durability)?;
+  let (dir, db, coll, ing) = pools.all.install(|| {
+    ingest(
+      &cfg.work_dir,
+      &format!("engine-{name}"),
+      durability,
+      Schema::vector(field),
+      ds.base.rows,
+      cfg.batch,
+      |i| Document::new(i as u64).vector(ds.base.row(i).to_vec()),
+    )
   })?;
   let mut results = Vec::new();
   for &ef in &cfg.efs {
@@ -269,8 +309,9 @@ pub fn run_engine_vector(
       "End to end through Collection::upsert / flush / compact / search; \
        build seconds = upsert + flush + compact (to one segment)."
         .into(),
-      "Index size is the whole database directory (vectors, graph, id \
-       map, manifest)."
+      "Index size is the whole database directory after closing and \
+       reopening it (vectors, graph, id map, stored documents, manifest); \
+       searches run on the reopened collection."
         .into(),
     ],
   };
@@ -312,17 +353,18 @@ pub fn run_engine_text(cfg: &EngineTextRun, pools: &Pools) -> Result<PathBuf> {
     cfg.durability,
     tc.analyzer.name()
   );
-  let (dir, db) = fresh_db(
-    &tc.work_dir,
-    &format!("engine-text-{}", tc.analyzer.name()),
-    parse_durability(&cfg.durability)?,
-  )?;
+  let durability = parse_durability(&cfg.durability)?;
   let schema = Schema::text(["text"]).with_analyzer(tc.analyzer.config());
-  let coll = db.create_collection("bench", schema)?;
-  let ing = pools.all.install(|| {
-    ingest(&dir, &coll, docs.len(), cfg.batch, |i| {
-      Document::new(i as u64).text("text", docs[i].as_str())
-    })
+  let (dir, db, coll, ing) = pools.all.install(|| {
+    ingest(
+      &tc.work_dir,
+      &format!("engine-text-{}", tc.analyzer.name()),
+      durability,
+      schema,
+      docs.len(),
+      cfg.batch,
+      |i| Document::new(i as u64).text("text", docs[i].as_str()),
+    )
   })?;
   let k = tc.k;
   let m = measure(pools, &queries, tc.runs, |q| {
