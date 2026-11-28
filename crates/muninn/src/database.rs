@@ -7,17 +7,24 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use muninn_core::{Error, Result};
 use muninn_store::DirLock;
-use muninn_store::fs::{sync_dir, temp_path_for};
+use muninn_store::fs::sync_dir;
 
-use crate::collection::{Collection, Core, Handle};
+use crate::collection::{
+  Collection, Core, DROPPED_MARKER, Handle, remove_collection_dir,
+};
 use crate::options::Options;
 use crate::schema::Schema;
 
 const COLLECTIONS_DIR: &str = "collections";
+
+/// Prefix of a dropped collection's directory, renamed aside until its
+/// files are released. Never a valid collection name.
+const DROPPED_PREFIX: &str = ".dropped-";
 
 /// An open database. Dropping it (and every [`Collection`] handle taken
 /// from it) stops background work and releases the directory.
@@ -82,10 +89,18 @@ impl Database {
         continue;
       };
       if check_name(&name).is_err() {
-        // Interrupted create_collection or drop_collection.
-        if name.ends_with(".creating") || name.ends_with(".dropped") {
+        // Interrupted create_collection, or a dropped collection whose
+        // files were still in use when it was dropped.
+        if name.starts_with(DROPPED_PREFIX)
+          || name.ends_with(".creating")
+          || name.ends_with(".dropped")
+        {
           leftovers.push(e.path());
         }
+        continue;
+      }
+      if e.path().join(DROPPED_MARKER).exists() {
+        leftovers.push(e.path());
         continue;
       }
       match Core::open(&e.path(), &name, &opts) {
@@ -101,8 +116,10 @@ impl Database {
         }
       }
     }
+    // Best effort: a directory that cannot be removed yet (files still
+    // open elsewhere) is never opened and is tried again next time.
     for p in leftovers {
-      std::fs::remove_dir_all(&p)?;
+      let _ = remove_collection_dir(&p);
     }
     Ok(Database {
       dir,
@@ -152,6 +169,11 @@ impl Database {
       return Err(Error::AlreadyExists(format!("collection {name:?}")));
     }
     let path = self.dir.join(COLLECTIONS_DIR).join(name);
+    if path.join(DROPPED_MARKER).exists() {
+      // A dropped collection that could not be set aside; its files are
+      // free by now unless a search was still running.
+      let _ = remove_collection_dir(&path);
+    }
     if path.exists() {
       return Err(Error::AlreadyExists(format!(
         "{} exists but is not an open collection",
@@ -185,12 +207,19 @@ impl Database {
     Ok(self.map()?.keys().cloned().collect())
   }
 
-  /// Deletes a collection and its files. Handles to it still held fail
-  /// with `NotFound` from then on.
+  /// Deletes a collection and its files. The name can be reused at
+  /// once; handles to the old collection still held fail with `NotFound`
+  /// from then on.
+  ///
+  /// The directory is renamed aside at once and deleted when the last
+  /// handle and running search release it (Windows cannot delete files
+  /// that are open or mapped). Anything left over, for example after a
+  /// crash, is deleted when the database is next opened.
   pub fn drop_collection(&self, name: &str) -> Result<()> {
     if self.failure(name).is_some() && !self.map()?.contains_key(name) {
       let path = self.dir.join(COLLECTIONS_DIR).join(name);
-      self.remove_dir(&path)?;
+      let aside = self.set_aside(name, &path)?;
+      let _ = remove_collection_dir(&aside);
       if let Ok(mut f) = self.failures.lock() {
         f.remove(name);
       }
@@ -202,20 +231,39 @@ impl Database {
       .ok_or_else(|| Error::NotFound(format!("collection {name:?}")))?;
     c.h.core.mark_dropped();
     c.h.stop();
+    c.h.core.release_files();
     let path = c.h.core.dir.clone();
+    let doomed = match self.set_aside(name, &path) {
+      Ok(aside) => aside,
+      Err(_) => {
+        // The rename was refused (a file in use without delete
+        // sharing). Mark the directory so it is never opened again.
+        muninn_store::fs::write_atomic(&path.join(DROPPED_MARKER), b"")?;
+        path
+      }
+    };
+    // Usually nothing holds the files any more; if a running search still
+    // maps a segment, the directory goes when the collection is released,
+    // or at the next open.
+    if remove_collection_dir(&doomed).is_err() {
+      c.h.core.remove_on_release(doomed);
+    }
     drop(c);
-    self.remove_dir(&path)
+    Ok(())
   }
 
-  /// Removes a collection directory: renamed first so a crash never
-  /// leaves half a collection under its name; the leftover is removed now
-  /// or at the next open.
-  fn remove_dir(&self, path: &Path) -> Result<()> {
-    let aside = temp_path_for(path).with_extension("dropped");
+  /// Renames a collection directory to a hidden, unique name, durably.
+  fn set_aside(&self, name: &str, path: &Path) -> Result<PathBuf> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let cdir = self.dir.join(COLLECTIONS_DIR);
+    let aside = cdir.join(format!(
+      "{DROPPED_PREFIX}{name}-{}-{}",
+      std::process::id(),
+      N.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::rename(path, &aside)?;
-    sync_dir(&self.dir.join(COLLECTIONS_DIR))?;
-    std::fs::remove_dir_all(&aside)?;
-    Ok(())
+    sync_dir(&cdir)?;
+    Ok(aside)
   }
 }
 
