@@ -1,0 +1,274 @@
+{
+  "kind": "vector",
+  "engine": "muninn-hnsw-sq8",
+  "engine_version": "0.1.0 (bcdd9f7)",
+  "dataset": {
+    "name": "sift-128-euclidean",
+    "metric": "l2",
+    "n": 1000000,
+    "dim": 128,
+    "queries": 10000,
+    "meta": {
+      "dim": 128,
+      "files": {
+        "base.fbin": {
+          "bytes": 512000008,
+          "sha256": "8c7b3d999ba3133f865af72df078f77c2d248fdb80571d7ea1f1bb8e1750658e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "4c06dd3d1539b1de50f1b7e98a116833ed5c2f1571d0ef81f383a04541e797e7"
+        },
+        "query.fbin": {
+          "bytes": 5120008,
+          "sha256": "9b0082b67d0ac55b4c7d42216560344567ad87ce3e75a9d5214a0762f1c15d65"
+        }
+      },
+      "gt_k": 100,
+      "n": 1000000,
+      "origin": "TEXMEX SIFT1M (Jegou et al.)",
+      "prepared": "2026-11-27T23:38:41Z",
+      "queries": 10000,
+      "sources": [
+        {
+          "bytes": 168280445,
+          "file": "sift.tar.gz",
+          "sha256": "92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
+          "url": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "quantization": "Sq8",
+    "rerank": 40
+  },
+  "build": {
+    "seconds": 97.34369627100001,
+    "threads": 4,
+    "index_bytes": 789543624,
+    "rss_delta_bytes": 676421632,
+    "peak_rss_bytes": 2129285120,
+    "details": {
+      "avg_level0_degree": 21,
+      "code_bytes": 132001024,
+      "graph_bytes": 141542060,
+      "graph_seconds": 96.945902802,
+      "max_level": 5,
+      "quantizer_seconds": 0.397793469,
+      "vector_bytes": 512000000,
+      "write_seconds": 3.220790945
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.92675,
+      "qps_1t": 13620.82271722438,
+      "qps_nt": 38550.476189360066,
+      "latency": {
+        "mean_us": 73.36399420000001,
+        "p50_us": 74.298,
+        "p95_us": 90.073,
+        "p99_us": 100.136,
+        "max_us": 254.266
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 16,
+      "recall": 0.92675,
+      "qps_1t": 13442.428552588239,
+      "qps_nt": 38041.00148155625,
+      "latency": {
+        "mean_us": 74.33963349999999,
+        "p50_us": 75.211,
+        "p95_us": 91.19,
+        "p99_us": 101.104,
+        "max_us": 143.301
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 24,
+      "recall": 0.92675,
+      "qps_1t": 13427.362178748279,
+      "qps_nt": 37739.542262450916,
+      "latency": {
+        "mean_us": 74.4215176,
+        "p50_us": 75.295,
+        "p95_us": 91.791,
+        "p99_us": 102.394,
+        "max_us": 287.128
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 32,
+      "recall": 0.92675,
+      "qps_1t": 13474.992661249498,
+      "qps_nt": 38101.55046982241,
+      "latency": {
+        "mean_us": 74.1585225,
+        "p50_us": 75.059,
+        "p95_us": 90.959,
+        "p99_us": 101.594,
+        "max_us": 133.865
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 48,
+      "recall": 0.94365,
+      "qps_1t": 11461.0333450582,
+      "qps_nt": 32884.93280516448,
+      "latency": {
+        "mean_us": 87.1975804,
+        "p50_us": 88.764,
+        "p95_us": 106.245,
+        "p99_us": 116.161,
+        "max_us": 209.673
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 64,
+      "recall": 0.96372,
+      "qps_1t": 9425.917776870901,
+      "qps_nt": 26148.018146787348,
+      "latency": {
+        "mean_us": 106.0351963,
+        "p50_us": 108.612,
+        "p95_us": 127.722,
+        "p99_us": 137.528,
+        "max_us": 174.351
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 96,
+      "recall": 0.98151,
+      "qps_1t": 6897.4622700243735,
+      "qps_nt": 18957.594127369575,
+      "latency": {
+        "mean_us": 144.9241141,
+        "p50_us": 149.582,
+        "p95_us": 173.737,
+        "p99_us": 183.27,
+        "max_us": 207.782
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 128,
+      "recall": 0.98929,
+      "qps_1t": 5394.513101977102,
+      "qps_nt": 14906.407267394672,
+      "latency": {
+        "mean_us": 185.3159988,
+        "p50_us": 191.822,
+        "p95_us": 222.496,
+        "p99_us": 234.564,
+        "max_us": 263.664
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 192,
+      "recall": 0.99502,
+      "qps_1t": 3860.015163575488,
+      "qps_nt": 10291.155487778784,
+      "latency": {
+        "mean_us": 259.0050774,
+        "p50_us": 268.922,
+        "p95_us": 313.741,
+        "p99_us": 327.643,
+        "max_us": 462.638
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 256,
+      "recall": 0.99732,
+      "qps_1t": 2802.537682064797,
+      "qps_nt": 8155.0683905809265,
+      "latency": {
+        "mean_us": 356.7530334,
+        "p50_us": 369.049,
+        "p95_us": 436.054,
+        "p99_us": 457.166,
+        "max_us": 512.751
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 384,
+      "recall": 0.99882,
+      "qps_1t": 2110.34618480951,
+      "qps_nt": 5982.3297485426765,
+      "latency": {
+        "mean_us": 473.77468339999996,
+        "p50_us": 491.322,
+        "p95_us": 585.948,
+        "p99_us": 609.874,
+        "max_us": 659.839
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 512,
+      "recall": 0.99919,
+      "qps_1t": 1649.239874033552,
+      "qps_nt": 4641.231076443708,
+      "latency": {
+        "mean_us": 606.2597737,
+        "p50_us": 627.545,
+        "p95_us": 755.003,
+        "p99_us": 791.227,
+        "max_us": 939.098
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "bcdd9f7",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795827931
+  },
+  "notes": [
+    "Searched from the memory-mapped index file.",
+    "Graph built in parallel with all threads; queries measured one at a time on one thread, and spread over all threads."
+  ]
+}

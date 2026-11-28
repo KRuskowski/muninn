@@ -1,0 +1,286 @@
+{
+  "kind": "vector",
+  "engine": "muninn-engine",
+  "engine_version": "0.1.0 (7b12b34)",
+  "dataset": {
+    "name": "sift-128-euclidean",
+    "metric": "l2",
+    "n": 1000000,
+    "dim": 128,
+    "queries": 10000,
+    "meta": {
+      "dim": 128,
+      "files": {
+        "base.fbin": {
+          "bytes": 512000008,
+          "sha256": "8c7b3d999ba3133f865af72df078f77c2d248fdb80571d7ea1f1bb8e1750658e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "4c06dd3d1539b1de50f1b7e98a116833ed5c2f1571d0ef81f383a04541e797e7"
+        },
+        "query.fbin": {
+          "bytes": 5120008,
+          "sha256": "9b0082b67d0ac55b4c7d42216560344567ad87ce3e75a9d5214a0762f1c15d65"
+        }
+      },
+      "gt_k": 100,
+      "n": 1000000,
+      "origin": "TEXMEX SIFT1M (Jegou et al.)",
+      "prepared": "2026-11-27T23:38:41Z",
+      "queries": 10000,
+      "sources": [
+        {
+          "bytes": 168280445,
+          "file": "sift.tar.gz",
+          "sha256": "92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
+          "url": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "batch": 1000,
+    "durability": "each",
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "memtable_max_docs": 50000
+  },
+  "build": {
+    "seconds": 256.51232576800004,
+    "threads": 4,
+    "index_bytes": 787800296,
+    "rss_delta_bytes": 152690688,
+    "peak_rss_bytes": 2359824384,
+    "details": {
+      "batch": 1000,
+      "bytes_by_kind": {
+        "docs": 22001504,
+        "ids": 91499056,
+        "other": 3063,
+        "vec": 1315100592,
+        "wal": 77701872
+      },
+      "compact_seconds": 96.784749141,
+      "dir_bytes": 1506306087,
+      "dir_bytes_after_compact": 1506306087,
+      "docs": 1000000,
+      "flush_seconds": 77.494013857,
+      "live_bytes": 787800296,
+      "reopen_seconds": 0.00188618,
+      "rss_delta_bytes": 152690688,
+      "segments_after_compact": 1,
+      "segments_after_flush": 5,
+      "upsert_seconds": 82.23356277
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.70761,
+      "qps_1t": 36109.01411020751,
+      "qps_nt": 85543.5095846712,
+      "latency": {
+        "mean_us": 27.619085899999998,
+        "p50_us": 26.841,
+        "p95_us": 39.299,
+        "p99_us": 46.615,
+        "max_us": 67.387
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 16,
+      "recall": 0.79953,
+      "qps_1t": 26821.53780214127,
+      "qps_nt": 64476.3429688822,
+      "latency": {
+        "mean_us": 37.2359229,
+        "p50_us": 36.535,
+        "p95_us": 51.217,
+        "p99_us": 59.579,
+        "max_us": 85.729
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 24,
+      "recall": 0.8661,
+      "qps_1t": 20181.92267647492,
+      "qps_nt": 48515.018592968496,
+      "latency": {
+        "mean_us": 49.4987828,
+        "p50_us": 49.113,
+        "p95_us": 65.402,
+        "p99_us": 75.629,
+        "max_us": 97.991
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 32,
+      "recall": 0.90456,
+      "qps_1t": 16473.323524073196,
+      "qps_nt": 39098.72267561818,
+      "latency": {
+        "mean_us": 60.655345200000006,
+        "p50_us": 60.632,
+        "p95_us": 78.7,
+        "p99_us": 90.23,
+        "max_us": 126.508
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 48,
+      "recall": 0.94475,
+      "qps_1t": 11831.624366608039,
+      "qps_nt": 28378.478673290912,
+      "latency": {
+        "mean_us": 84.4655457,
+        "p50_us": 85.582,
+        "p95_us": 105.862,
+        "p99_us": 116.464,
+        "max_us": 146.562
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 64,
+      "recall": 0.96438,
+      "qps_1t": 9310.023923260915,
+      "qps_nt": 22719.482268438067,
+      "latency": {
+        "mean_us": 107.352997,
+        "p50_us": 109.545,
+        "p95_us": 133.637,
+        "p99_us": 144.399,
+        "max_us": 180.281
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 96,
+      "recall": 0.98202,
+      "qps_1t": 6544.900618861652,
+      "qps_nt": 16163.932012239005,
+      "latency": {
+        "mean_us": 152.6969203,
+        "p50_us": 156.913,
+        "p95_us": 188.363,
+        "p99_us": 201.519,
+        "max_us": 324.07
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 128,
+      "recall": 0.98942,
+      "qps_1t": 5084.24398057696,
+      "qps_nt": 12572.382395694043,
+      "latency": {
+        "mean_us": 196.5598524,
+        "p50_us": 202.259,
+        "p95_us": 242.626,
+        "p99_us": 258.291,
+        "max_us": 370.051
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 192,
+      "recall": 0.99508,
+      "qps_1t": 3544.0417721942467,
+      "qps_nt": 8681.211929027977,
+      "latency": {
+        "mean_us": 282.0815768,
+        "p50_us": 290.488,
+        "p95_us": 348.652,
+        "p99_us": 368.831,
+        "max_us": 421.13
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 256,
+      "recall": 0.99715,
+      "qps_1t": 2733.9262956282582,
+      "qps_nt": 6927.234005760147,
+      "latency": {
+        "mean_us": 365.6740268,
+        "p50_us": 377.502,
+        "p95_us": 456.4,
+        "p99_us": 481.021,
+        "max_us": 527.796
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 384,
+      "recall": 0.9987,
+      "qps_1t": 1911.708103803909,
+      "qps_nt": 4796.628899278623,
+      "latency": {
+        "mean_us": 522.9808739,
+        "p50_us": 539.651,
+        "p95_us": 656.16,
+        "p99_us": 692.98,
+        "max_us": 790.365
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 512,
+      "recall": 0.99907,
+      "qps_1t": 1482.9588120803992,
+      "qps_nt": 3807.205947734089,
+      "latency": {
+        "mean_us": 674.2077103,
+        "p50_us": 694.174,
+        "p95_us": 853.114,
+        "p99_us": 900.242,
+        "max_us": 1017.663
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "7b12b34",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795831018
+  },
+  "notes": [
+    "End to end through Collection::upsert / flush / compact / search; build seconds = upsert + flush + compact (to one segment).",
+    "Index size counts the files the current manifest references (vectors, graph, id map, stored documents) plus manifest and log, after closing and reopening the database; dir_bytes also counts the previous generation kept as a crash fallback. Searches run on the reopened collection."
+  ]
+}

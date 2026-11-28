@@ -1,0 +1,109 @@
+{
+  "kind": "vector",
+  "engine": "muninn-flat",
+  "engine_version": "0.1.0 (bcdd9f7)",
+  "dataset": {
+    "name": "sift-128-euclidean",
+    "metric": "l2",
+    "n": 1000000,
+    "dim": 128,
+    "queries": 1000,
+    "meta": {
+      "dim": 128,
+      "files": {
+        "base.fbin": {
+          "bytes": 512000008,
+          "sha256": "8c7b3d999ba3133f865af72df078f77c2d248fdb80571d7ea1f1bb8e1750658e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "4c06dd3d1539b1de50f1b7e98a116833ed5c2f1571d0ef81f383a04541e797e7"
+        },
+        "query.fbin": {
+          "bytes": 5120008,
+          "sha256": "9b0082b67d0ac55b4c7d42216560344567ad87ce3e75a9d5214a0762f1c15d65"
+        }
+      },
+      "gt_k": 100,
+      "n": 1000000,
+      "origin": "TEXMEX SIFT1M (Jegou et al.)",
+      "prepared": "2026-11-27T23:38:41Z",
+      "queries": 10000,
+      "sources": [
+        {
+          "bytes": 168280445,
+          "file": "sift.tar.gz",
+          "sha256": "92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
+          "url": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "exact": true
+  },
+  "build": {
+    "seconds": 0.161676159,
+    "threads": 1,
+    "index_bytes": 512000240,
+    "rss_delta_bytes": 512184320,
+    "peak_rss_bytes": 1048432640,
+    "details": {
+      "write_seconds": 2.055941934
+    }
+  },
+  "results": [
+    {
+      "ef": 0,
+      "recall": 0.9994,
+      "qps_1t": 41.57761308957578,
+      "qps_nt": 132.38864170112817,
+      "latency": {
+        "mean_us": 24051.278344000002,
+        "p50_us": 24000.973,
+        "p95_us": 24587.687,
+        "p99_us": 24878.212,
+        "max_us": 25350.409
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "bcdd9f7",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795828005
+  },
+  "notes": [
+    "Exact scan; recall below 1 only from distance ties.",
+    "Searched from the memory-mapped index file."
+  ]
+}

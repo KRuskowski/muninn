@@ -164,13 +164,17 @@ def text_section(runs):
           f"{o['finish_seconds']:,.1f} s merging), "
           f"{mb(o['index_bytes'])} MB")
       i = e["index"]
+      if e["engine"] == "muninn-engine":
+        lines.append(
+          "- muninn-engine index size is the whole live collection, "
+          "including the stored passage text, id map and write-ahead log.")
       lines.append(
         f"- {e['engine']}: {i['index_seconds']:,.1f} s indexing + "
         f"{i['finish_seconds']:,.1f} s "
         f"{FINISH.get(e['engine'], 'finishing')}; analyzer: "
         f"{e['analyzer']}")
       fast = i.get("details", {}).get("id_fast_field_bytes")
-      if fast:
+      if fast and fast >= 1e6:
         lines.append(f"- tantivy index size includes {mb(fast)} MB for the "
                      f"passage-number fast field used to map results.")
     o = r.get("overlap")

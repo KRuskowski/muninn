@@ -1,0 +1,142 @@
+{
+  "kind": "text",
+  "dataset": {
+    "collection": "collection.tsv",
+    "docs": 1000000,
+    "name": "msmarco-passage",
+    "queries": 6980,
+    "queries_file": "queries.dev.small.tsv",
+    "text_bytes": 335479702
+  },
+  "analyzer": "english",
+  "k": 10,
+  "threads": 4,
+  "engines": [
+    {
+      "engine": "muninn",
+      "engine_version": "0.1.0 (bcdd9f7)",
+      "analyzer": "alphanumeric runs, Unicode lowercase, Latin diacritic folding, tokens > 255 bytes dropped, Lucene English stop words, Porter stemmer",
+      "index": {
+        "threads": 1,
+        "index_seconds": 6.80064653,
+        "finish_seconds": 0.407029032,
+        "total_seconds": 7.2076755619999995,
+        "docs_per_sec": 138740.9840243306,
+        "index_bytes": 67230056,
+        "rss_delta_bytes": 139718656,
+        "details": {
+          "in_memory_index_bytes": 136110162,
+          "terms": 343514
+        }
+      },
+      "other_index_runs": [],
+      "search": {
+        "k": 10,
+        "queries": 6980,
+        "qps_1t": 1832.231545305818,
+        "qps_nt": 5175.361197355433,
+        "latency": {
+          "mean_us": 545.7156468481375,
+          "p50_us": 317.121,
+          "p95_us": 1813.687,
+          "p99_us": 3172.036,
+          "max_us": 8586.57
+        },
+        "mean_hits": 9.99785100286533,
+        "deterministic": true
+      }
+    },
+    {
+      "engine": "tantivy",
+      "engine_version": "tantivy v0.27.0, index_format v7",
+      "analyzer": "SimpleTokenizer, LowerCaser, AsciiFoldingFilter, RemoveLongFilter(256), StopWordFilter(English, Lucene list), Stemmer(English, Snowball)",
+      "index": {
+        "threads": 1,
+        "index_seconds": 14.465459254,
+        "finish_seconds": 0.000233283,
+        "total_seconds": 14.465692537,
+        "docs_per_sec": 69129.07884929975,
+        "index_bytes": 60221442,
+        "rss_delta_bytes": 150437888,
+        "details": {
+          "id_fast_field_bytes": 17571,
+          "segments": 1,
+          "segments_before_merge": 1
+        }
+      },
+      "other_index_runs": [
+        {
+          "threads": 4,
+          "index_seconds": 5.869857891,
+          "finish_seconds": 1.043532265,
+          "total_seconds": 6.913390156,
+          "docs_per_sec": 144646.8342499257,
+          "index_bytes": 60961129,
+          "rss_delta_bytes": 210018304,
+          "details": {
+            "segments_before_merge": 4
+          }
+        }
+      ],
+      "search": {
+        "k": 10,
+        "queries": 6980,
+        "qps_1t": 1952.1772406082605,
+        "qps_nt": 5446.632125160953,
+        "latency": {
+          "mean_us": 512.1897114613181,
+          "p50_us": 262.408,
+          "p95_us": 1827.863,
+          "p99_us": 3425.69,
+          "max_us": 8409.125
+        },
+        "mean_hits": 9.99785100286533,
+        "deterministic": true
+      }
+    }
+  ],
+  "overlap": {
+    "engines": [
+      "muninn",
+      "tantivy"
+    ],
+    "mean": 0.9797564469914,
+    "identical_sets": 0.914756446991404,
+    "same_top1": 0.9773638968481375
+  },
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "bcdd9f7",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795828841
+  },
+  "notes": [
+    "BM25 k1=1.2 b=0.75 in both engines; OR of distinct query terms.",
+    "Both searched from one memory-mapped segment after a warm-up pass."
+  ]
+}
