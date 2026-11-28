@@ -499,6 +499,12 @@ impl HnswIndex {
           .for_each(|id| b.ensure_backlink(id as DocId));
       }
       b.reconnect_orphans();
+      // The full reachability walk costs O(n * M): worth it for batches
+      // that are a noticeable share of the index (any bulk build), not
+      // for every single insert into a large one.
+      if rows >= PAR_MIN_BATCH && end <= rows.saturating_mul(1024) {
+        b.reconnect_unreachable();
+      }
     });
   }
 

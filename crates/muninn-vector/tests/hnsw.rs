@@ -303,6 +303,27 @@ fn every_node_is_reachable_after_parallel_builds() {
   }
 }
 
+/// A deliberately weak graph (M = 4, ef_construction = 32) forms small
+/// groups of nodes that link only to each other; reachability must still
+/// hold after a parallel build.
+#[test]
+fn every_node_is_reachable_in_a_sparse_graph() {
+  let c = clusters();
+  let data = c.sample(N, 2);
+  let p = HnswParams::default().with_m(4).with_ef_construction(32);
+  for threads in [1, 4, 8] {
+    let pool = rayon::ThreadPoolBuilder::new()
+      .num_threads(threads)
+      .build()
+      .unwrap();
+    let idx =
+      pool.install(|| HnswIndex::build(DIM, Metric::L2, p, &data).unwrap());
+    let st = idx.stats();
+    println!("sparse, {threads} threads: {} unreachable", st.unreachable);
+    assert_eq!(st.unreachable, 0, "{threads} threads");
+  }
+}
+
 #[test]
 fn serial_build_is_deterministic() {
   init_pool();

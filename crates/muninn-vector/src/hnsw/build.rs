@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use muninn_core::{DocId, Metric};
 
-use super::graph::{BuildView, NONE, read_record, write_record};
+use super::graph::{BuildView, NONE, Neighbors, read_record, write_record};
 use super::search::{Scratch, beam, greedy, with_scratch};
 use crate::dist::{Dist, FullDist};
 
@@ -235,14 +235,55 @@ impl Builder<'_> {
     orphans.dedup();
     for x in orphans {
       if self.indeg[x as usize].load(Relaxed) == 0 && !self.is_entry(x) {
-        self.adopt(x);
+        let _ = self.adopt(x);
+      }
+    }
+  }
+
+  /// Makes every node reachable from the entry point at level 0.
+  ///
+  /// [`Builder::reconnect_orphans`] catches nodes with no in-edge at all,
+  /// but a few nodes can also end up linking only to each other, with no
+  /// edge from the reachable part (measured: 4 to 5 per million, and 27
+  /// in 20k with M = 4). A breadth-first walk from the entry point finds
+  /// them; each one left unreachable gets an edge from the closest
+  /// reachable node, which also brings in everything it links to.
+  /// O(n * M) reads, so callers run it only for large enough batches.
+  pub(crate) fn reconnect_unreachable(&self) {
+    let n = self.view.levels.len();
+    if n == 0 {
+      return;
+    }
+    let entry = self.entry.lock().unwrap_or_else(|e| e.into_inner()).0;
+    let mut seen = vec![false; n];
+    let mut buf = Vec::new();
+    let mut stack = Vec::new();
+    let mut walk = |from: DocId, seen: &mut [bool], stack: &mut Vec<u32>| {
+      if seen[from as usize] {
+        return;
+      }
+      seen[from as usize] = true;
+      stack.push(from);
+      while let Some(x) = stack.pop() {
+        for &y in self.view.neighbors(x, 0, &mut buf) {
+          if (y as usize) < n && !seen[y as usize] {
+            seen[y as usize] = true;
+            stack.push(y);
+          }
+        }
+      }
+    };
+    walk(entry, &mut seen, &mut stack);
+    for x in 0..n as DocId {
+      if !seen[x as usize] && self.adopt(x) {
+        walk(x, &mut seen, &mut stack);
       }
     }
   }
 
   /// Gives orphan `x` one incoming level-0 edge from the closest node a
   /// search from the entry point finds (so a reachable one).
-  fn adopt(&self, x: DocId) {
+  fn adopt(&self, x: DocId) -> bool {
     let dist = FullDist {
       metric: self.metric,
       dim: self.dim,
@@ -269,9 +310,10 @@ impl Builder<'_> {
     });
     for (e, _) in found.top.into_sorted_vec() {
       if e != x && self.force_link(e, x) {
-        return;
+        return true;
       }
     }
+    false
   }
 
   /// Makes sure the closest of `x`'s level-0 neighbours (that has room)
