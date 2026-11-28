@@ -81,7 +81,7 @@ pub struct ApiError {
   /// Send `Retry-After: 1` with a 503: the condition is transient (too
   /// much in flight). False for a collection that refuses writes until
   /// the server restarts, where retrying cannot help.
-  pub retry_after: bool,
+  retry_after: bool,
 }
 
 impl ApiError {
@@ -93,6 +93,13 @@ impl ApiError {
       message: message.into(),
       retry_after: code == ErrorCode::Unavailable,
     }
+  }
+
+  /// Whether the response carries `Retry-After`: true for a transient
+  /// 503 `unavailable` (too much in flight), false for a collection that
+  /// refuses writes until the server restarts, and for other codes.
+  pub fn retry_after(&self) -> bool {
+    self.retry_after && self.code == ErrorCode::Unavailable
   }
 
   /// A 400 `invalid_argument` error.
@@ -160,7 +167,7 @@ impl IntoResponse for ApiError {
       ErrorCode::Unauthenticated => {
         h.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
       }
-      ErrorCode::Unavailable if self.retry_after => {
+      ErrorCode::Unavailable if self.retry_after() => {
         h.insert(RETRY_AFTER, HeaderValue::from_static("1"));
       }
       _ => {}
@@ -184,6 +191,9 @@ mod tests {
     assert_eq!(busy.headers()[RETRY_AFTER], "1");
     let refused: ApiError =
       muninn::Error::Unavailable("refuses writes".into()).into();
+    assert!(!refused.retry_after());
+    assert!(ApiError::new(ErrorCode::Unavailable, "busy").retry_after());
+    assert!(!ApiError::invalid("bad").retry_after());
     let refused = refused.into_response();
     assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(refused.headers().get(RETRY_AFTER).is_none());

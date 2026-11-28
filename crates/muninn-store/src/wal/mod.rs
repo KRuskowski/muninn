@@ -98,7 +98,8 @@ pub enum Durability {
   /// segment written since the last sync). Survives process crashes only.
   /// One exception bounds the open files: once
   /// [`MAX_UNSYNCED_SEGMENTS`] segments have been rotated out unsynced,
-  /// they are fsynced and closed (one fsync per that many segments).
+  /// each of them is fsynced and closed (one fsync per segment, done in
+  /// groups of that many; the append that rotates waits for it).
   NoSync,
 }
 
@@ -453,7 +454,20 @@ impl Shared {
   /// newer segment never exists on disk while older records are not.
   fn rotate(&self, a: &mut Active, first: Lsn) -> Result<()> {
     let sync = self.sync_on_rotate();
-    if sync {
+    // NoSync: the segment being closed completes a group of
+    // MAX_UNSYNCED_SEGMENTS, which are fsynced (oldest first) and closed
+    // before anything else changes, so a failure leaves the files on disk
+    // and the segment list in agreement. Durability is not claimed (the
+    // next segment is not synced); a failure is a real writeback error
+    // and poisons the log like any fsync failure. NoSync appenders wait
+    // for this, once per group.
+    let group = !sync && a.unsynced.len() + 1 >= MAX_UNSYNCED_SEGMENTS;
+    if group {
+      for f in &a.unsynced {
+        self.fsync(f, SyncSite::Leader)?;
+      }
+    }
+    if sync || group {
       self.fsync(&a.file, SyncSite::Leader)?;
     }
     let header = SegmentHeader {
@@ -463,17 +477,13 @@ impl Shared {
     let (file, path) = create_segment(&self.dir, header, sync, &self.counters)?;
     let old = std::mem::replace(&mut a.file, Arc::new(file));
     a.len = HEADER_LEN as u64;
-    if !sync {
+    if group {
+      a.unsynced.clear();
+    } else if !sync {
       a.unsynced.push(old);
+    }
+    if !sync {
       a.dir_dirty = true;
-      if a.unsynced.len() >= MAX_UNSYNCED_SEGMENTS {
-        // Oldest first, like a sync round. Durability is not claimed
-        // (the active segment is not synced); a failure is a real
-        // writeback error and poisons the log like any fsync failure.
-        for f in std::mem::take(&mut a.unsynced) {
-          self.fsync(&f, SyncSite::Leader)?;
-        }
-      }
     }
     lock(&self.segments).push(SegmentInfo {
       first_lsn: first,
@@ -1135,6 +1145,44 @@ mod tests {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(wal.durable_lsn(), 0);
     assert!(wal.append(b"b").is_err());
+    drop(wal);
+    let _ = std::fs::remove_dir_all(dir);
+  }
+
+  /// A failing fsync of a group of rotated-out segments (NoSync) poisons
+  /// the log, and leaves its list of segments matching the files on disk.
+  #[test]
+  fn group_fsync_failure_poisons_and_keeps_segments_consistent() {
+    let dir = test_dir("wal-group-fsync");
+    let wal = Wal::open(&dir, nosync()).unwrap();
+    wal.set_sync_hook(Some(Box::new(|_, _| {
+      Err(std::io::Error::other("injected EIO"))
+    })));
+    let mut err = None;
+    for i in 0..MAX_UNSYNCED_SEGMENTS {
+      wal.append(b"x").unwrap();
+      if let Err(e) = wal.rotate() {
+        err = Some((i, e));
+        break;
+      }
+    }
+    let (i, _) = err.expect("group fsync failure not reported");
+    assert_eq!(i, MAX_UNSYNCED_SEGMENTS - 1);
+    assert!(wal.append(b"y").is_err());
+    assert!(wal.sync().is_err());
+    assert_eq!(wal.durable_lsn(), 0);
+    let on_disk = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter(|e| {
+        e.as_ref()
+          .unwrap()
+          .file_name()
+          .to_str()
+          .unwrap()
+          .ends_with(SEGMENT_SUFFIX)
+      })
+      .count();
+    assert_eq!(wal.segment_count(), on_disk);
     drop(wal);
     let _ = std::fs::remove_dir_all(dir);
   }
