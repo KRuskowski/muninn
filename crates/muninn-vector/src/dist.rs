@@ -13,6 +13,15 @@ pub(crate) trait Dist: Sync {
 
   /// Hints that `id` will be scored soon. Never faults.
   fn prefetch(&self, id: DocId);
+
+  /// `out[i] = self.dist(ids[i])` for every id (all in range);
+  /// `out.len() == ids.len()`.
+  #[inline]
+  fn dist_many(&self, ids: &[DocId], out: &mut [f32]) {
+    for (o, &id) in out.iter_mut().zip(ids) {
+      *o = self.dist(id);
+    }
+  }
 }
 
 /// Exact distance on full-precision rows.
@@ -41,6 +50,11 @@ impl Dist for FullDist<'_> {
   #[inline]
   fn prefetch(&self, id: DocId) {
     prefetch_lines(self.data.as_ptr(), id as usize * self.dim, self.dim);
+  }
+
+  #[inline]
+  fn dist_many(&self, ids: &[DocId], out: &mut [f32]) {
+    muninn_simd::distance_gather(self.metric, self.query, self.data, ids, out);
   }
 }
 

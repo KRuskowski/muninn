@@ -265,7 +265,7 @@ impl VectorIndex for FlatIndex {
     let q = prepare_query(self.metric, query);
     let data = self.data.as_slice();
     let top = match &self.quant {
-      None => exact_search(self.metric, self.dim, data, &q, k, filter),
+      None => exact_search(self.metric, self.dim, data, &q, k, filter, None),
       Some(qz) => {
         let r = match params.rerank {
           0 => qz.kind().default_rerank(k),
@@ -280,7 +280,7 @@ impl VectorIndex for FlatIndex {
           })
         });
         let ids = cands.iter().map(|(id, _)| id);
-        rerank(self.metric, self.dim, data, &q, ids, k)
+        rerank(self.metric, data, &q, ids, k, &[])
       }
     };
     Ok(top.into_hits(self.metric))

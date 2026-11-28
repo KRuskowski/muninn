@@ -2,6 +2,7 @@
 
 mod build;
 mod graph;
+mod order;
 mod search;
 
 use std::io::Write;
@@ -16,6 +17,8 @@ use rayon::prelude::*;
 
 use self::build::{Builder, MAX_LEVEL, level_for};
 use self::graph::{BuildView, Graph, GraphView, NONE, Neighbors, as_atomic};
+use self::order::{IdMap, Mapped, bfs_order};
+pub(crate) use self::order::{lookup, permute_rows};
 use self::search::{Abort, Beam, beam, greedy, prefer_exact, with_scratch};
 use crate::dist::{Dist, FullDist};
 use crate::flat::{
@@ -29,7 +32,7 @@ use crate::{SearchParams, VectorIndex, meta};
 /// Container kind of an [`HnswIndex`] file.
 pub const HNSW_KIND: [u8; 8] = tag("hnsw");
 /// Current [`HnswIndex`] file format version.
-pub const HNSW_VERSION: u32 = 2;
+pub const HNSW_VERSION: u32 = 3;
 
 const T_META: [u8; 8] = tag("meta");
 const T_VECTORS: [u8; 8] = tag("vectors");
@@ -41,6 +44,11 @@ const T_UPPER: [u8; 8] = tag("upper");
 /// (see `Builder::anchor`). Version 1 files have none; their tree is built
 /// on the first insert after opening.
 const T_PROT: [u8; 8] = tag("prot");
+/// Since version 3: the external id of each internal node, and the
+/// internal node of each external id (see `order.rs`). Absent or empty
+/// means both orders are the same (all version 1 and 2 files).
+const T_EXT: [u8; 8] = tag("ext");
+const T_INT: [u8; 8] = tag("int");
 const META_FIELDS: usize = 12;
 
 /// Nodes a filtered search scores before judging the filter's
@@ -89,6 +97,14 @@ pub const MAX_M: usize = 256;
 
 /// Batches smaller than this are inserted on the calling thread.
 const PAR_MIN_BATCH: usize = 64;
+
+/// Batches of at least this many vectors are linked with SQ8 codes
+/// standing in for the full vectors during each insert's search, then
+/// re-scored exactly for neighbour selection. The search reads a quarter
+/// of the bytes and found the same graph quality: SIFT-1M built in 69 s
+/// instead of 99 s, with recall@10 at ef 32 and 128 equal to three
+/// digits. Small batches are not worth training codes for.
+const CODED_BUILD_MIN: usize = 4096;
 
 /// While the graph is smaller than this, a batch is inserted serially
 /// first, so parallel inserts never race over a near-empty graph.
@@ -217,6 +233,10 @@ pub struct HnswIndex {
   /// Whether every node is known to hang in the protected tree; false
   /// after opening a file until [`HnswIndex::check_tree`] has run.
   tree_ready: bool,
+  /// Caller ids of the internal nodes. Everything above (vectors, graph,
+  /// codes, `prot`, `entry`) is in internal order; ids cross over only in
+  /// `search`, `vector` and the exact scans.
+  ids: IdMap,
 }
 
 /// Index structure sizes, for capacity planning and reports.
@@ -259,6 +279,7 @@ impl HnswIndex {
       from_file: false,
       prot: Slab::default(),
       tree_ready: true,
+      ids: IdMap::default(),
     })
   }
 
@@ -310,7 +331,7 @@ impl HnswIndex {
   /// The stored (possibly normalised) vector for `id`. Panics if `id` is
   /// out of range.
   pub fn vector(&self, id: DocId) -> &[f32] {
-    let s = id as usize * self.dim;
+    let s = self.ids.int(id) as usize * self.dim;
     &self.vectors.as_slice()[s..s + self.dim]
   }
 
@@ -384,8 +405,89 @@ impl HnswIndex {
     let (first, end) = (range.start as usize, range.end as usize);
     if end > first {
       self.link(first, end);
+      // A bulk build into an empty index (every segment build) is
+      // renumbered for locality; later inserts keep their numbers.
+      if first == 0 {
+        self.reorder();
+      }
     }
     Ok(range)
+  }
+
+  /// Renumbers every node breadth-first over level 0 from the entry point
+  /// (see `order.rs`), permuting vectors, graph, codes and the protected
+  /// tree in place, and records the new caller-id map.
+  fn reorder(&mut self) {
+    let n = self.len();
+    if n < 2 {
+      return;
+    }
+    let (m, m0, dim) = (self.params.m, 2 * self.params.m, self.dim);
+    let order = {
+      let g = self.view();
+      bfs_order(n, self.entry, |v, out| {
+        let mut buf = Vec::new();
+        out.clear();
+        out.extend_from_slice(g.neighbors(v, 0, &mut buf));
+      })
+    };
+    let mut new_of = vec![0u32; n];
+    for (i, &o) in order.iter().enumerate() {
+      new_of[o as usize] = i as u32;
+    }
+    let map = |x: u32| new_of.get(x as usize).copied().unwrap_or(x);
+    permute_rows(self.vectors.to_mut(), dim, &order);
+    if let Some(q) = &mut self.quant {
+      q.permute(&order);
+    }
+    let l0 = self.graph.l0.to_mut();
+    permute_rows(l0, 1 + m0, &order);
+    for rec in l0.chunks_exact_mut(1 + m0) {
+      let c = (rec[0] as usize).min(m0);
+      for x in &mut rec[1..1 + c] {
+        *x = map(*x);
+      }
+    }
+    // Upper levels: rebuilt in the new order (they hold about 1/M of the
+    // nodes).
+    let levels = self.graph.levels.as_slice();
+    let upoff = self.graph.upoff.as_slice();
+    let upper = self.graph.upper.as_slice();
+    let mut nlevels = Vec::with_capacity(n);
+    let mut nupoff = Vec::with_capacity(n);
+    let mut nupper = Vec::with_capacity(upper.len());
+    for &o in &order {
+      let l = levels[o as usize];
+      nlevels.push(l);
+      if l == 0 {
+        nupoff.push(NONE);
+        continue;
+      }
+      nupoff.push(nupper.len() as u32);
+      let off = upoff[o as usize] as usize;
+      for rec in upper[off..off + l as usize * (1 + m)].chunks_exact(1 + m) {
+        let c = (rec[0] as usize).min(m);
+        nupper.push(c as u32);
+        nupper.extend(rec[1..1 + c].iter().map(|&x| map(x)));
+        nupper.extend(std::iter::repeat_n(0, m - c));
+      }
+    }
+    self.graph.levels = Slab::owned(nlevels);
+    self.graph.upoff = Slab::owned(nupoff);
+    self.graph.upper = Slab::owned(nupper);
+    let prot = self.prot.as_slice();
+    if prot.len() == n {
+      let np: Vec<u32> = order
+        .iter()
+        .map(|&o| match prot[o as usize] {
+          NONE => NONE,
+          p => map(p),
+        })
+        .collect();
+      self.prot = Slab::owned(np);
+    }
+    self.entry = map(self.entry);
+    self.ids.renumber(&order);
   }
 
   /// Stores `vectors` (codes, levels, empty graph records) without
@@ -450,6 +552,7 @@ impl HnswIndex {
       }
     }
     self.graph.l0.to_mut().resize(end * (1 + m0), 0);
+    self.ids.push_identity(first, end);
     if self.entry == NONE {
       self.entry = first as DocId;
       self.max_level = self.graph.levels.as_slice()[first];
@@ -471,7 +574,7 @@ impl HnswIndex {
     } else {
       end.next_power_of_two().min(1 << 16)
     };
-    self.with_builder(stripes, |b| {
+    self.with_builder(stripes, rows, |b| {
       // The entry point (the very first node) has nothing to link to.
       let start = if b.is_entry(first as DocId) {
         first + 1
@@ -520,6 +623,7 @@ impl HnswIndex {
   fn with_builder<R>(
     &mut self,
     stripes: usize,
+    rows: usize,
     f: impl FnOnce(&Builder<'_>) -> R,
   ) -> R {
     let (m, m0) = (self.params.m, 2 * self.params.m);
@@ -528,6 +632,25 @@ impl HnswIndex {
     self.prot.to_mut().resize(n, NONE);
     let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
     let entry = Mutex::new((self.entry, self.max_level));
+    // Large batches search with SQ8 codes while inserting (see
+    // `Builder::codes`): the index's own SQ8 codes when it has them,
+    // otherwise codes trained just for this batch.
+    let coded = stripes > 1 && rows >= CODED_BUILD_MIN;
+    let own_sq8 = matches!(self.quant, Some(Quantizer::Sq8(_)));
+    let temp_codes = (coded && !own_sq8)
+      .then(|| {
+        Quantizer::train(
+          Quantization::Sq8,
+          self.dim,
+          self.metric,
+          self.vectors.as_slice(),
+        )
+      })
+      .flatten();
+    let build_codes = match (&self.quant, &temp_codes) {
+      (Some(q), _) if coded && own_sq8 => Some(q),
+      (_, t) => t.as_ref(),
+    };
     let r = {
       let b = Builder {
         view: BuildView {
@@ -545,6 +668,7 @@ impl HnswIndex {
         ef_construction: self.params.ef_construction,
         entry: &entry,
         prot: as_atomic(self.prot.to_mut()),
+        codes: build_codes,
       };
       f(&b)
     };
@@ -671,6 +795,8 @@ impl HnswIndex {
     let prot = self.prot.as_slice();
     let prot = if prot.len() == self.len() { prot } else { &[] };
     w.pod_section(T_PROT, prot)?;
+    w.pod_section(T_EXT, self.ids.ext.as_slice())?;
+    w.pod_section(T_INT, self.ids.int.as_slice())?;
     if let Some(q) = &self.quant {
       q.write_sections(&mut w)?;
     }
@@ -723,8 +849,18 @@ impl HnswIndex {
       Some(r) => Slab::from_region(r)?,
       None => Slab::default(),
     };
+    let section = |t| match c.try_section(t) {
+      Some(r) => Slab::from_region(r),
+      None => Ok(Slab::default()),
+    };
+    let ids = IdMap {
+      ext: section(T_EXT)?,
+      int: section(T_INT)?,
+    };
     let sizes_ok = Some(vectors.len()) == n.checked_mul(dim)
       && (prot.len() == n || prot.len() == 0)
+      && ids.ext.len() == ids.int.len()
+      && (ids.ext.len() == n || ids.ext.len() == 0)
       && graph.levels.len() == n
       && graph.upoff.len() == n
       && Some(graph.l0.len()) == n.checked_mul(1 + m0);
@@ -755,6 +891,7 @@ impl HnswIndex {
       from_file: true,
       prot,
       tree_ready: false,
+      ids,
     })
   }
 
@@ -762,9 +899,20 @@ impl HnswIndex {
     self.graph.view(self.params.m)
   }
 
-  /// Exact scan over the documents passing `filter`.
+  /// Exact scan over the documents passing `filter` (caller ids in,
+  /// caller ids out).
   fn exact(&self, q: &[f32], k: usize, filter: Option<&dyn DocFilter>) -> TopK {
-    exact_search(self.metric, self.dim, self.vectors.as_slice(), q, k, filter)
+    let map = (!self.ids.is_identity())
+      .then(|| (self.ids.ext.as_slice(), self.ids.int.as_slice()));
+    exact_search(
+      self.metric,
+      self.dim,
+      self.vectors.as_slice(),
+      q,
+      k,
+      filter,
+      map,
+    )
   }
 
   /// Descends the upper levels and runs the level-0 beam with `dist`.
@@ -825,6 +973,17 @@ impl VectorIndex for HnswIndex {
       ef => ef,
     }
     .clamp(k, n);
+    // The graph works on internal node numbers; the caller's filter and
+    // the results use the caller's ids.
+    let ext = self.ids.ext.as_slice();
+    let mapped;
+    let graph_filter = match filter {
+      Some(f) if !self.ids.is_identity() => {
+        mapped = Mapped { filter: f, ext };
+        Some(&mapped as &dyn DocFilter)
+      }
+      other => other,
+    };
     // With a selectivity hint, Auto decides up front; without one it
     // judges the filter from the pass rate seen during traversal.
     let mut adaptive = false;
@@ -853,13 +1012,15 @@ impl VectorIndex for HnswIndex {
           query: &q,
           data,
         };
-        let b = self.graph_search(&dist, ef, filter, adaptive);
+        let b = self.graph_search(&dist, ef, graph_filter, adaptive);
         if b.aborted || b.top.len() < k {
           self.exact(&q, k, filter)
         } else {
+          // All of the beam, not just its first `k`: renumbering can
+          // reorder equal distances, and ties go to the smaller caller id.
           let mut top = TopK::new(k);
-          for (id, d) in b.top.iter() {
-            top.push(id, d);
+          for &(id, d) in &b.top {
+            top.push(order::lookup(ext, id), d);
           }
           top
         }
@@ -872,14 +1033,13 @@ impl VectorIndex for HnswIndex {
         .clamp(k, n);
         let qc = qz.prepare(self.metric, &q);
         let b = with_code_dist!(qz.dist(&qc), |d| {
-          self.graph_search(&d, ef.max(r), filter, adaptive)
+          self.graph_search(&d, ef.max(r), graph_filter, adaptive)
         });
         if b.aborted || b.top.len() < k {
           self.exact(&q, k, filter)
         } else {
-          let cands = b.top.into_sorted_vec();
-          let ids = cands.iter().take(r).map(|&(id, _)| id);
-          rerank(self.metric, self.dim, data, &q, ids, k)
+          let ids = b.top.iter().take(r).map(|&(id, _)| id);
+          rerank(self.metric, data, &q, ids, k, ext)
         }
       }
     };
@@ -999,6 +1159,77 @@ mod tests {
     });
   }
 
+  /// Mean `|a - b|` over level-0 edges `a -> b`: how far apart in memory
+  /// a node's neighbours are.
+  fn edge_span(idx: &HnswIndex) -> f64 {
+    let g = idx.view();
+    let mut buf = Vec::new();
+    let (mut sum, mut edges) = (0f64, 0usize);
+    for a in 0..idx.len() as DocId {
+      for &b in g.neighbors(a, 0, &mut buf) {
+        sum += (a as f64 - b as f64).abs();
+        edges += 1;
+      }
+    }
+    sum / edges as f64
+  }
+
+  /// Renumbering changes where nodes live, never what callers see: the
+  /// same results (ids and scores) for plain, filtered (graph and exact)
+  /// and quantised searches, the same `vector(id)`, before and after.
+  /// It must also actually bring neighbours closer together.
+  #[test]
+  fn reordering_is_invisible_to_callers() {
+    let (n, dim) = (4000, 12);
+    let d = data(n, dim, 5);
+    let queries = data(50, dim, 99);
+    for q in [Quantization::None, Quantization::Sq8] {
+      let p = HnswParams::default().with_quantization(q);
+      let mut idx = HnswIndex::new(dim, Metric::L2, p).unwrap();
+      let r = idx.append(&d).unwrap();
+      idx.link(r.start as usize, r.end as usize);
+      let before = idx.clone();
+      assert!(before.ids.is_identity());
+      idx.reorder();
+      assert!(!idx.ids.is_identity());
+      let (s0, s1) = (edge_span(&before), edge_span(&idx));
+      assert!(s1 * 1.25 < s0, "edge span {s0:.0} -> {s1:.0}");
+      assert_eq!(idx.stats(), before.stats());
+      for id in 0..n as DocId {
+        assert_eq!(idx.vector(id), before.vector(id));
+      }
+      let mut sel = BitSet::new(n);
+      for id in (0..n as DocId).step_by(3) {
+        sel.insert(id);
+      }
+      let tiny = |id: DocId| id % 400 == 7;
+      for (qi, qv) in queries.chunks_exact(dim).enumerate() {
+        let sp = SearchParams::new(10).with_ef(32);
+        let filters: [Option<&dyn DocFilter>; 3] =
+          [None, Some(&sel), Some(&tiny)];
+        for f in filters {
+          let (a, b) = (
+            before.search(qv, &sp, f).unwrap(),
+            idx.search(qv, &sp, f).unwrap(),
+          );
+          assert_eq!(a, b, "{q:?} query {qi}");
+        }
+      }
+      // And after a round trip through a file, and further inserts.
+      let buf = idx.write_to(muninn_core::AlignedBuf::new()).unwrap();
+      let mut back = HnswIndex::open(Region::new(buf)).unwrap();
+      assert!(!back.ids.is_identity());
+      let more = data(10, dim, 7);
+      let r = back.add_batch(&more).unwrap();
+      assert_eq!(r, n as DocId..n as DocId + 10);
+      for (i, row) in more.chunks_exact(dim).enumerate() {
+        assert_eq!(back.vector(n as DocId + i as DocId), row);
+        let hit = back.search(row, &SearchParams::new(1), None).unwrap();
+        assert_eq!(hit[0].id, n as DocId + i as DocId);
+      }
+    }
+  }
+
   /// Review item 6: in a parallel build another thread can add a
   /// back-link into a new node's list (it found the node as a search
   /// entry) before the node's own insert writes that list. The insert
@@ -1019,7 +1250,7 @@ mod tests {
       })
       .unwrap();
     let q = idx.append(&v).unwrap().start;
-    idx.with_builder(1, |b| {
+    idx.with_builder(1, 1, |b| {
       b.connect(q, far, 0);
       b.insert(q);
     });

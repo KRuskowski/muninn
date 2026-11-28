@@ -275,6 +275,20 @@ impl Quantizer {
     }
   }
 
+  /// Renumbers the encoded vectors: new vector `i` is old `order[i]`.
+  pub(crate) fn permute(&mut self, order: &[u32]) {
+    use crate::hnsw::permute_rows;
+    match self {
+      Self::Sq8(s) => {
+        permute_rows(s.codes.to_mut(), s.dim, order);
+        if s.l2 {
+          permute_rows(s.sq.to_mut(), 1, order);
+        }
+      }
+      Self::Binary(b) => permute_rows(b.bits.to_mut(), b.words, order),
+    }
+  }
+
   /// Retrains from all of `data` if the index has doubled since the codes
   /// were trained on `trained_on` vectors and is still small. Returns the
   /// new training size.
@@ -505,6 +519,18 @@ impl Dist for Sq8Dist<'_> {
   #[inline]
   fn prefetch(&self, id: DocId) {
     prefetch_lines(self.codes.as_ptr(), id as usize * self.dim, self.dim);
+    if !self.sq.is_empty() {
+      prefetch_lines(self.sq.as_ptr(), id as usize, 1);
+    }
+  }
+
+  /// Same values as `dist`, bit for bit (`a + b == b + a` in floats).
+  #[inline]
+  fn dist_many(&self, ids: &[DocId], out: &mut [f32]) {
+    muninn_simd::dot_f32_u8_gather(self.w, self.codes, ids, out);
+    for (o, &id) in out.iter_mut().zip(ids) {
+      *o += self.base + self.sq.get(id as usize).copied().unwrap_or(0.0);
+    }
   }
 }
 
@@ -539,27 +565,11 @@ impl Dist for BinDist<'_> {
   }
 }
 
-/// `sum w_i * c_i` with the codes widened to `f32`.
-///
-/// muninn-simd has no mixed `f32 x u8` kernel yet; this portable loop
-/// keeps eight independent accumulators so the compiler vectorises it.
+/// `sum w_i * c_i` with the codes widened to `f32`, on the dispatched
+/// SIMD kernel.
 #[inline]
 pub(crate) fn dot_f32_u8(w: &[f32], c: &[u8]) -> f32 {
-  debug_assert_eq!(w.len(), c.len());
-  let mut acc = [0.0f32; 8];
-  let (cw, cc) = (w.chunks_exact(8), c.chunks_exact(8));
-  let (rw, rc) = (cw.remainder(), cc.remainder());
-  for (x, y) in cw.zip(cc) {
-    for i in 0..8 {
-      acc[i] += x[i] * y[i] as f32;
-    }
-  }
-  let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
-    + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-  for (x, &y) in rw.iter().zip(rc) {
-    s += x * y as f32;
-  }
-  s
+  muninn_simd::dot_f32_u8(w, c)
 }
 
 #[cfg(test)]
@@ -629,6 +639,33 @@ mod tests {
         for i in 0..dim {
           assert!((deq[i] - orig[i]).abs() <= s.step.as_slice()[i] * 0.51);
         }
+      }
+    }
+  }
+
+  /// Batched code distances equal single ones bit for bit, for every
+  /// quantiser and metric.
+  #[test]
+  fn dist_many_equals_dist() {
+    let (n, dim) = (40, 37);
+    let data = rows(n, dim);
+    let q = &rows(1, dim)[..];
+    let ids: Vec<DocId> = (0..n as DocId).rev().chain([3, 3, 0]).collect();
+    for kind in [Quantization::Sq8, Quantization::Binary] {
+      for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+        let qz = Quantizer::train(kind, dim, metric, &data).unwrap();
+        let qc = qz.prepare(metric, q);
+        with_code_dist!(qz.dist(&qc), |d| {
+          let mut out = vec![0.0f32; ids.len()];
+          d.dist_many(&ids, &mut out);
+          for (&id, &o) in ids.iter().zip(&out) {
+            assert_eq!(
+              o.to_bits(),
+              d.dist(id).to_bits(),
+              "{kind:?} {metric:?}"
+            );
+          }
+        });
       }
     }
   }
