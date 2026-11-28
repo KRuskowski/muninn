@@ -5,7 +5,6 @@ use std::ops::Range;
 use muninn_core::{BitSet, DocFilter, DocId, Metric, TopK};
 use rayon::prelude::*;
 
-use crate::dist::prefetch_lines;
 use crate::hnsw::lookup;
 
 /// Rows scored per `distance_batch` call. Small enough that the output
@@ -159,10 +158,15 @@ pub(crate) fn scan_bits(
   if range.start >= end {
     return;
   }
-  let mut found = [(0 as DocId, 0usize); 64];
-  for wi in range.start / 64..end.div_ceil(64) {
-    let mut w = words.get(wi).copied().unwrap_or(0);
-    let mut c = 0;
+  let (w0, w1) = (range.start / 64, end.div_ceil(64).min(words.len()));
+  // A tight walk over the words: the zero words dominate when the set is
+  // selective, so they must cost next to nothing.
+  for (k, &word) in words[w0..w1].iter().enumerate() {
+    if word == 0 {
+      continue;
+    }
+    let wi = w0 + k;
+    let mut w = word;
     while w != 0 {
       let id = wi * 64 + w.trailing_zeros() as usize;
       w &= w - 1;
@@ -171,16 +175,11 @@ pub(crate) fn scan_bits(
       }
       let r = lookup(int, id as DocId) as usize;
       if r < n && filter.matches(id as DocId) {
-        prefetch_lines(data.as_ptr(), r * dim, dim);
-        found[c] = (id as DocId, r);
-        c += 1;
-      }
-    }
-    for &(id, r) in &found[..c] {
-      let s = r * dim;
-      let d = muninn_simd::distance(metric, query, &data[s..s + dim]);
-      if d <= top.threshold() {
-        top.push(id, d);
+        let s = r * dim;
+        let d = muninn_simd::distance(metric, query, &data[s..s + dim]);
+        if d <= top.threshold() {
+          top.push(id as DocId, d);
+        }
       }
     }
   }

@@ -79,6 +79,43 @@ impl Quantization {
   }
 }
 
+/// Quantiles that bound build-time SQ8 codes (see
+/// `Quantizer::train_sq8_clipped`).
+const CLIP: f64 = 0.001;
+
+/// Rows sampled to estimate per-dimension quantiles.
+const SAMPLE_ROWS: usize = 8192;
+
+/// Up to `SAMPLE_ROWS` evenly spaced rows of `data`, one vector of
+/// non-NaN values per dimension.
+fn sample_columns(dim: usize, data: &[f32]) -> Vec<Vec<f32>> {
+  let n = data.len() / dim;
+  let stride = n.div_ceil(SAMPLE_ROWS).max(1);
+  let mut cols = vec![Vec::with_capacity(n.min(SAMPLE_ROWS)); dim];
+  for row in data.chunks_exact(dim).step_by(stride) {
+    for (c, &x) in cols.iter_mut().zip(row) {
+      if !x.is_nan() {
+        c.push(x);
+      }
+    }
+  }
+  cols
+}
+
+/// The `a` and `b` quantiles (`0 <= a <= b <= 1`, nearest rank) of
+/// `v`; `(0, 0)` for an empty vector.
+fn quantiles(mut v: Vec<f32>, a: f64, b: f64) -> (f32, f32) {
+  if v.is_empty() {
+    return (0.0, 0.0);
+  }
+  let rank =
+    |p: f64| ((p * (v.len() - 1) as f64).round() as usize).min(v.len() - 1);
+  let (ia, ib) = (rank(a), rank(b));
+  let (_, &mut hi, _) = v.select_nth_unstable_by(ib, f32::total_cmp);
+  let (_, &mut lo, _) = v[..=ib].select_nth_unstable_by(ia, f32::total_cmp);
+  (lo, hi)
+}
+
 /// Retrain while the index is smaller than this whenever it has doubled
 /// since the last training, so codes built from a handful of early
 /// inserts do not clamp everything inserted later.
@@ -162,26 +199,7 @@ impl Quantizer {
             *h = h.max(x);
           }
         }
-        let step: Vec<f32> = lo
-          .iter()
-          .zip(&hi)
-          // `h / 255 - l / 255` rather than `(h - l) / 255`: the
-          // difference of two finite floats can overflow to infinity,
-          // and an infinite step turns `inf * 0` into NaN.
-          .map(|(&l, &h)| if h > l { h / 255.0 - l / 255.0 } else { 0.0 })
-          .collect();
-        let lo = lo
-          .into_iter()
-          .map(|l| if l.is_finite() { l } else { 0.0 })
-          .collect();
-        Self::Sq8(Sq8 {
-          dim,
-          l2: metric == Metric::L2,
-          min: Slab::owned(lo),
-          step: Slab::owned(step),
-          codes: Slab::default(),
-          sq: Slab::default(),
-        })
+        Self::sq8_with_range(dim, metric, lo, &hi)
       }
       Quantization::Binary => {
         let mut mean = vec![0.0f64; dim];
@@ -215,6 +233,103 @@ impl Quantizer {
     };
     q.append(data);
     Some(q)
+  }
+
+  /// Untrained SQ8 parameters covering `lo[i]..=hi[i]` per dimension.
+  fn sq8_with_range(
+    dim: usize,
+    metric: Metric,
+    lo: Vec<f32>,
+    hi: &[f32],
+  ) -> Self {
+    let step: Vec<f32> = lo
+      .iter()
+      .zip(hi)
+      // `h / 255 - l / 255` rather than `(h - l) / 255`: the difference of
+      // two finite floats can overflow to infinity, and an infinite step
+      // turns `inf * 0` into NaN.
+      .map(|(&l, &h)| if h > l { h / 255.0 - l / 255.0 } else { 0.0 })
+      .collect();
+    let lo = lo
+      .into_iter()
+      .map(|l| if l.is_finite() { l } else { 0.0 })
+      .collect();
+    Self::Sq8(Sq8 {
+      dim,
+      l2: metric == Metric::L2,
+      min: Slab::owned(lo),
+      step: Slab::owned(step),
+      codes: Slab::default(),
+      sq: Slab::default(),
+    })
+  }
+
+  /// SQ8 codes for searching while a graph is built: each dimension's
+  /// range is its `CLIP` and `1 - CLIP` quantile over a sample of rows,
+  /// not its min and max, so a few extreme vectors cannot stretch the
+  /// range until every normal vector falls onto one or two code levels.
+  /// Values outside the range saturate; that only blurs the outliers' own
+  /// code distances, and build candidates are re-scored exactly anyway.
+  pub(crate) fn train_sq8_clipped(
+    dim: usize,
+    metric: Metric,
+    data: &[f32],
+  ) -> Option<Self> {
+    if dim == 0 {
+      return None;
+    }
+    let cols = sample_columns(dim, data);
+    let (mut lo, mut hi) = (vec![0.0f32; dim], vec![0.0f32; dim]);
+    for (j, col) in cols.into_iter().enumerate() {
+      (lo[j], hi[j]) = quantiles(col, CLIP, 1.0 - CLIP);
+    }
+    let mut q = Self::sq8_with_range(dim, metric, lo, &hi);
+    q.append(data);
+    Some(q)
+  }
+
+  /// How coarse SQ8 codes are for `data`: estimated mean squared coding
+  /// error (`step^2 / 12` inside the range plus the squared excess of
+  /// bulk values outside it, which saturate) summed over dimensions,
+  /// divided
+  /// by the summed robust variance of the bulk of the values
+  /// (`(IQR / 1.349)^2`, which outliers cannot inflate). About 1e-4 for
+  /// well-spread data; near or above 1 when the codes have collapsed.
+  /// Infinite for binary codes. Estimated on a sample of rows.
+  pub(crate) fn sq8_error_ratio(&self, data: &[f32]) -> f32 {
+    let Self::Sq8(s) = self else {
+      return f32::INFINITY;
+    };
+    let (min, step) = (s.min.as_slice(), s.step.as_slice());
+    let (mut err, mut var) = (0f64, 0f64);
+    for (j, col) in sample_columns(s.dim, data).into_iter().enumerate() {
+      if col.is_empty() {
+        continue;
+      }
+      let (lo, d) = (min[j] as f64, step[j] as f64);
+      let hi = lo + 255.0 * d;
+      // Saturation counts only for the bulk (inside the clipping
+      // quantiles): codes trained on an early, narrower part of the data
+      // fail that way, while clipping the outliers is intended.
+      let (b0, b1) = quantiles(col.clone(), CLIP, 1.0 - CLIP);
+      let out: f64 = col
+        .iter()
+        .filter(|&&x| x >= b0 && x <= b1)
+        .map(|&x| {
+          let e = (lo - x as f64).max(x as f64 - hi).max(0.0);
+          e * e
+        })
+        .sum();
+      err += d * d / 12.0 + out / col.len() as f64;
+      let (q1, q3) = quantiles(col, 0.25, 0.75);
+      let iqr = (q3 - q1) as f64 / 1.349;
+      var += iqr * iqr;
+    }
+    match (err > 0.0, var > 0.0) {
+      (false, _) => 0.0,
+      (true, false) => f32::INFINITY,
+      (true, true) => (err / var) as f32,
+    }
   }
 
   /// Which quantisation this is.
@@ -668,6 +783,46 @@ mod tests {
         });
       }
     }
+  }
+
+  /// Clipped codes ignore a single extreme row and keep the bulk's
+  /// resolution; the error ratio flags min/max codes that collapsed, and
+  /// clipped codes when outliers are too many to clip away.
+  #[test]
+  fn clipped_codes_and_error_ratio() {
+    let (n, dim) = (5000, 8);
+    let mut data = rows(n, dim);
+    let normal = Quantizer::train(Quantization::Sq8, dim, Metric::L2, &data)
+      .unwrap()
+      .sq8_error_ratio(&data);
+    assert!(normal < 1e-3, "{normal}");
+    for j in 0..dim {
+      data[17 * dim + j] = 1e4;
+    }
+    let minmax =
+      Quantizer::train(Quantization::Sq8, dim, Metric::L2, &data).unwrap();
+    assert!(minmax.sq8_error_ratio(&data) > 1.0);
+    let clipped = Quantizer::train_sq8_clipped(dim, Metric::L2, &data).unwrap();
+    assert!(clipped.sq8_error_ratio(&data) < 1e-2);
+    let Quantizer::Sq8(s) = &clipped else {
+      unreachable!()
+    };
+    assert!(s.step.as_slice().iter().all(|&d| d < 0.01), "{s:?}");
+    for i in (0..n).step_by(50) {
+      for j in 0..dim {
+        data[i * dim + j] = -1e4;
+      }
+    }
+    let clipped = Quantizer::train_sq8_clipped(dim, Metric::L2, &data).unwrap();
+    assert!(clipped.sq8_error_ratio(&data) > 1.0);
+    // Codes trained on a narrow early part saturate for the rest.
+    let early = rows(100, dim).iter().map(|x| x * 0.05).collect::<Vec<_>>();
+    let narrow =
+      Quantizer::train(Quantization::Sq8, dim, Metric::L2, &early).unwrap();
+    let later = rows(n, dim);
+    assert!(narrow.sq8_error_ratio(&later) > 0.1);
+    assert_eq!(quantiles(vec![], 0.1, 0.9), (0.0, 0.0));
+    assert_eq!(quantiles(vec![3.0, 1.0, 2.0], 0.0, 1.0), (1.0, 3.0));
   }
 
   #[test]

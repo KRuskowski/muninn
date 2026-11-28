@@ -92,9 +92,10 @@ impl Ord for Near {
 /// Sort key of a candidate: the distance's bits mapped so that unsigned
 /// order is float order (negative values flipped, positive ones offset),
 /// then the id. One `u64` compare ranks by distance, then by smaller id.
+/// `-0.0` is folded into `+0.0` first, so the two tie (as in `TopK`).
 #[inline]
 fn key(d: f32, id: DocId) -> u64 {
-  let b = d.to_bits();
+  let b = (d + 0.0).to_bits();
   let k = if b >> 31 == 1 { !b } else { b | 0x8000_0000 };
   ((k as u64) << 32) | id as u64
 }
@@ -538,6 +539,17 @@ mod tests {
     }
     let ids: Vec<DocId> = p.to_vec().iter().map(|x| x.0).collect();
     assert_eq!(ids, vec![2, 5, 3, 4]);
+    // -0.0 and +0.0 tie, so the smaller id ranks first either way.
+    p.reset(2);
+    p.insert(9, 0.0);
+    p.insert(8, -0.0);
+    let ids: Vec<DocId> = p.to_vec().iter().map(|x| x.0).collect();
+    assert_eq!(ids, vec![8, 9]);
+    p.reset(2);
+    p.insert(8, 0.0);
+    p.insert(9, -0.0);
+    let ids: Vec<DocId> = p.to_vec().iter().map(|x| x.0).collect();
+    assert_eq!(ids, vec![8, 9]);
   }
 
   #[test]

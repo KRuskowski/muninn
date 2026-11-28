@@ -442,12 +442,18 @@ impl Builder<'_> {
     // `q` farther than every current neighbour: re-pruning a list the
     // heuristic produced would keep the list and drop `q` (the heuristic
     // walks closest first and the list is full before it reaches `q`), so
-    // the re-prune is skipped. It differs only for lists that grew by
-    // plain appends, whose re-prune could drop a redundant neighbour and
-    // keep `q`. Measured on NYTimes-256: the build took 50 s instead of
-    // 58 s, with recall@10 at ef 64 and 256 unchanged (0.858, 0.917).
+    // the re-prune is skipped. Lists not produced by the heuristic (filled
+    // by plain appends, merged, or holding re-inserted protected edges)
+    // could re-prune differently: drop a redundant neighbour and keep
+    // `q`. Measured on NYTimes-256 (cosine): the build took 50 s instead
+    // of 58 s, with recall@10 at ef 64 and 256 unchanged (0.858, 0.917);
+    // SIFT-1M (L2) and GloVe-100 recall also held. Not for `Metric::Dot`:
+    // there `select` tops lists up with pruned candidates, so a re-prune
+    // can keep a farthest `q`; Dot always re-prunes.
     let dq = cands[cands.len() - 1].1;
-    if cands[..cands.len() - 1].iter().all(|&(_, d)| d <= dq) {
+    if self.metric != Metric::Dot
+      && cands[..cands.len() - 1].iter().all(|&(_, d)| d <= dq)
+    {
       return;
     }
     Self::sort_cands(&mut cands);

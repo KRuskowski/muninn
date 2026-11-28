@@ -259,3 +259,54 @@ fn hnsw_format_versions() {
     assert_eq!(r.is_ok(), ok, "version {version}");
   }
 }
+
+/// Review of the node-order maps: a file whose maps are not inverse
+/// permutations must be rejected at open. Before the check, an
+/// out-of-range `ext` entry came back as a hit id, a duplicated one gave
+/// duplicate hits, a swap gave silently wrong ids, and an out-of-range
+/// `int` entry made `vector(id)` panic.
+#[test]
+fn corrupt_order_maps_are_rejected() {
+  let (n, dim) = (500usize, 8);
+  let d = data(n, dim);
+  let idx =
+    HnswIndex::build(dim, Metric::L2, HnswParams::default(), &d).unwrap();
+  let buf = idx.write_to(AlignedBuf::new()).unwrap();
+  assert!(HnswIndex::open(Region::new(buf.clone())).is_ok());
+  type Edit<'a> = Box<dyn Fn(usize, u32) -> u32 + 'a>;
+  let cases: Vec<(&str, &str, Edit<'_>)> = vec![
+    (
+      "ext",
+      "out of range",
+      Box::new(|i, v| if i == 0 { 1 << 30 } else { v }),
+    ),
+    (
+      "ext",
+      "duplicate",
+      Box::new(|i, v| if i <= 1 { 0 } else { v }),
+    ),
+    (
+      "ext",
+      "swap",
+      Box::new(|i, v| match i {
+        0 => 1,
+        1 => 0,
+        _ => v,
+      }),
+    ),
+    (
+      "int",
+      "out of range",
+      Box::new(move |i, v| if i < n { (1 << 30) + i as u32 } else { v }),
+    ),
+  ];
+  for (sec, what, f) in cases {
+    let mut b = buf.clone();
+    let r = section_range(&b, sec);
+    let before = b.as_slice()[r.clone()].to_vec();
+    edit_u32s(&mut b.as_mut_slice()[r.clone()], f);
+    assert_ne!(b.as_slice()[r].to_vec(), before, "{sec} {what}: no edit");
+    let res = HnswIndex::open(Region::new(b));
+    assert!(res.is_err(), "{sec} {what}: opened");
+  }
+}

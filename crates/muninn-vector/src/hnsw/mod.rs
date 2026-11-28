@@ -106,6 +106,12 @@ const PAR_MIN_BATCH: usize = 64;
 /// digits. Small batches are not worth training codes for.
 const CODED_BUILD_MIN: usize = 4096;
 
+/// Largest `Quantizer::sq8_error_ratio` (coding error relative to the
+/// spread of the bulk of the values) at which a build searches with SQ8
+/// codes. Well-spread data scores about 1e-4; codes whose range one
+/// outlier stretched score near or above 1.
+const MAX_CODE_ERROR: f32 = 1e-2;
+
 /// While the graph is smaller than this, a batch is inserted serially
 /// first, so parallel inserts never race over a near-empty graph.
 const SERIAL_WARMUP: usize = 256;
@@ -633,24 +639,20 @@ impl HnswIndex {
     let locks: Vec<Mutex<()>> = (0..stripes).map(|_| Mutex::new(())).collect();
     let entry = Mutex::new((self.entry, self.max_level));
     // Large batches search with SQ8 codes while inserting (see
-    // `Builder::codes`): the index's own SQ8 codes when it has them,
-    // otherwise codes trained just for this batch.
+    // `Builder::codes`): the index's own SQ8 codes if they still resolve
+    // all the vectors well (they may have been trained on an early part
+    // of them), otherwise codes trained for this build on clipped ranges
+    // (n * dim bytes while the build runs). If even those are too coarse
+    // (heavy outliers), the build searches full vectors.
     let coded = stripes > 1 && rows >= CODED_BUILD_MIN;
-    let own_sq8 = matches!(self.quant, Some(Quantizer::Sq8(_)));
-    let temp_codes = (coded && !own_sq8)
-      .then(|| {
-        Quantizer::train(
-          Quantization::Sq8,
-          self.dim,
-          self.metric,
-          self.vectors.as_slice(),
-        )
-      })
-      .flatten();
-    let build_codes = match (&self.quant, &temp_codes) {
-      (Some(q), _) if coded && own_sq8 => Some(q),
-      (_, t) => t.as_ref(),
-    };
+    let data = self.vectors.as_slice();
+    let fine = |q: &Quantizer| q.sq8_error_ratio(data) <= MAX_CODE_ERROR;
+    let own = self.quant.as_ref().filter(|q| coded && fine(q));
+    let temp_codes = (coded && own.is_none())
+      .then(|| Quantizer::train_sq8_clipped(self.dim, self.metric, data))
+      .flatten()
+      .filter(|q| fine(q));
+    let build_codes = own.or(temp_codes.as_ref());
     let r = {
       let b = Builder {
         view: BuildView {
@@ -866,6 +868,12 @@ impl HnswIndex {
       && Some(graph.l0.len()) == n.checked_mul(1 + m0);
     if !sizes_ok {
       return Err(Error::corrupt("HNSW sections have inconsistent sizes"));
+    }
+    // The order maps must be inverse permutations, or results would carry
+    // ids out of range, twice, or wrong, and `vector(id)` could panic.
+    // One pass over 8 bytes per node, the only O(n) check at open.
+    if !ids.is_valid() {
+      return Err(Error::corrupt("HNSW node order maps are not a permutation"));
     }
     let entry_ok = if n == 0 {
       entry == NONE as u64
@@ -1228,6 +1236,28 @@ mod tests {
         assert_eq!(hit[0].id, n as DocId + i as DocId);
       }
     }
+  }
+
+  /// With `Metric::Dot`, re-pruning a full list can keep a new link that
+  /// is farther than every current neighbour (pruned candidates top the
+  /// list up), so `connect` must not skip the re-prune there. Node 0's
+  /// neighbours 1..=4 all point its way and dominate each other; node 5
+  /// is orthogonal: the heuristic keeps 1 and 5, then tops up with 2, 3.
+  #[test]
+  fn dot_connect_keeps_a_farthest_link_the_heuristic_keeps() {
+    let p = HnswParams::default().with_m(2);
+    let mut idx = HnswIndex::new(2, Metric::Dot, p).unwrap();
+    let rows = [1.0, 0.0, 10.0, 0.0, 9.0, 0.1, 8.0, 0.2, 7.0, -0.1, 0.0, 5.0];
+    idx.append(&rows).unwrap();
+    idx.with_builder(1, 1, |b| {
+      for x in 1..=5 {
+        b.connect(0, x, 0);
+      }
+    });
+    let mut buf = Vec::new();
+    let mut nb = idx.view().neighbors(0, 0, &mut buf).to_vec();
+    nb.sort_unstable();
+    assert_eq!(nb, vec![1, 2, 3, 5]);
   }
 
   /// Review item 6: in a parallel build another thread can add a

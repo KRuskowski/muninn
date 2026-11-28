@@ -48,6 +48,17 @@ impl IdMap {
     lookup(self.int.as_slice(), e)
   }
 
+  /// Whether the map is the identity or `ext` and `int` are inverse
+  /// permutations of `0..n` (`int[ext[i]] == i` for every `i`, which with
+  /// equal lengths implies both are permutations).
+  pub(crate) fn is_valid(&self) -> bool {
+    let (ext, int) = (self.ext.as_slice(), self.int.as_slice());
+    ext.len() == int.len()
+      && ext.iter().enumerate().all(|(i, &e)| {
+        int.get(e as usize).is_some_and(|&back| back as usize == i)
+      })
+  }
+
   /// Extends a non-identity map for nodes `first..end` appended with equal
   /// internal and external ids.
   pub(crate) fn push_identity(&mut self, first: usize, end: usize) {
@@ -210,5 +221,14 @@ mod tests {
     assert_eq!((m.ext(0), m.ext(1), m.ext(2)), (0, 1, 2));
     m.push_identity(3, 5);
     assert_eq!((m.ext(4), m.int(3)), (4, 3));
+    assert!(m.is_valid());
+    let bad = |ext: Vec<u32>, int: Vec<u32>| IdMap {
+      ext: Slab::owned(ext),
+      int: Slab::owned(int),
+    };
+    assert!(!bad(vec![1, 1], vec![0, 1]).is_valid());
+    assert!(!bad(vec![0, 9], vec![0, 1]).is_valid());
+    assert!(!bad(vec![1, 0], vec![0, 1]).is_valid());
+    assert!(!bad(vec![0], vec![]).is_valid());
   }
 }
