@@ -40,7 +40,7 @@ Every failure returns the same body, with a matching status code:
 | `payload_too_large` | 413 | the body exceeds `--body-limit` (default 16 MiB); for the bulk endpoint, one line exceeds `--bulk-line-limit` (default 1 MiB) |
 | `unsupported_media_type` | 415 | a body without `Content-Type: application/json` |
 | `internal` | 500 | disk errors, corrupt data, a collection that could not be opened |
-| `unavailable` | 503 | too many requests, bulk imports or request bytes in flight (retry after the `Retry-After` seconds); a collection that stopped accepting writes after a disk failure (until the server is restarted) |
+| `unavailable` | 503 | too many requests, bulk imports or request bytes in flight (sent with `Retry-After`: retry after that many seconds); a collection that stopped accepting writes after a disk failure (sent without `Retry-After`: retrying does not help until the server is restarted) |
 
 Messages say exactly what is wrong and where, for example `request body: unknown field \`limit\`, expected one of ... at line 1 column 21` or `filter at $.and[1].range.year: range bound must be a number, got a string`.
 
@@ -67,7 +67,7 @@ Messages say exactly what is wrong and where, for example `request body: unknown
 - `last_lsn`, `durable_lsn`, `checkpoint_lsn`: sequence numbers of the last applied write, of the last write on stable storage, and of the last write contained in segments.
 - `unavailable`: collections whose files could not be opened when the server started, with the reason, for example `{"old": "corrupt data: ..."}`. The other collections work normally. Every endpoint of an unavailable collection answers `500 internal` with that reason; `DELETE /v1/collections/{name}` removes it.
 
-If a disk failure leaves a collection in an unknown state, it stops accepting writes and its write endpoints answer `503 unavailable` with a message saying so; retrying does not help until the server is restarted. Restarting the server reopens it and recovers every acknowledged write.
+If a disk failure leaves a collection in an unknown state, it stops accepting writes and its write endpoints answer `503 unavailable` without a `Retry-After` header and with a message saying so; retrying does not help until the server is restarted. Restarting the server reopens it and recovers every acknowledged write.
 
 ## Collections
 

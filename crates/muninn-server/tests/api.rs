@@ -974,18 +974,18 @@ async fn poisoned_collection_refuses_writes_as_unavailable() {
     503,
     "unavailable",
   );
-  let m = assert_error(
-    &call(
-      &a,
-      "POST",
-      "/v1/collections/docs/documents",
-      r#"{"documents": [{"id": 9, "vector": [1, 0, 0]}]}"#,
-    )
-    .await,
-    503,
-    "unavailable",
-  );
+  let r = call_with(
+    &a,
+    "POST",
+    "/v1/collections/docs/documents",
+    &[LOCAL, JSON],
+    r#"{"documents": [{"id": 9, "vector": [1, 0, 0]}]}"#,
+  )
+  .await;
+  let m = assert_error(&(r.0, r.1), 503, "unavailable");
   assert!(m.contains("refuses writes"), "{m}");
+  // Retrying cannot help until the server restarts: no Retry-After.
+  assert!(r.2.get("retry-after").is_none(), "{:?}", r.2);
   drop(a);
   // A restart recovers every acknowledged write.
   let a = app(dir.path(), ServerConfig::default());
