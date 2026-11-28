@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::TestDir;
 use muninn_core::Error;
-use muninn_store::wal::{
-  DISCARDED_SUFFIX, MAX_UNSYNCED_SEGMENTS, SEGMENT_SUFFIX,
-};
+use muninn_store::wal::{DISCARDED_SUFFIX, SEGMENT_SUFFIX};
 use muninn_store::{Durability, Lsn, Recovery, Wal, WalOptions};
 
 type Records = Vec<(Lsn, Vec<u8>)>;
@@ -572,7 +570,8 @@ fn no_sync_rotation_keeps_no_handle_per_segment() {
   );
   // Every full group of rotated segments was synced and closed; nothing
   // is claimed durable before a sync.
-  let eager = rotated / MAX_UNSYNCED_SEGMENTS * MAX_UNSYNCED_SEGMENTS;
+  let group = muninn_store::wal::MAX_UNSYNCED_SEGMENTS;
+  let eager = rotated / group * group;
   assert_eq!(wal.stats().syncs as usize, eager);
   assert_eq!(wal.durable_lsn(), 0);
   // Sync reaches the remaining rotated segments, also when some of them
