@@ -1,0 +1,280 @@
+{
+  "kind": "vector",
+  "engine": "hnswlib",
+  "engine_version": "0.8.0",
+  "dataset": {
+    "name": "sift-128-euclidean",
+    "metric": "l2",
+    "n": 1000000,
+    "dim": 128,
+    "queries": 10000,
+    "meta": {
+      "n": 1000000,
+      "dim": 128,
+      "queries": 10000,
+      "gt_k": 100,
+      "sources": [
+        {
+          "url": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+          "file": "sift.tar.gz",
+          "bytes": 168280445,
+          "sha256": "92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
+          "verified": true
+        }
+      ],
+      "files": {
+        "base.fbin": {
+          "bytes": 512000008,
+          "sha256": "8c7b3d999ba3133f865af72df078f77c2d248fdb80571d7ea1f1bb8e1750658e"
+        },
+        "query.fbin": {
+          "bytes": 5120008,
+          "sha256": "9b0082b67d0ac55b4c7d42216560344567ad87ce3e75a9d5214a0762f1c15d65"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "4c06dd3d1539b1de50f1b7e98a116833ed5c2f1571d0ef81f383a04541e797e7"
+        }
+      },
+      "prepared": "2026-11-27T23:38:41Z",
+      "origin": "TEXMEX SIFT1M (Jegou et al.)"
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "space": "l2",
+    "random_seed": 100
+  },
+  "build": {
+    "seconds": 110.98064438399888,
+    "threads": 4,
+    "index_bytes": 660565344,
+    "rss_delta_bytes": 768417792,
+    "peak_rss_bytes": 1340018688,
+    "details": {
+      "write_seconds": 2.48698299300122
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.70954,
+      "qps_1t": 32316.316762065326,
+      "qps_nt": 74285.06401535793,
+      "latency": {
+        "mean_us": 31.265749800000002,
+        "p50_us": 30.425,
+        "p95_us": 43.963,
+        "p99_us": 52.441,
+        "max_us": 71.077
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 0.3216293000470145
+    },
+    {
+      "ef": 16,
+      "recall": 0.80163,
+      "qps_1t": 25448.650223856566,
+      "qps_nt": 56875.043936133996,
+      "latency": {
+        "mean_us": 40.060920599999996,
+        "p50_us": 39.438,
+        "p95_us": 54.344,
+        "p99_us": 64.832,
+        "max_us": 98.163
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 0.7661057000505807
+    },
+    {
+      "ef": 24,
+      "recall": 0.86604,
+      "qps_1t": 19464.83052377138,
+      "qps_nt": 42927.65066471334,
+      "latency": {
+        "mean_us": 53.4133304,
+        "p50_us": 53.234,
+        "p95_us": 70.314,
+        "p99_us": 80.644,
+        "max_us": 119.27
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 2.038621600005449
+    },
+    {
+      "ef": 32,
+      "recall": 0.90283,
+      "qps_1t": 15525.583502852169,
+      "qps_nt": 35757.58099349025,
+      "latency": {
+        "mean_us": 66.5509064,
+        "p50_us": 66.788,
+        "p95_us": 85.225,
+        "p99_us": 96.146,
+        "max_us": 127.833
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 2.141088899981895
+    },
+    {
+      "ef": 48,
+      "recall": 0.94327,
+      "qps_1t": 11239.861880615772,
+      "qps_nt": 25262.269279715954,
+      "latency": {
+        "mean_us": 94.5258209,
+        "p50_us": 95.935,
+        "p95_us": 118.311,
+        "p99_us": 133.612,
+        "max_us": 325.038
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 5.556756099960367
+    },
+    {
+      "ef": 64,
+      "recall": 0.96347,
+      "qps_1t": 8882.732941771914,
+      "qps_nt": 19997.014045794655,
+      "latency": {
+        "mean_us": 120.2288776,
+        "p50_us": 122.736,
+        "p95_us": 149.887,
+        "p99_us": 164.631,
+        "max_us": 202.544
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 7.65091239996535
+    },
+    {
+      "ef": 96,
+      "recall": 0.98155,
+      "qps_1t": 5953.481775971176,
+      "qps_nt": 14854.299435258023,
+      "latency": {
+        "mean_us": 172.4567635,
+        "p50_us": 177.568,
+        "p95_us": 212.547,
+        "p99_us": 226.761,
+        "max_us": 283.596
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 4.487827400103612
+    },
+    {
+      "ef": 128,
+      "recall": 0.98921,
+      "qps_1t": 4583.081708782036,
+      "qps_nt": 11028.188993982392,
+      "latency": {
+        "mean_us": 220.70654689999998,
+        "p50_us": 227.578,
+        "p95_us": 271.976,
+        "p99_us": 288.127,
+        "max_us": 338.859
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 2.512749900087414
+    },
+    {
+      "ef": 192,
+      "recall": 0.99523,
+      "qps_1t": 3351.590182405556,
+      "qps_nt": 8192.045969825831,
+      "latency": {
+        "mean_us": 300.53864250000004,
+        "p50_us": 310.555,
+        "p95_us": 372.868,
+        "p99_us": 395.063,
+        "max_us": 488.393
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 2.1728084998943586
+    },
+    {
+      "ef": 256,
+      "recall": 0.99737,
+      "qps_1t": 2580.2812430857666,
+      "qps_nt": 6389.316086197228,
+      "latency": {
+        "mean_us": 392.6752109,
+        "p50_us": 405.657,
+        "p95_us": 487.28,
+        "p99_us": 513.16,
+        "max_us": 558.99
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 5.120558600122536
+    },
+    {
+      "ef": 384,
+      "recall": 0.99862,
+      "qps_1t": 1830.8282489996407,
+      "qps_nt": 4341.626725349741,
+      "latency": {
+        "mean_us": 552.673898,
+        "p50_us": 569.88,
+        "p95_us": 691.72,
+        "p99_us": 727.807,
+        "max_us": 839.904
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 6.473018400071851
+    },
+    {
+      "ef": 512,
+      "recall": 0.99904,
+      "qps_1t": 1375.1936652234876,
+      "qps_nt": 3529.347271489202,
+      "latency": {
+        "mean_us": 732.4162415999999,
+        "p50_us": 755.369,
+        "p95_us": 919.598,
+        "p99_us": 965.854,
+        "max_us": 1090.929
+      },
+      "deterministic": true,
+      "python_call_overhead_us": 5.245934400041733
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "02c19aa",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (3 other agents compiling on other cores): numbers are NOISY, for pipeline validation only. muninn-vector from its in-review branch.",
+    "python": "3.11.2",
+    "numpy": "2.4.6",
+    "timestamp": 1795824114
+  },
+  "notes": [
+    "hnswlib built from source by pip (compiled with -march=native by its setup.py).",
+    "qps_1t: one batch call with one thread; latency: one call per query, including the Python call (see python_call_overhead_us)."
+  ]
+}

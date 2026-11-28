@@ -1,0 +1,110 @@
+{
+  "kind": "vector",
+  "engine": "muninn-flat",
+  "engine_version": "0.1.0 (bcdd9f7)",
+  "dataset": {
+    "name": "glove-100-angular",
+    "metric": "cosine",
+    "n": 1183514,
+    "dim": 100,
+    "queries": 1000,
+    "meta": {
+      "dim": 100,
+      "files": {
+        "base.fbin": {
+          "bytes": 473405608,
+          "sha256": "e2fdc4d26bf3156a47f0baecbf7d61a58671f92b851e52040a67c8593546219e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "3f43ac9b7edd0b06b197c3e86615d94a333a8994bbd6f50e339ac98234890e43"
+        },
+        "query.fbin": {
+          "bytes": 4000008,
+          "sha256": "9fe959d97e44ccd8fefb889499a06bf9222c0493536c7f585ae103ea52987d3b"
+        }
+      },
+      "gt_k": 100,
+      "n": 1183514,
+      "origin": "ann-benchmarks",
+      "prepared": "2026-11-27T23:38:42Z",
+      "queries": 10000,
+      "source_distance": "angular",
+      "sources": [
+        {
+          "bytes": 485413888,
+          "file": "glove-100-angular.hdf5",
+          "sha256": "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4",
+          "url": "http://ann-benchmarks.com/glove-100-angular.hdf5",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "exact": true
+  },
+  "build": {
+    "seconds": 0.179589906,
+    "threads": 1,
+    "index_bytes": 473405872,
+    "rss_delta_bytes": 473550848,
+    "peak_rss_bytes": 970014720,
+    "details": {
+      "write_seconds": 1.811282397
+    }
+  },
+  "results": [
+    {
+      "ef": 0,
+      "recall": 0.9999,
+      "qps_1t": 37.889622189489316,
+      "qps_nt": 118.87729528186628,
+      "latency": {
+        "mean_us": 26392.324052,
+        "p50_us": 26245.235,
+        "p95_us": 27364.277,
+        "p99_us": 27702.959,
+        "max_us": 27977.287
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "bcdd9f7",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795828412
+  },
+  "notes": [
+    "Exact scan; recall below 1 only from distance ties.",
+    "Searched from the memory-mapped index file."
+  ]
+}
