@@ -841,6 +841,9 @@ impl Dist for Sq8Dist<'_> {
     if !self.sq.is_empty() {
       prefetch_lines(self.sq.as_ptr(), id as usize, 1);
     }
+    if !self.exact.is_empty() {
+      prefetch_lines(self.exact.as_ptr(), id as usize / 64, 1);
+    }
   }
 
   /// Same values as `dist`, bit for bit (`a + b == b + a` in floats).
@@ -850,15 +853,19 @@ impl Dist for Sq8Dist<'_> {
       return self.full.dist_many(ids, out);
     }
     muninn_simd::dot_f32_u8_gather(self.w, self.codes, ids, out);
-    for (o, &id) in out.iter_mut().zip(ids) {
-      *o += self.base + self.sq.get(id as usize).copied().unwrap_or(0.0);
-    }
-    if !self.exact.is_empty() {
+    if self.exact.is_empty() {
       for (o, &id) in out.iter_mut().zip(ids) {
-        if self.is_exact(id as usize) {
-          *o = self.full.dist(id);
-        }
+        *o += self.base + self.sq.get(id as usize).copied().unwrap_or(0.0);
       }
+      return;
+    }
+    for (o, &id) in out.iter_mut().zip(ids) {
+      let i = id as usize;
+      *o = if self.exact[i / 64] >> (i % 64) & 1 == 1 {
+        self.full.dist(id)
+      } else {
+        *o + (self.base + self.sq.get(i).copied().unwrap_or(0.0))
+      };
     }
   }
 }
