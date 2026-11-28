@@ -121,7 +121,7 @@ export BENCH_LABEL=$LABEL
 export BENCH_MACHINE_TYPE=$(curl -s -m 2 -H 'Metadata-Flavor: Google' \
   http://metadata.google.internal/computeMetadata/v1/instance/machine-type \
   2>/dev/null | sed 's|.*/||')
-"$bin" sysinfo > "$OUT/system.json"
+"${pin[@]}" "$bin" sysinfo > "$OUT/system.json"
 cat > "$OUT/config.json" <<JSON
 {"datasets": "$DATASETS", "engines": "$ENGINES", "quant": "$QUANT",
  "M": $M, "ef_construction": $EFC, "efs": "$EFS", "k": $K,
