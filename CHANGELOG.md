@@ -40,3 +40,4 @@ All notable changes to muninn are recorded here, written for people who use muni
 - New documents are searchable as soon as the write returns. Large collections are written to disk in the background while searching and writing continue, and the parts on disk are merged in the background so searches stay fast and deleted documents stop taking space. You can also trigger both yourself.
 - Text relevance scores are the same however a collection happens to be split on disk, and documents with equal scores always come back in the order they were written.
 - Searches can be limited to a list of document ids or by a test on the id, and filters can be combined with and, or and not. Filters are applied while searching, so you get as many results as you asked for whenever that many documents match.
+- Background merging keeps the number of on-disk parts small even under a constant stream of deletes, and an explicit compaction is never held up indefinitely by ongoing writes.

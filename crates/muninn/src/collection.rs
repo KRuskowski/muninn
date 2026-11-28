@@ -69,7 +69,7 @@ use muninn_text::DELETED;
 
 use crate::codec::{self, Op};
 use crate::memtable::{MemInner, Memtable, read, write};
-use crate::options::{Failpoint, Options};
+use crate::options::{Durability, Failpoint, Options};
 use crate::schema::Schema;
 use crate::segment::{self, Segment};
 use crate::types::{CollectionStats, Document, Id, SegmentStats};
@@ -271,6 +271,34 @@ fn is_full(opts: &Options, st: &State) -> bool {
   bytes >= opts.memtable_max_bytes
 }
 
+/// Removes files of segments a crashed flush or merge wrote but never
+/// committed: ids at or above the manifest's `next_segment_id`. The
+/// store's gc keeps those, because in a running collection they belong to
+/// work in flight; at open nothing is in flight (the directory is locked).
+fn remove_uncommitted(dir: &Path, next_id: u64) -> Result<()> {
+  let mut removed = false;
+  for e in std::fs::read_dir(dir)? {
+    let e = e?;
+    let name = e.file_name();
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("seg-")) else {
+      continue;
+    };
+    let digits: String =
+      rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !e.file_type()?.is_file() {
+      continue;
+    }
+    if digits.parse::<u64>().is_ok_and(|id| id >= next_id) {
+      std::fs::remove_file(e.path())?;
+      removed = true;
+    }
+  }
+  if removed {
+    muninn_store::fs::sync_dir(dir)?;
+  }
+  Ok(())
+}
+
 /// Picks segments to merge in the background: a contiguous range of
 /// `segs` (live, total docs per segment).
 fn pick_merge(
@@ -278,15 +306,20 @@ fn pick_merge(
   opts: &Options,
 ) -> Option<std::ops::Range<usize>> {
   let n = segs.len();
-  for (i, &(live, total)) in segs.iter().enumerate() {
-    if total > 0
-      && (total - live) as f64 / total as f64 >= opts.compact_deleted_ratio
-    {
-      return Some(i..i + 1);
-    }
-  }
   let base = opts.memtable_max_docs.max(1) as u64;
   let f = opts.merge_factor;
+  let cap = opts.max_merge_docs as u64;
+  // 1. Bound the number of segments: merge the smallest neighbours.
+  if n > 3 * f + 8 {
+    let best = (0..n - 1)
+      .map(|i| (segs[i].0 + segs[i + 1].0, i))
+      .filter(|&(s, _)| s <= cap)
+      .min();
+    if let Some((_, i)) = best {
+      return Some(i..i + 2);
+    }
+  }
+  // 2. Size tiers: `f` neighbours of similar size.
   let tier = |live: u64| {
     let (mut t, mut cap) = (0u32, base);
     while live > cap {
@@ -295,7 +328,6 @@ fn pick_merge(
     }
     t
   };
-  let cap = opts.max_merge_docs as u64;
   if n >= f {
     for i in 0..=n - f {
       let w = &segs[i..i + f];
@@ -306,13 +338,13 @@ fn pick_merge(
       }
     }
   }
-  if n > 3 * f + 8 {
-    let best = (0..n - 1)
-      .map(|i| (segs[i].0 + segs[i + 1].0, i))
-      .filter(|&(s, _)| s <= cap)
-      .min();
-    if let Some((_, i)) = best {
-      return Some(i..i + 2);
+  // 3. Reclaim space from segments with many deletes. Last, so constant
+  // deletes cannot starve the merges above.
+  for (i, &(live, total)) in segs.iter().enumerate() {
+    if total > 0
+      && (total - live) as f64 / total as f64 >= opts.compact_deleted_ratio
+    {
+      return Some(i..i + 1);
     }
   }
   None
@@ -349,6 +381,7 @@ impl Core {
       Error::corrupt(format!("{} has no manifest", dir.display()))
     })?;
     let schema = Schema::from_json(&m.schema)?;
+    remove_uncommitted(dir, m.next_segment_id)?;
     store.gc(true, &[])?;
     let mut views = Vec::with_capacity(m.segments.len() + 1);
     let mut tombs = HashMap::new();
@@ -633,9 +666,17 @@ impl Core {
     Ok(())
   }
 
+  /// See [`Failpoint::SlowPublish`].
+  fn pause(&self) {
+    if self.opts.failpoint == Some(Failpoint::SlowPublish) {
+      std::thread::sleep(Duration::from_millis(20));
+    }
+  }
+
   /// The worker thread's loop.
   pub(crate) fn run_worker(self: Arc<Self>) {
     let mut retry_wait = false;
+    let mut flushed_last = false;
     loop {
       let job = {
         let Ok(mut st) = self.state.lock() else {
@@ -651,20 +692,33 @@ impl Core {
           if st.shutdown || st.poisoned.is_some() {
             return;
           }
-          if let Some(f) = st.frozen.front() {
-            break Job::Flush(*f);
-          }
-          if st.compact_req > st.compact_done {
-            break Job::Compact {
+          let compaction = if st.compact_req > st.compact_done {
+            Some(Job::Compact {
               full: true,
               req: st.compact_req,
-            };
-          }
-          if self.opts.auto_compact && st.auto_compact_pending {
-            break Job::Compact {
+            })
+          } else if self.opts.auto_compact && st.auto_compact_pending {
+            Some(Job::Compact {
               full: false,
               req: 0,
-            };
+            })
+          } else {
+            None
+          };
+          // Flushes first, but under sustained writes alternate with
+          // compaction so merges (and explicit compact calls) are not
+          // starved; writers blocked on the flush backlog always win.
+          let blocked = st.frozen.len() > self.opts.max_pending_flushes;
+          match (st.frozen.front(), compaction) {
+            (Some(f), Some(c)) => {
+              if blocked || !flushed_last {
+                break Job::Flush(*f);
+              }
+              break c;
+            }
+            (Some(f), None) => break Job::Flush(*f),
+            (None, Some(c)) => break c,
+            (None, None) => {}
           }
           st = match self.worker_cv.wait(st) {
             Ok(g) => g,
@@ -672,6 +726,7 @@ impl Core {
           };
         }
       };
+      flushed_last = matches!(job, Job::Flush(_));
       let res = match job {
         Job::Flush(f) => self.flush_one(f),
         Job::Compact { full, req } => {
@@ -707,6 +762,12 @@ impl Core {
   /// Writes the oldest frozen memtable as a segment and publishes it.
   fn flush_one(&self, f: Frozen) -> Result<()> {
     self.wal.rotate()?;
+    if self.opts.durability == Durability::NoSync {
+      // Without syncs the WAL keeps every rotated-out segment file open
+      // until the next `Wal::sync`; one rotation per flush would leak a
+      // file handle per flush. One fsync per flush releases them.
+      self.wal.sync()?;
+    }
     let mut disk = self.disk.lock().map_err(|_| poisoned_err("disk lock"))?;
     let v = self.snapshot();
     let mem = v.views[v.nseg..]
@@ -752,6 +813,7 @@ impl Core {
         targets.push((s.id, view.tomb.clone(), view.deleted, s.len));
       }
     }
+    self.pause();
     let mut m = disk.manifest.clone();
     let prev_checkpoint = m.wal_checkpoint_lsn;
     if let Some(s) = &seg {
@@ -867,6 +929,7 @@ impl Core {
       None => None,
     };
     self.failpoint(Failpoint::AfterCompactionWrite)?;
+    self.pause();
     let run_ids: HashSet<u64> = run.iter().map(|(s, _, _)| s.id).collect();
     let mut m = disk.manifest.clone();
     let pos = m
@@ -1104,9 +1167,12 @@ mod tests {
   }
 
   #[test]
-  fn policy_prefers_heavy_deletes_then_tiers() {
+  fn policy_bounds_count_then_tiers_then_deletes() {
     let o = opts();
     assert_eq!(pick_merge(&[(100, 100), (10, 100)], &o), Some(1..2));
+    // A tier window wins over a segment with many deletes.
+    let s = [(10, 100), (90, 90), (100, 100), (50, 50), (80, 80)];
+    assert_eq!(pick_merge(&s, &o), Some(0..4));
     assert_eq!(pick_merge(&[(100, 100); 3], &o), None);
     let s = [(1000, 1000), (90, 90), (100, 100), (50, 50), (80, 80)];
     assert_eq!(pick_merge(&s, &o), Some(1..5));

@@ -119,4 +119,8 @@ pub enum Failpoint {
   AfterManifestCommit,
   /// After a compaction wrote its segment, before the manifest commit.
   AfterCompactionWrite,
+  /// Not a crash: the worker pauses 20 ms inside the windows where a
+  /// flush or merge has captured state that concurrent writes may change
+  /// before it publishes, so tests can hit those races reliably.
+  SlowPublish,
 }
