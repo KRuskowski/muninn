@@ -26,6 +26,7 @@ mod bulk;
 pub mod cli;
 mod error;
 mod guard;
+mod linger;
 pub mod model;
 mod server;
 
@@ -52,7 +53,10 @@ pub use server::{AppState, MAX_BULK_BATCH, ServerConfig, router};
 /// Each connection gets `TCP_NODELAY`, must send each request's headers
 /// within [`ServerConfig::header_timeout`] (which also ends idle
 /// keep-alive connections), and beyond [`ServerConfig::max_connections`]
-/// new connections are closed at once.
+/// new connections are closed at once. A closing connection first reads
+/// and discards what the client still sends (for up to 2 s and 1 MiB), so
+/// a response sent before the request body was read is not destroyed by a
+/// connection reset.
 pub async fn serve(
   listener: tokio::net::TcpListener,
   state: AppState,
@@ -95,8 +99,8 @@ pub async fn serve(
     if let Err(e) = tcp.set_nodelay(true) {
       tracing::debug!("cannot set TCP_NODELAY: {e}");
     }
-    let conn =
-      graceful.watch(http.serve_connection(TokioIo::new(tcp), service.clone()));
+    let io = TokioIo::new(linger::LingerStream::new(tcp));
+    let conn = graceful.watch(http.serve_connection(io, service.clone()));
     conns.spawn(async move {
       if let Err(e) = conn.await {
         tracing::debug!("connection from {peer}: {e}");
