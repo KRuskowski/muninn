@@ -11,9 +11,12 @@
 //! - [`sys`]: machine description and memory figures for reports.
 //! - [`vector`]: muninn HNSW and flat search sweeps, ground-truth checks.
 //! - [`text`]: muninn and tantivy BM25 indexing and query benchmarks.
+//! - [`engine`]: the same workloads end to end through the `muninn`
+//!   engine's `Collection` (ingest, flush, compaction, search).
 //! - [`run`]: shared helpers for timing query passes on thread pools.
 
 pub mod dataset;
+pub mod engine;
 pub mod measure;
 pub mod run;
 pub mod sys;

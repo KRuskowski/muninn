@@ -90,7 +90,7 @@ impl AnalyzerKind {
     })?)
   }
 
-  fn muninn_description(self) -> &'static str {
+  pub(crate) fn muninn_description(self) -> &'static str {
     match self {
       Self::Default => {
         "alphanumeric runs, Unicode lowercase, tokens > 255 bytes dropped"
@@ -285,7 +285,8 @@ pub struct TextReport {
   pub notes: Vec<String>,
 }
 
-fn muninn_engine(
+/// Builds, writes and searches the component-level muninn text index.
+pub(crate) fn muninn_component(
   cfg: &TextRun,
   docs: &[String],
   queries: &[String],
@@ -572,7 +573,7 @@ pub fn run_text(cfg: &TextRun, pools: &Pools) -> Result<PathBuf> {
     cfg.analyzer.name()
   );
   std::fs::create_dir_all(&cfg.work_dir)?;
-  let (mun, mun_ids) = muninn_engine(cfg, &docs, &queries, pools)?;
+  let (mun, mun_ids) = muninn_component(cfg, &docs, &queries, pools)?;
   log_search("muninn", &mun.search, pools.threads);
   let mut engines = vec![mun];
   let mut overlap = None;
@@ -705,7 +706,7 @@ mod tests {
     let docs: Vec<String> = DOCS.iter().map(|d| d.to_string()).collect();
     let queries: Vec<String> =
       vec!["runners".into(), "the".into(), "cafe".into()];
-    let (_, m) = muninn_engine(&cfg, &docs, &queries, &pools).unwrap();
+    let (_, m) = muninn_component(&cfg, &docs, &queries, &pools).unwrap();
     let (_, t) = tantivy_engine(&cfg, &docs, &queries, &pools).unwrap();
     // "runners" stems to "runner" in both; "the" is a stop word; "café"
     // is folded at index time.

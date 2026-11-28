@@ -11,6 +11,9 @@ import sys
 import time
 
 RECALL_TARGETS = [0.80, 0.90, 0.95, 0.98, 0.99]
+# What the second indexing phase of each text engine is.
+FINISH = {"muninn": "writing", "tantivy": "merging",
+          "muninn-engine": "flush + compaction"}
 
 def load(d):
   out = []
@@ -127,9 +130,13 @@ def vector_section(ds, runs, checks):
 
 def text_section(runs):
   lines = ["## MS MARCO passages, BM25 top-k", ""]
-  for r in sorted(runs, key=lambda r: r["analyzer"]):
+  for r in sorted(runs, key=lambda r: (r["analyzer"],
+                                       r["engines"][0]["engine"])):
     d = r["dataset"]
-    lines += [f"### Analyzer `{r['analyzer']}`", "",
+    title = f"### Analyzer `{r['analyzer']}`"
+    if r["engines"][0]["engine"] == "muninn-engine":
+      title += ", end to end through the engine"
+    lines += [title, "",
               f"{d['docs']:,} passages ({d['text_bytes'] / 1e6:,.0f} MB of "
               f"text), {d['queries']:,} queries "
               f"({d.get('queries_file')}), k = {r['k']}, "
@@ -160,7 +167,7 @@ def text_section(runs):
       lines.append(
         f"- {e['engine']}: {i['index_seconds']:,.1f} s indexing + "
         f"{i['finish_seconds']:,.1f} s "
-        f"{'writing' if e['engine'] == 'muninn' else 'merging'}; analyzer: "
+        f"{FINISH.get(e['engine'], 'finishing')}; analyzer: "
         f"{e['analyzer']}")
       fast = i.get("details", {}).get("id_fast_field_bytes")
       if fast:
@@ -212,6 +219,7 @@ def main():
   vec = [r for r in rs if r["kind"] == "vector"]
   checks = [r for r in rs if r["kind"] == "gt-check"]
   order = {"muninn-hnsw": 0, "muninn-hnsw-sq8": 1, "muninn-hnsw-binary": 2,
+           "muninn-engine": 2.5,
            "hnswlib": 3, "faiss-hnsw": 4, "usearch": 5, "muninn-flat": 9}
   for ds in sorted({r["dataset"]["name"] for r in vec}):
     runs = sorted((r for r in vec if r["dataset"]["name"] == ds),

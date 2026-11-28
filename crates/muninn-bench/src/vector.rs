@@ -41,7 +41,7 @@ pub struct DatasetInfo {
 }
 
 impl DatasetInfo {
-  fn new(ds: &Dataset, queries: usize) -> Self {
+  pub(crate) fn new(ds: &Dataset, queries: usize) -> Self {
     Self {
       name: ds.meta.name.clone(),
       metric: ds.meta.metric.clone(),
@@ -515,14 +515,14 @@ pub fn verify_ground_truth(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
   use super::*;
   use std::fs::File;
 
   use crate::dataset::{Matrix, write_fbin, write_ibin};
 
   /// A small clustered dataset with exact ground truth, on disk.
-  fn tiny_dataset(dir: &Path, metric: Metric) {
+  pub(crate) fn tiny_dataset(dir: &Path, metric: Metric) {
     std::fs::create_dir_all(dir).unwrap();
     let (n, dim, nq, k) = (600, 8, 20, 10);
     let mut s = 0x1234_5678u64;

@@ -11,6 +11,7 @@ publish = false
 # Heavy dependencies are fine here: this crate is a tool, never a
 # dependency of the library.
 [dependencies]
+muninn.workspace = true
 muninn-core.workspace = true
 muninn-simd.workspace = true
 muninn-store.workspace = true

@@ -13,7 +13,8 @@
 #   DATASETS   vector datasets
 #              [sift-128-euclidean,glove-100-angular]; also
 #              nytimes-256-angular
-#   ENGINES    vector engines [muninn,muninn-flat,hnswlib,faiss,usearch]
+#   ENGINES    vector engines
+#              [muninn,muninn-flat,muninn-engine,hnswlib,faiss,usearch]
 #   QUANT      muninn traversal variants on the same graph [none,sq8]
 #   M, EFC     HNSW M and ef_construction                  [16, 200]
 #   EFS        search ef sweep  [10,16,24,32,48,64,96,128,192,256,384,512]
@@ -24,6 +25,10 @@
 #   TEXT       run the MS MARCO text benchmark (0/1)       [1]
 #   MSMARCO_LIMIT  passages to index, 0 for all 8.8M       [1000000]
 #   ANALYZERS  text analyzers                    [default english]
+#   ENGINE_TEXT  also run the text benchmark end to end through the
+#              engine (0/1)                                 [1]
+#   ENGINE_BATCH, ENGINE_DURABILITY  documents per upsert and
+#              durability (each, batch, none) for engine runs [1000, each]
 #   TANTIVY_INDEX_THREADS  tantivy indexing threads; the first
 #              builds the searched index           [1,<threads>]
 #   CPUS       CPU list to pin everything to, e.g. 0-7 (empty: all) []
@@ -39,7 +44,7 @@ OUT=${OUT:-$HOME/bench-results/$(date -u +%Y%m%dT%H%M%SZ)}
 WORK=${WORK:-$HOME/bench-work}
 VENV=${VENV:-$HOME/benchenv}
 DATASETS=${DATASETS:-sift-128-euclidean,glove-100-angular}
-ENGINES=${ENGINES:-muninn,muninn-flat,hnswlib,faiss,usearch}
+ENGINES=${ENGINES:-muninn,muninn-flat,muninn-engine,hnswlib,faiss,usearch}
 QUANT=${QUANT:-none,sq8}
 M=${M:-16}
 EFC=${EFC:-200}
@@ -51,6 +56,9 @@ FLAT_QUERIES=${FLAT_QUERIES:-1000}
 TEXT=${TEXT:-1}
 MSMARCO_LIMIT=${MSMARCO_LIMIT:-1000000}
 ANALYZERS=${ANALYZERS:-default english}
+ENGINE_TEXT=${ENGINE_TEXT:-1}
+ENGINE_BATCH=${ENGINE_BATCH:-1000}
+ENGINE_DURABILITY=${ENGINE_DURABILITY:-each}
 CPUS=${CPUS:-}
 NATIVE=${NATIVE:-1}
 LABEL=${LABEL:-}
@@ -120,6 +128,8 @@ cat > "$OUT/config.json" <<JSON
  "runs": $RUNS, "queries": "$QUERIES", "flat_queries": $FLAT_QUERIES,
  "threads": $threads, "cpus": "$CPUS", "text": $TEXT,
  "msmarco_limit": $MSMARCO_LIMIT, "analyzers": "$ANALYZERS",
+ "engine_text": $ENGINE_TEXT, "engine_batch": $ENGINE_BATCH,
+ "engine_durability": "$ENGINE_DURABILITY",
  "tantivy_index_threads": "$TANTIVY_INDEX_THREADS",
  "rustflags": "$RUSTFLAGS", "git_commit": "$BENCH_GIT_COMMIT"}
 JSON
@@ -144,6 +154,11 @@ for ds in "${dsets[@]}"; do
       muninn-flat)
         step "$ds-muninn-flat" "${pin[@]}" "$bin" flat --data "$dir" \
           --queries "$FLAT_QUERIES" "${common[@]}" ;;
+      muninn-engine)
+        step "$ds-muninn-engine" "${pin[@]}" "$bin" engine-vector \
+          --data "$dir" --m "$M" --efc "$EFC" --ef "$EFS" "${qlimit[@]}" \
+          --batch "$ENGINE_BATCH" --durability "$ENGINE_DURABILITY" \
+          "${common[@]}" ;;
       hnswlib|faiss|usearch)
         step "$ds-$e" "${pin[@]}" "${py[@]}" "$here/run_ann.py" \
           --engine "$e" --data "$dir" --m "$M" --efc "$EFC" --ef "$EFS" \
@@ -162,6 +177,13 @@ if [ "$TEXT" = 1 ]; then
       --queries "$DATA/msmarco-passage/queries.dev.small.tsv" \
       "${limit[@]}" --analyzer "$a" \
       --tantivy-index-threads "$TANTIVY_INDEX_THREADS" "${common[@]}"
+    if [ "$ENGINE_TEXT" = 1 ]; then
+      step "msmarco-engine-$a" "${pin[@]}" "$bin" engine-text \
+        --collection "$DATA/msmarco-passage/collection.tsv" \
+        --queries "$DATA/msmarco-passage/queries.dev.small.tsv" \
+        "${limit[@]}" --analyzer "$a" --batch "$ENGINE_BATCH" \
+        --durability "$ENGINE_DURABILITY" "${common[@]}"
+    fi
   done
 fi
 

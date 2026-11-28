@@ -5,6 +5,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use muninn_bench::engine::{
+  EngineTextRun, EngineVectorRun, run_engine_text, run_engine_vector,
+};
 use muninn_bench::run::{Pools, write_json};
 use muninn_bench::sys::SystemInfo;
 use muninn_bench::text::{AnalyzerKind, TextRun, run_text};
@@ -109,6 +112,60 @@ enum Cmd {
     /// the searched index. Empty skips tantivy.
     #[arg(long, default_value = "1")]
     tantivy_index_threads: String,
+    #[command(flatten)]
+    common: Common,
+  },
+  /// End to end through the engine: ingest a vector dataset into a
+  /// collection, compact it, sweep ef.
+  EngineVector {
+    /// Dataset directory.
+    #[arg(long)]
+    data: PathBuf,
+    /// HNSW M.
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+    /// HNSW ef_construction.
+    #[arg(long, default_value_t = 200)]
+    efc: usize,
+    /// Comma-separated search ef values.
+    #[arg(long, default_value = DEFAULT_EFS)]
+    ef: String,
+    /// Use only the first N queries.
+    #[arg(long)]
+    queries: Option<usize>,
+    /// Documents per upsert call.
+    #[arg(long, default_value_t = 1000)]
+    batch: usize,
+    /// Write durability: each, batch or none.
+    #[arg(long, default_value = "each")]
+    durability: String,
+    #[command(flatten)]
+    common: Common,
+  },
+  /// End to end through the engine: ingest MS MARCO passages, compact,
+  /// BM25 top-k, compared with the component-level index.
+  EngineText {
+    /// collection.tsv (pid<TAB>passage).
+    #[arg(long)]
+    collection: PathBuf,
+    /// Queries TSV (qid<TAB>query).
+    #[arg(long)]
+    queries: PathBuf,
+    /// Index only the first N passages.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Use only the first N queries.
+    #[arg(long)]
+    query_limit: Option<usize>,
+    /// Analysis: default or english.
+    #[arg(long, default_value = "default")]
+    analyzer: String,
+    /// Documents per upsert call.
+    #[arg(long, default_value_t = 1000)]
+    batch: usize,
+    /// Write durability: each, batch or none.
+    #[arg(long, default_value = "each")]
+    durability: String,
     #[command(flatten)]
     common: Common,
   },
@@ -223,6 +280,61 @@ fn main() -> muninn_bench::Result<()> {
         out_dir: common.out_dir,
       };
       println!("{}", run_text(&cfg, &pools)?.display());
+    }
+    Cmd::EngineVector {
+      data,
+      m,
+      efc,
+      ef,
+      queries,
+      batch,
+      durability,
+      common,
+    } => {
+      let pools = Pools::new(common.threads)?;
+      let cfg = EngineVectorRun {
+        data,
+        m,
+        ef_construction: efc,
+        efs: list(&ef, str::parse::<usize>)?,
+        k: common.k,
+        query_limit: queries,
+        runs: common.runs,
+        batch,
+        durability,
+        work_dir: common.work_dir,
+        out_dir: common.out_dir,
+      };
+      println!("{}", run_engine_vector(&cfg, &pools)?.display());
+    }
+    Cmd::EngineText {
+      collection,
+      queries,
+      limit,
+      query_limit,
+      analyzer,
+      batch,
+      durability,
+      common,
+    } => {
+      let pools = Pools::new(common.threads)?;
+      let cfg = EngineTextRun {
+        text: TextRun {
+          collection,
+          queries,
+          limit,
+          query_limit,
+          analyzer: AnalyzerKind::parse(&analyzer)?,
+          k: common.k,
+          runs: common.runs,
+          tantivy_index_threads: Vec::new(),
+          work_dir: common.work_dir,
+          out_dir: common.out_dir,
+        },
+        batch,
+        durability,
+      };
+      println!("{}", run_engine_text(&cfg, &pools)?.display());
     }
     Cmd::Sysinfo => {
       println!("{}", serde_json::to_string_pretty(&SystemInfo::collect())?);

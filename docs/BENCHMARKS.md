@@ -26,7 +26,7 @@ Results go to `~/bench-results/<UTC timestamp>/` (`OUT=...` to change). A failin
 |---|---|---|
 | `CPUS` | all | CPU list every step is pinned to with `taskset`, e.g. `0-7`; the thread count follows from it |
 | `DATASETS` | `sift-128-euclidean,glove-100-angular` | vector datasets; `nytimes-256-angular` is also available |
-| `ENGINES` | `muninn,muninn-flat,hnswlib,faiss,usearch` | vector engines |
+| `ENGINES` | `muninn,muninn-flat,muninn-engine,hnswlib,faiss,usearch` | vector engines |
 | `M`, `EFC` | 16, 200 | HNSW graph parameters, identical for every engine |
 | `EFS` | `10,16,24,32,48,64,96,128,192,256,384,512` | search `ef` sweep |
 | `RUNS` | 3 | repetitions of each measurement; the best is kept |
@@ -34,7 +34,7 @@ Results go to `~/bench-results/<UTC timestamp>/` (`OUT=...` to change). A failin
 | `TEXT` | 1 | run the MS MARCO text benchmark |
 | `LABEL` | | printed at the top of the report (e.g. "shared VM, noisy") |
 
-Single steps can be run by hand: `target/release/muninn-bench --help` (subcommands `hnsw`, `flat`, `verify-gt`, `text`, `sysinfo`) and `scripts/run_ann.py --help`.
+Single steps can be run by hand: `target/release/muninn-bench --help` (subcommands `hnsw`, `flat`, `verify-gt`, `text`, `engine-vector`, `engine-text`, `sysinfo`) and `scripts/run_ann.py --help`.
 
 ## Datasets
 
@@ -60,6 +60,7 @@ Every engine runs on the same machine, pinned to the same CPUs, with the same th
 | `muninn-hnsw` | `HnswIndex::build` (parallel), written to a file and fsynced, then memory-mapped with `HnswIndex::open` and searched from the mapping, as a muninn segment is served |
 | `muninn-hnsw-sq8` | the same graph with SQ8 codes for traversal and full-precision re-ranking (default re-rank depth); build time includes training the quantiser |
 | `muninn-flat` | `FlatIndex` exact scan on the first 1,000 queries; a sanity baseline (recall 1 up to ties) |
+| `muninn-engine` | the whole database, end to end: `Database::open`, a collection with an HNSW vector field (same `M`, `ef_construction`), `Collection::upsert` in batches of 1,000 (each batch durable before `upsert` returns), `flush`, `compact` to one segment, then `Collection::search` with `Query::vector(..).ef(..)` |
 | `hnswlib` | `hnswlib.Index`, built from source by pip, which compiles it with `-march=native` |
 | `faiss-hnsw` | `faiss.IndexHNSWFlat` from the `faiss-cpu` wheel (which dispatches to its AVX-512 or AVX2 build at runtime) |
 | `usearch` | `usearch.index.Index` with `f32` storage |
@@ -92,6 +93,15 @@ muninn and tantivy index the same passages and answer the same 6,980 MS MARCO de
 - **Indexing.** muninn: one `MemTextIndex` on one thread, then written as one file and fsynced. tantivy: an `IndexWriter` with 1 GiB per indexing thread, merging disabled while indexing, one commit, then all segments merged into one and obsolete files deleted. Indexing time covers everything up to one durable segment for both (muninn: add + write; tantivy: add + commit + merge). tantivy is timed with one indexing thread (the searched index, matching muninn's single-threaded writer) and with all threads (reported as an extra line).
 - **Search.** Both open their single segment memory-mapped. Each query string is analysed inside the timed region by the engine's own analyzer. tantivy runs a `BooleanQuery` of one `TermQuery` per distinct term (`BooleanQuery::new_multiterms_query`, block-WAND) collected with `TopDocs::with_limit(10).order_by_score()`; muninn runs `TextSearcher::search` (block-max MaxScore). Mapping tantivy's document addresses to passage numbers happens after timing. Same warm-up / one-thread / all-thread protocol as above.
 
+### End to end through the engine
+
+The component benchmarks above measure index structures in isolation. `muninn-engine` (vector) and `engine-text` (MS MARCO) measure what an application gets from the `muninn` crate:
+
+- **Ingest** is reported in three parts: all `upsert` calls (write-ahead log, memtable, background flushes and merges; building the `Document`s is included, as an application would have to), `flush` (everything into segments) and `compact` (all segments merged into one). The default durability is `each` (every `upsert` is on stable storage before it returns); `ENGINE_DURABILITY=batch` (fsync at most 10 ms later) or `none` change that, `ENGINE_BATCH` the batch size.
+- **Size** is the whole database directory after compaction (vectors, graph or postings, id map, manifest).
+- **Search** uses `Collection::search` on the compacted collection with the same protocol as everything else. For text, the run also builds the component-level index on the same passages and reports the overlap of the two result lists, which must be 1.0: the engine has to rank exactly like the index it wraps.
+- Hybrid search is not benchmarked yet: no standard dataset pairs embeddings with text and relevance judgements.
+
 ## Output
 
 Each run directory contains:
@@ -99,6 +109,7 @@ Each run directory contains:
 - `<dataset>__<engine>__M16_efc200.json`: one vector run (build figures, the full `ef` sweep with recall, QPS on 1 and all threads, latency mean/p50/p95/p99/max);
 - `<dataset>__gt-check.json`: the ground-truth verification;
 - `msmarco-passage-<docs>__text-<analyzer>.json`: both text engines, indexing and search figures, and their overlap;
+- `<dataset>__muninn-engine__M16_efc200.json`, `msmarco-passage-<docs>__engine-text-<analyzer>.json`: the end-to-end engine runs;
 - `system.json`, `config.json`: machine (CPU model and flags, machine type, RAM, kernel), git commit, `rustc` version, `RUSTFLAGS`, CPU pinning, and every setting of the run (also embedded in each result file under `system`);
 - `REPORT.md`: build tables, best QPS per recall target, the full sweep per engine with the Pareto front marked, and the text tables;
 - `logs/`: the console output of every step.
