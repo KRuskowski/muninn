@@ -70,6 +70,10 @@ def sha256(path):
         return h.hexdigest()
       h.update(b)
 
+# Some hosts (ann-benchmarks.com since late 2026) answer 403 to urllib's
+# default "Python-urllib/3.x" User-Agent, so send a neutral one.
+USER_AGENT = "dataset-downloader/1.0"
+
 def download(url, dest, args):
   """Fetches url to dest (unless present) and verifies it.
 
@@ -82,7 +86,8 @@ def download(url, dest, args):
     tmp = dest + ".part"
     for attempt in range(3):
       try:
-        with urllib.request.urlopen(url, timeout=120) as r, \
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=120) as r, \
             open(tmp, "wb") as f:
           shutil.copyfileobj(r, f, 1 << 22)
         break
