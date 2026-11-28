@@ -35,7 +35,7 @@ use crate::collection::Core;
 use crate::idfilter::{Selection, SourceFilter, SourceRef};
 use crate::memtable::{MemInner, read};
 use crate::query::{Fusion, Query};
-use crate::segment::Segment;
+use crate::segment::{Segment, VecIndex};
 use crate::types::{Document, Id, SearchHit};
 use crate::version::{Source, Version};
 
@@ -140,6 +140,35 @@ fn scan_memtable(
     }
     top
   };
+  top.into_hits(metric)
+}
+
+/// A segment's filter selecting at most this many docs is searched by
+/// scoring exactly those docs (a few thousand distance computations)
+/// rather than through the index.
+const EXACT_MAX_DOCS: usize = 8192;
+
+/// Exact top-`k` over the docs set in `bits` (and passing `filter`),
+/// visiting only those docs. `query` is already normalised for cosine.
+/// The distances are those of a flat scan, bit for bit.
+fn scan_selected(
+  vi: &VecIndex,
+  bits: &muninn_core::BitSet,
+  filter: &SourceFilter<'_>,
+  metric: Metric,
+  query: &[f32],
+  k: usize,
+) -> Vec<Hit> {
+  let mut top = TopK::new(k);
+  for d in bits.iter() {
+    if !filter.matches(d) {
+      continue;
+    }
+    let dist = muninn_simd::distance(metric, query, vi.vector(d));
+    if dist < top.threshold() {
+      top.push(d, dist);
+    }
+  }
   top.into_hits(metric)
 }
 
@@ -348,9 +377,16 @@ pub(crate) fn search(core: &Core, q: &Query) -> Result<Vec<SearchHit>> {
             let vi = seg.vectors.as_ref().ok_or_else(|| {
               Error::corrupt("segment without a vector index")
             })?;
-            let filt: Option<&dyn DocFilter> =
-              if sf.passes_all() { None } else { Some(sf) };
-            vi.index().search(query, &params, filt)?
+            match sf.sel {
+              Selection::Bits(bits, n) if *n <= EXACT_MAX_DOCS => {
+                scan_selected(vi, bits, sf, metric, &prepared, side_k)
+              }
+              _ => {
+                let filt: Option<&dyn DocFilter> =
+                  if sf.passes_all() { None } else { Some(sf) };
+                vi.index().search(query, &params, filt)?
+              }
+            }
           }
         };
         Ok(to_cands(i, hits).collect())

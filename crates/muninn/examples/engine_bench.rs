@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use muninn::vector::{FlatIndex, SearchParams, VectorIndex};
 use muninn::{
-  Collection, Database, Document, Durability, IndexKind, Metric, Options,
-  Query, Schema, VectorField,
+  Collection, Database, Document, Durability, FieldSpec, Filter, IndexKind,
+  Metric, Options, Query, Schema, VectorField,
 };
 use serde_json::json;
 
@@ -147,6 +147,7 @@ fn schema(dim: usize) -> Schema {
     quantization: muninn::Quantization::None,
   })
   .with_text_fields(["body"])
+  .with_filterable(FieldSpec::integer("group"))
 }
 
 fn fresh(dir: &Path, name: &str) -> PathBuf {
@@ -363,6 +364,20 @@ fn main() {
           "| vector k=10 ef={ef} | {th} | {p50:.3} | {p99:.3} | {qps:.0} | {recall:.4} |"
         );
       }
+    }
+    for th in [1, threads] {
+      let (p50, p99, qps) = run_queries(nq, th, |i| {
+        c.search(
+          &Query::vector(data.queries[i].clone())
+            .k(10)
+            .filter(Filter::eq("group", (i % 100) as i64)),
+        )
+        .unwrap();
+      });
+      println!(
+        "| vector k=10, payload filter (1% of docs) | {th} | {p50:.3} | \
+         {p99:.3} | {qps:.0} | - |"
+      );
     }
     for th in [1, threads] {
       let (p50, p99, qps) = run_queries(nq, th, |i| {
