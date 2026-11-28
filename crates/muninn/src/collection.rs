@@ -37,7 +37,9 @@
 //! the segments they replace are deleted as soon as the merge is done.
 //! Disk use is therefore bounded by the live segments, the log since the
 //! last flush (at most the memtables in memory), and the output of a
-//! merge in progress.
+//! merge in progress. (On Windows a file still mapped by a running search
+//! cannot be deleted; gc skips it, and the next flush, merge or open
+//! removes it.)
 //!
 //! While writes outpace the worker (more frozen memtables wait, or the
 //! collection already ends with such segments), a flush in a collection
@@ -96,6 +98,10 @@ pub(crate) const WAL_DIR: &str = "wal";
 /// Marker file left by a recovery that found the log damaged before its
 /// end; the collection refuses to open while it exists.
 pub(crate) const WAL_DAMAGED: &str = "WAL-DAMAGED";
+
+/// Shortest wait between checks for a pause in writes (see
+/// [`Options::merge_idle_delay`]).
+const MIN_IDLE_CHECK: Duration = Duration::from_millis(1);
 
 /// How long the worker waits before retrying after a failed job.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -413,46 +419,83 @@ fn has_trailing_flats(segs: &[SegSize]) -> bool {
   segs.last().is_some_and(|s| !s.graph)
 }
 
-/// The merge that gives segments flushed without a graph one: the run of
-/// such segments at the end of the collection, merged into the graph
-/// segment before them when that is cheap (its graph is extended, see
-/// `segment::write_merged`), otherwise into a segment of their own.
+/// The merge that gives segments flushed without a graph one. Such
+/// segments form runs; normally one run at the end of the collection,
+/// but a merge by another rule can leave part of a run between graph
+/// segments. A run is merged into the graph segment before it when that
+/// is cheap (its graph is extended, see `segment::write_merged`),
+/// otherwise its oldest segments are merged into a segment of their own,
+/// never above `max_merge_docs` documents.
 ///
-/// Folding waits until the run is worth it: `merge_factor` segments, or
-/// at least a memtable's worth and a `merge_factor`th of the graph
-/// segment, so that bulk loads insert every vector into a graph once
-/// instead of building a graph per flush and rebuilding it per merge.
-/// With `quiet` (no writes for a while) the run is merged whatever its
-/// size, so searches do not keep scanning it exactly.
+/// The run at the end waits until it is worth it: `merge_factor`
+/// segments, or at least a memtable's worth and a `merge_factor`th of
+/// the graph segment, so that bulk loads insert every vector into a graph
+/// once instead of building a graph per flush and rebuilding it per
+/// merge. With `quiet` (no writes for a while) it is merged whatever its
+/// size, so searches do not keep scanning it exactly. A run left between
+/// graph segments no longer grows, so it is merged at once.
 fn pick_fold(
   segs: &[SegSize],
   opts: &Options,
   quiet: bool,
 ) -> Option<std::ops::Range<usize>> {
   let n = segs.len();
-  let start = segs.iter().rposition(|s| s.graph).map_or(0, |i| i + 1);
-  if start == n {
-    return None;
+  let mut i = 0;
+  while i < n {
+    if segs[i].graph {
+      i += 1;
+      continue;
+    }
+    let end = segs[i..].iter().position(|s| s.graph).map_or(n, |e| i + e);
+    if let Some(r) = fold_run(segs, i..end, end == n, opts, quiet) {
+      return Some(r);
+    }
+    i = end;
   }
-  let run_docs: u64 = segs[start..].iter().map(|s| s.live).sum();
-  let run_len = n - start;
+  None
+}
+
+/// [`pick_fold`] for the graphless run `run`; `tail` if it ends the
+/// collection.
+fn fold_run(
+  segs: &[SegSize],
+  run: std::ops::Range<usize>,
+  tail: bool,
+  opts: &Options,
+  quiet: bool,
+) -> Option<std::ops::Range<usize>> {
+  let (start, end) = (run.start, run.end);
+  let run_docs: u64 = segs[run.clone()].iter().map(|s| s.live).sum();
+  let run_len = end - start;
   let base = start.checked_sub(1).map(|i| segs[i]);
   let f = opts.merge_factor as u64;
   let unit = opts.memtable_max_docs as u64;
-  let urgent =
-    run_len as u64 >= f || run_docs >= unit.max(base.map_or(0, |b| b.live / f));
+  let cap = opts.max_merge_docs as u64;
+  let urgent = !tail
+    || run_len as u64 >= f
+    || run_docs >= unit.max(base.map_or(0, |b| b.live / f));
   if !urgent && !quiet {
     return None;
   }
+  // A stranded run is rewritten into its graph segment once; the tail
+  // keeps growing, so it is folded only while that stays cheap.
   if let Some(b) = base
     && b.live == b.total
-    && b.live + run_docs <= opts.max_merge_docs as u64
-    && b.live <= FOLD_MAX_REWRITE * run_docs
+    && b.live + run_docs <= cap
+    && (!tail || b.live <= FOLD_MAX_REWRITE * run_docs)
   {
-    return Some(start - 1..n);
+    return Some(start - 1..end);
   }
-  if run_docs >= opts.hnsw_min_docs as u64 || run_len >= 2 {
-    return Some(start..n);
+  // The oldest segments of the run that fit under the cap (at least one:
+  // a single segment's graph is no larger than the segment).
+  let mut stop = start;
+  let mut docs = 0;
+  while stop < end && (stop == start || docs + segs[stop].live <= cap) {
+    docs += segs[stop].live;
+    stop += 1;
+  }
+  if docs >= opts.hnsw_min_docs as u64 || stop - start >= 2 {
+    return Some(start..stop);
   }
   None
 }
@@ -1009,14 +1052,26 @@ impl Core {
             (None, Some(c)) => break c,
             (None, None) => {}
           }
-          // Segments waiting for a graph: merge them once writes pause.
+          // Segments waiting for a graph: merge them once writes pause
+          // (at once with a zero delay; checking again at most every
+          // millisecond otherwise, so the worker never spins).
           if let Some(lsn) = st.fold_waiting {
-            let (g, timeout) =
-              match self.worker_cv.wait_timeout(st, self.opts.merge_idle_delay)
-              {
-                Ok(r) => r,
-                Err(_) => return,
+            let delay = self.opts.merge_idle_delay;
+            if delay.is_zero() {
+              st.fold_waiting = None;
+              break Job::Compact {
+                full: false,
+                req: 0,
+                quiet: true,
               };
+            }
+            let (g, timeout) = match self
+              .worker_cv
+              .wait_timeout(st, delay.max(MIN_IDLE_CHECK))
+            {
+              Ok(r) => r,
+              Err(_) => return,
+            };
             st = g;
             if timeout.timed_out() && st.fold_waiting.is_some() {
               if st.applied_lsn == lsn && st.frozen.is_empty() {
@@ -1754,6 +1809,48 @@ mod tests {
     assert_eq!(fold(&[flat(10)], true), None);
     assert_eq!(fold(&[flat(60)], true), Some(0..1));
     assert!(!has_trailing_flats(&g(&[(1, 1)])));
+  }
+
+  /// Background merges never produce segments above `max_merge_docs`,
+  /// also when a long graphless tail cannot be folded into a graph.
+  #[test]
+  fn fold_respects_max_merge_docs() {
+    let o = Options {
+      memtable_max_docs: 1000,
+      merge_factor: 4,
+      hnsw_min_docs: 10,
+      max_merge_docs: 2500,
+      ..Options::default()
+    };
+    let s = vec![flat(1000); 4];
+    let r = pick_merge(&s, &o, true, false);
+    let docs: u64 = r.clone().map_or(0, |r| s[r].iter().map(|x| x.live).sum());
+    assert!(docs <= o.max_merge_docs as u64, "{r:?} merges {docs} docs");
+    // The oldest segments that fit go first.
+    assert_eq!(r, Some(0..2));
+  }
+
+  /// A graphless run left between graph segments (for example by the
+  /// segment-count rule merging the end of a run) is still folded.
+  #[test]
+  fn stranded_graphless_segments_are_folded() {
+    let o = Options {
+      memtable_max_docs: 100,
+      merge_factor: 4,
+      hnsw_min_docs: 50,
+      ..Options::default()
+    };
+    // G, F, G': F is folded into G although G is far larger than F.
+    let mut s = g(&[(10_000, 10_000)]);
+    s.push(flat(30));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, false), Some(0..2));
+    // G with deletes cannot be extended: a large enough F gets a graph
+    // of its own.
+    let mut s = g(&[(9_000, 10_000)]);
+    s.push(flat(60));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, false), Some(1..2));
   }
 
   #[test]

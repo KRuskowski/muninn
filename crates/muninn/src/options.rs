@@ -28,8 +28,10 @@ pub struct Options {
   /// segments skip the HNSW graph and background merging inserts their
   /// vectors into a graph segment in bulk, so every vector goes into a
   /// graph about once. Such segments are searched exactly until then.
-  /// When writes pause for this long, they are merged whatever their
-  /// size. Default 1 s.
+  /// When no write arrives for this long, they are merged whatever their
+  /// size: in practice one to two delays after the last write. Zero
+  /// merges them as soon as the worker is idle, even while writes
+  /// continue; delays below 1 ms count as 1 ms. Default 1 s.
   pub merge_idle_delay: Duration,
   /// Merge segments in the background. Default true.
   pub auto_compact: bool,
