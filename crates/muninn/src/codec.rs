@@ -52,25 +52,20 @@ pub const MAX_PAYLOAD_DEPTH: usize = 100;
 /// so no distance between accepted vectors overflows `f32`.
 const MAX_NORM_SQ: f64 = f32::MAX as f64 / 4.0;
 
-/// Nesting depth of a JSON value (scalars are 0), without recursion.
-fn json_depth(v: &serde_json::Value) -> usize {
+/// Whether `v` nests deeper than `limit` levels (scalars are depth 0).
+/// Recursion stops at `limit + 1` levels, and nothing is allocated, so
+/// this costs one pass over the payload's containers.
+fn deeper_than(v: &serde_json::Value, limit: usize) -> bool {
   use serde_json::Value;
-  let mut max = 0;
-  let mut stack: Vec<(&Value, usize)> = vec![(v, 0)];
-  while let Some((v, d)) = stack.pop() {
-    match v {
-      Value::Array(a) => {
-        max = max.max(d + 1);
-        stack.extend(a.iter().map(|x| (x, d + 1)));
-      }
-      Value::Object(o) => {
-        max = max.max(d + 1);
-        stack.extend(o.values().map(|x| (x, d + 1)));
-      }
-      _ => {}
+  match v {
+    Value::Array(a) => {
+      limit == 0 || a.iter().any(|x| deeper_than(x, limit - 1))
     }
+    Value::Object(o) => {
+      limit == 0 || o.values().any(|x| deeper_than(x, limit - 1))
+    }
+    _ => false,
   }
-  max
 }
 
 /// Checks a vector (document or query) is usable: finite components and
@@ -185,7 +180,7 @@ pub(crate) fn encode_upsert(
       out.extend_from_slice(text.as_bytes());
     }
     payload.clear();
-    if json_depth(&d.payload) > MAX_PAYLOAD_DEPTH {
+    if deeper_than(&d.payload, MAX_PAYLOAD_DEPTH) {
       return Err(Error::invalid(format!(
         "document {:?} has a payload nested deeper than \
          {MAX_PAYLOAD_DEPTH} levels",
@@ -500,12 +495,18 @@ mod tests {
   #[test]
   fn depth_and_norm_limits() {
     let mut v = serde_json::json!(1);
-    for _ in 0..MAX_PAYLOAD_DEPTH {
-      v = serde_json::json!({"a": [v]}).get("a").cloned().unwrap();
+    for i in 0..MAX_PAYLOAD_DEPTH {
+      v = if i % 2 == 0 {
+        serde_json::json!([v])
+      } else {
+        serde_json::json!({"a": v})
+      };
     }
-    assert_eq!(json_depth(&v), MAX_PAYLOAD_DEPTH);
-    assert_eq!(json_depth(&serde_json::json!({"a": {"b": [1]}})), 3);
-    assert_eq!(json_depth(&serde_json::json!(3)), 0);
+    assert!(!deeper_than(&v, MAX_PAYLOAD_DEPTH));
+    assert!(deeper_than(&serde_json::json!([v]), MAX_PAYLOAD_DEPTH));
+    let small = serde_json::json!({"a": {"b": [1]}});
+    assert!(!deeper_than(&small, 3) && deeper_than(&small, 2));
+    assert!(!deeper_than(&serde_json::json!(3), 0));
     check_vector(&[1e18; 4], "v").unwrap();
     assert!(check_vector(&[1e19; 4], "v").is_err());
     assert!(check_vector(&[f32::INFINITY], "v").is_err());
