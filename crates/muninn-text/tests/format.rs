@@ -447,3 +447,97 @@ fn queries_with_too_many_distinct_terms_are_rejected() {
     assert_eq!(idx.search(&repeated, 5, None).unwrap().len(), 1);
   }
 }
+
+/// Format-1 files (plain bit layout in every block, written by muninn
+/// before the lanes layout) still open, rank exactly like a current index
+/// of the same documents, and merge into a current-format file
+/// byte-identical to building it from scratch.
+#[test]
+fn reads_format_1_files() {
+  let bytes = include_bytes!("data/v1-zipf-2026-1500-120.text");
+  assert_eq!(&bytes[16..20], &1u32.to_le_bytes(), "fixture is version 1");
+  let mut buf = AlignedBuf::new();
+  buf.extend_from_slice(bytes);
+  let v1 = TextIndex::open(Region::new(buf)).unwrap();
+  v1.verify_checksum().unwrap();
+  let corpus = zipf_corpus(2026, 1500, 120);
+  let mem = mem_from(&corpus.docs, &Analyzer::default());
+  let v2 = mem.freeze().unwrap();
+  // The fixture has terms with many full blocks.
+  let top = v1.stats_for(&common::word(0)).unwrap();
+  assert!(top.terms[0].doc_freq >= 512, "{top:?}");
+  let mut rng = Rng::new(77);
+  for qi in 0..200 {
+    let q = random_query(&mut rng, 120);
+    let k = [1, 10, 100][qi % 3];
+    assert_eq!(v1.stats_for(&q).unwrap(), v2.stats_for(&q).unwrap());
+    let want = v2.search(&q, k, None).unwrap();
+    assert_eq!(v1.search(&q, k, None).unwrap(), want, "q={q:?}");
+    let ex = v1.search_exhaustive(&q, k, None, None).unwrap();
+    assert_eq!(ex, want, "q={q:?}");
+  }
+  let map: Vec<DocId> = (0..v1.num_docs() as DocId).collect();
+  let input = [MergeInput {
+    index: &v1,
+    doc_map: &map,
+  }];
+  let merged =
+    TextIndex::merge(&input, v1.num_docs(), AlignedBuf::new()).unwrap();
+  assert_eq!(&merged.as_slice()[16..20], &FORMAT_VERSION.to_le_bytes());
+  assert_eq!(merged.as_slice(), bytes_of(&mem).as_slice());
+}
+
+/// Writes `mem`, sets `last_doc` of skip record `rec` to `u32::MAX`,
+/// and opens the result.
+fn with_corrupt_skip_last_doc(mem: &MemTextIndex, rec: usize) -> TextIndex {
+  let buf = mem.write_to(AlignedBuf::new()).unwrap();
+  let bytes = buf.as_slice().to_vec();
+  let region = Region::new(buf);
+  let base = region.bytes().as_ptr() as usize;
+  let c = Container::open(region.clone()).unwrap();
+  let skips = c.section(tag("skips")).unwrap();
+  assert!(skips.bytes().len() >= (rec + 1) * 32);
+  let off = skips.bytes().as_ptr() as usize - base + rec * 32;
+  let mut bad = bytes;
+  bad[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+  let mut b = AlignedBuf::new();
+  b.extend_from_slice(&bad);
+  TextIndex::open(Region::new(b)).unwrap()
+}
+
+/// A block of the only essential term that fails to decode in the last
+/// window (its corrupt `last_doc` makes that window end at the last id)
+/// is reported, like the exhaustive search reports it.
+#[test]
+fn corrupt_block_in_the_last_window_is_reported() {
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..2000u32 {
+    let text = match id {
+      0 => "qa qb",
+      1..=399 => "qa",
+      400..=1900 => "qb",
+      _ => "qc",
+    };
+    mem.add(id, text).unwrap();
+  }
+  // "qa" sorts first: its skip records are 0..4; record 2 is block 2.
+  let idx = with_corrupt_skip_last_doc(&mem, 2);
+  assert!(idx.search_exhaustive("qa qb", 1, None, None).is_err());
+  let got = idx.search("qa qb", 1, None);
+  assert!(matches!(got, Err(Error::Corrupt(_))), "{got:?}");
+}
+
+/// A single-term search skips block 1 by its bound without decoding it;
+/// that block claiming to end at `u32::MAX` must be reported as corrupt
+/// when the next block is located, not overflow (a panic in debug builds,
+/// silently rescanning block 0 in release builds).
+#[test]
+fn corrupt_skipped_block_ending_at_the_last_id_is_reported() {
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..400u32 {
+    mem.add(id, if id == 300 { "qa" } else { "qa qc" }).unwrap();
+  }
+  let idx = with_corrupt_skip_last_doc(&mem, 1);
+  let got = idx.search("qa", 1, None);
+  assert!(matches!(got, Err(Error::Corrupt(_))), "{got:?}");
+}

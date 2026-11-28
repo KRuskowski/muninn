@@ -7,6 +7,7 @@ use muninn_core::{AlignedBuf, DocFilter, DocId, Error, Hit, Region, Result};
 
 use crate::TextSearcher;
 use crate::analyzer::{Analyzer, Tokens};
+use crate::bm25::NormsCache;
 use crate::frozen::{ABSENT, TextIndex, Writer};
 use crate::hash::FoldBuild;
 use crate::norm::encode_doc_len;
@@ -40,6 +41,7 @@ pub struct MemTextIndex {
   total_len: u64,
   tokens: Tokens,
   doc_terms: Vec<(u32, u32)>,
+  norms_cache: NormsCache,
 }
 
 impl MemTextIndex {
@@ -56,6 +58,7 @@ impl MemTextIndex {
       total_len: 0,
       tokens: Tokens::new(),
       doc_terms: Vec::new(),
+      norms_cache: NormsCache::default(),
     }
   }
 
@@ -214,6 +217,10 @@ impl Source for MemTextIndex {
         .get(term)
         .map_or(0, |&t| self.lists[t as usize].df()),
     )
+  }
+
+  fn norms_cache(&self) -> &NormsCache {
+    &self.norms_cache
   }
 
   fn cursor(&self, term: &str) -> Result<Option<Cursor<'_>>> {

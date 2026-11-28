@@ -1,7 +1,7 @@
 //! The immutable on-disk text index and its container format.
 //!
 //! A `muninn_core::container` of kind `"text"`, version
-//! [`FORMAT_VERSION`], with these sections (written in this order):
+//! [`FORMAT_VERSION`] (2), with these sections (written in this order):
 //!
 //! | tag        | contents |
 //! |------------|----------|
@@ -24,6 +24,11 @@
 //! total_doc_len`, `u64 num_terms`, `u64 num_skips`, then the analyzer
 //! settings. All little-endian.
 //!
+//! Version 1 differs only inside posting blocks: every block uses the
+//! plain bit layout, where version 2 packs full blocks in the lanes
+//! layout ([`crate::bitpack`]). Both are read; merging always writes the
+//! current version.
+//!
 //! Opening validates section sizes and the analyzer; posting blocks are
 //! validated as they are decoded, so corrupt files produce errors, not
 //! panics. [`TextIndex::verify_checksum`] checks the whole-file CRC.
@@ -36,6 +41,7 @@ use muninn_core::{DocFilter, DocId, Error, Hit, Region, Result};
 use crate::TextSearcher;
 use crate::analyzer::{Analyzer, AnalyzerConfig, decode_config, encode_config};
 use crate::bitpack::BLOCK;
+use crate::bm25::NormsCache;
 use crate::impacts::{IMPACTS, Impacts};
 use crate::norm::encode_doc_len;
 use crate::postings::{Cursor, END, Frozen, PostingList, SkipRec};
@@ -45,8 +51,12 @@ use crate::varint;
 
 /// Container kind of text index files.
 pub const KIND: [u8; 8] = tag("text");
-/// Current format version.
-pub const FORMAT_VERSION: u32 = 1;
+/// Current format version. Version 2 packs full posting blocks in the
+/// interleaved lanes layout; version-1 files (plain layout everywhere)
+/// are still read.
+pub const FORMAT_VERSION: u32 = 2;
+/// Oldest format version that can be opened.
+pub const MIN_FORMAT_VERSION: u32 = 1;
 /// Marks a deleted document in a [`MergeInput::doc_map`].
 pub const DELETED: DocId = DocId::MAX;
 
@@ -292,6 +302,7 @@ pub struct TextIndex {
   skips: Region,
   dict: Region,
   dictidx: Region,
+  norms_cache: NormsCache,
 }
 
 impl TextIndex {
@@ -329,7 +340,18 @@ impl TextIndex {
     region: Region,
   ) -> Result<(Container, AnalyzerConfig, usize)> {
     let file_len = region.len();
-    let c = Container::open_kind(region, KIND, FORMAT_VERSION)?;
+    let c = Container::open(region)?;
+    if c.kind() != KIND {
+      return Err(Error::corrupt("not a text index file"));
+    }
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&c.version()) {
+      return Err(Error::corrupt(format!(
+        "text index format version {} is not supported (expected {}..={})",
+        c.version(),
+        MIN_FORMAT_VERSION,
+        FORMAT_VERSION
+      )));
+    }
     let meta = c.section(META)?;
     let b = meta.bytes();
     if b.len() < META_FIXED {
@@ -409,6 +431,7 @@ impl TextIndex {
       skips,
       dict,
       dictidx,
+      norms_cache: NormsCache::default(),
     })
   }
 
@@ -519,8 +542,11 @@ impl TextIndex {
       .and_then(|o| self.postings.bytes().get(o..))
       .ok_or_else(bad)?;
     let num_docs = self.num_docs as usize;
+    let lanes = self.container.version() >= 2;
     let c = match m.single {
-      Some((last, imp)) => Cursor::single(data, m.df, last, imp, num_docs),
+      Some((last, imp)) => {
+        Cursor::single(data, m.df, last, imp, num_docs, lanes)
+      }
       None => {
         let nb = (m.df as usize).div_ceil(BLOCK);
         let s = usize::try_from(m.skip_idx).map_err(|_| bad())?;
@@ -529,6 +555,7 @@ impl TextIndex {
           .get(s..s.saturating_add(nb))
           .ok_or_else(bad)?;
         let mut c = Cursor::empty(data, recs, m.df, num_docs);
+        c.lanes = lanes;
         c.start();
         c
       }
@@ -747,6 +774,10 @@ impl Source for TextIndex {
 
   fn doc_freq(&self, term: &str) -> Result<u32> {
     TextIndex::doc_freq(self, term)
+  }
+
+  fn norms_cache(&self) -> &NormsCache {
+    &self.norms_cache
   }
 
   fn cursor(&self, term: &str) -> Result<Option<Cursor<'_>>> {

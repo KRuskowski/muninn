@@ -21,6 +21,7 @@
 mod analyzer;
 mod bitpack;
 pub mod bm25;
+mod delta;
 mod frozen;
 mod hash;
 mod impacts;
@@ -35,7 +36,9 @@ mod varint;
 pub use analyzer::{
   Analyzer, AnalyzerConfig, PorterStemmer, Stemmer, StemmerChoice, Tokens,
 };
-pub use frozen::{DELETED, FORMAT_VERSION, KIND, MergeInput, TextIndex};
+pub use frozen::{
+  DELETED, FORMAT_VERSION, KIND, MIN_FORMAT_VERSION, MergeInput, TextIndex,
+};
 pub use mem::MemTextIndex;
 pub use stats::{CorpusStats, TermDocFreq};
 
