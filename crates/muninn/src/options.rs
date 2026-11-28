@@ -41,9 +41,11 @@ pub struct Options {
   /// A segment in which at least this fraction of documents is deleted
   /// is rewritten without them. Default 0.3.
   pub compact_deleted_ratio: f64,
-  /// Background merges never produce segments above this many documents
-  /// (an explicit [`crate::Collection::compact`] ignores the limit).
-  /// Default 4 000 000.
+  /// Background merges never combine segments into one above this many
+  /// documents (an explicit [`crate::Collection::compact`] ignores the
+  /// limit). A single segment may still be rewritten on its own when it
+  /// is larger, for example a flushed memtable that gets its HNSW graph
+  /// later (when `memtable_max_docs` exceeds this). Default 4 000 000.
   pub max_merge_docs: usize,
   /// Size of one write-ahead-log file before a new one is started.
   /// Default 64 MiB.

@@ -433,7 +433,7 @@ fn has_trailing_flats(segs: &[SegSize]) -> bool {
 /// once instead of building a graph per flush and rebuilding it per
 /// merge. With `quiet` (no writes for a while) it is merged whatever its
 /// size, so searches do not keep scanning it exactly. A run left between
-/// graph segments no longer grows, so it is merged at once.
+/// graph segments no longer grows, so it is handled at once.
 fn pick_fold(
   segs: &[SegSize],
   opts: &Options,
@@ -477,25 +477,35 @@ fn fold_run(
   if !urgent && !quiet {
     return None;
   }
-  // A stranded run is rewritten into its graph segment once; the tail
-  // keeps growing, so it is folded only while that stays cheap.
+  // Extending the graph before the run rewrites that whole segment, so
+  // it is done only while the rewrite stays proportionate to the
+  // documents added (a stranded run included: rewriting millions of
+  // documents for a few dozen is not worth it).
   if let Some(b) = base
     && b.live == b.total
     && b.live + run_docs <= cap
-    && (!tail || b.live <= FOLD_MAX_REWRITE * run_docs)
+    && b.live <= FOLD_MAX_REWRITE * run_docs
   {
     return Some(start - 1..end);
   }
-  // The oldest segments of the run that fit under the cap (at least one:
-  // a single segment's graph is no larger than the segment).
-  let mut stop = start;
-  let mut docs = 0;
-  while stop < end && (stop == start || docs + segs[stop].live <= cap) {
-    docs += segs[stop].live;
-    stop += 1;
-  }
-  if docs >= opts.hnsw_min_docs as u64 || stop - start >= 2 {
-    return Some(start..stop);
+  // Otherwise a segment of their own: the oldest group of neighbouring
+  // segments that fits under the cap and is worth a rewrite (two or more
+  // segments, or one large enough for a graph; a single segment may be
+  // larger than the cap, its graph is no larger than the segment). A
+  // small segment that fits with neither neighbour is skipped, so it
+  // never holds up the segments after it.
+  let mut i = start;
+  while i < end {
+    let mut stop = i;
+    let mut docs = 0;
+    while stop < end && (stop == i || docs + segs[stop].live <= cap) {
+      docs += segs[stop].live;
+      stop += 1;
+    }
+    if docs >= opts.hnsw_min_docs as u64 || stop - i >= 2 {
+      return Some(i..stop);
+    }
+    i = stop;
   }
   None
 }
@@ -1840,17 +1850,129 @@ mod tests {
       hnsw_min_docs: 50,
       ..Options::default()
     };
-    // G, F, G': F is folded into G although G is far larger than F.
+    // G, F, G': F is folded into G when the rewrite is proportionate.
+    let mut s = g(&[(1_000, 1_000)]);
+    s.push(flat(100));
+    s.extend(g(&[(200, 200)]));
+    assert_eq!(pick_merge(&s, &o, true, false), Some(0..2));
+    // Not for a few documents into a large G: a small F stays (it is
+    // scanned exactly, which is cheap at that size) ...
     let mut s = g(&[(10_000, 10_000)]);
     s.push(flat(30));
     s.extend(g(&[(200, 200)]));
-    assert_eq!(pick_merge(&s, &o, true, false), Some(0..2));
-    // G with deletes cannot be extended: a large enough F gets a graph
-    // of its own.
-    let mut s = g(&[(9_000, 10_000)]);
+    assert_eq!(pick_merge(&s, &o, true, true), None);
+    // ... and a large enough F gets a graph of its own, as it does when
+    // G has deletes and cannot be extended.
+    s[1] = flat(60);
+    assert_eq!(pick_merge(&s, &o, true, false), Some(1..2));
+    let mut s = g(&[(900, 1_000)]);
     s.push(flat(60));
     s.extend(g(&[(200, 200)]));
     assert_eq!(pick_merge(&s, &o, true, false), Some(1..2));
+  }
+
+  /// A small graphless segment that fits under `max_merge_docs` with no
+  /// neighbour must not keep the segments after it from getting graphs
+  /// (they would stay graphless forever, and so would every later flush).
+  #[test]
+  fn small_head_that_cannot_pair_does_not_stop_folding() {
+    let o = Options {
+      memtable_max_docs: 50_000,
+      merge_factor: 4,
+      hnsw_min_docs: 10_000,
+      max_merge_docs: 50_000,
+      ..Options::default()
+    };
+    let mut s = vec![flat(1000)];
+    for _ in 0..40 {
+      s.push(flat(50_000));
+    }
+    assert_eq!(pick_merge(&s, &o, true, true), Some(1..2));
+  }
+
+  /// Applies `pick_merge` until it picks nothing, modelling each merge as
+  /// one segment of the summed live documents (with a graph if large
+  /// enough). Returns the final segments, or `None` if it did not end.
+  fn settle(
+    mut s: Vec<SegSize>,
+    o: &Options,
+    quiet: bool,
+  ) -> Option<Vec<SegSize>> {
+    for _ in 0..10_000 {
+      let Some(r) = pick_merge(&s, o, true, quiet) else {
+        return Some(s);
+      };
+      assert!(!r.is_empty() && r.end <= s.len(), "{r:?} of {}", s.len());
+      let live: u64 = s[r.clone()].iter().map(|x| x.live).sum();
+      if r.len() > 1 {
+        assert!(live <= o.max_merge_docs as u64, "{r:?} merges {live}");
+      }
+      let out = (live > 0).then_some(SegSize {
+        live,
+        total: live,
+        graph: live >= o.hnsw_min_docs as u64,
+      });
+      s.splice(r, out);
+    }
+    None
+  }
+
+  /// Property: from any mix of segments, background merging settles,
+  /// leaves no graphless segment large enough for a graph, and gets the
+  /// segment count under its bound whenever merges under the cap can.
+  #[test]
+  fn merge_policy_always_settles_with_graphs() {
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let mut rnd = |n: u64| {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      x % n
+    };
+    for case in 0..3000 {
+      let unit = [100u64, 1000][rnd(2) as usize];
+      let cap = match rnd(4) {
+        0 => unit,
+        1 => unit / 2,
+        2 => 3 * unit,
+        _ => 10 * unit,
+      };
+      let o = Options {
+        memtable_max_docs: unit as usize,
+        max_merge_docs: cap as usize,
+        hnsw_min_docs: [1, 10, 50, 500][rnd(4) as usize],
+        merge_factor: 2 + rnd(3) as usize,
+        ..Options::default()
+      };
+      let s: Vec<SegSize> = (0..rnd(60))
+        .map(|_| {
+          let total = 1 + rnd(2 * unit);
+          let live = if rnd(4) == 0 { rnd(total + 1) } else { total };
+          SegSize {
+            live,
+            total,
+            graph: rnd(3) == 0 && live >= o.hnsw_min_docs as u64,
+          }
+        })
+        .collect();
+      for quiet in [true, false] {
+        let end = settle(s.clone(), &o, quiet)
+          .unwrap_or_else(|| panic!("case {case}: no end for {s:?} {o:?}"));
+        if quiet {
+          let stuck: Vec<_> = end
+            .iter()
+            .filter(|x| !x.graph && x.live >= o.hnsw_min_docs as u64)
+            .collect();
+          assert!(stuck.is_empty(), "case {case}: {end:?} {o:?}");
+        }
+        let can_shrink = end.windows(2).any(|w| w[0].live + w[1].live <= cap);
+        assert!(
+          end.len() <= max_segments(&o) || !can_shrink,
+          "case {case}: {} segments: {end:?} {o:?}",
+          end.len()
+        );
+      }
+    }
   }
 
   #[test]
