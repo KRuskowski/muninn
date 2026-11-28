@@ -558,3 +558,29 @@ fn near_tie_one_ulp_above_threshold_is_kept() {
     }
   }
 }
+
+/// A live (memtable) posting list with 31 closed blocks and an open
+/// one, and a window over blocks 16..=31: the window bound may take a
+/// cached group of closed blocks only, never one reaching the open
+/// block (which once indexed past the group cache and panicked).
+#[test]
+fn memtable_window_bound_stays_within_closed_blocks() {
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..4000u32 {
+    let text = match id {
+      0 => "qa qb",
+      300 => "qb",
+      _ => "qa",
+    };
+    mem.add(id, text).unwrap();
+  }
+  for id in 4000..5000u32 {
+    mem.add(id, if id == 4999 { "qb" } else { "qc" }).unwrap();
+  }
+  for k in [1, 2, 10] {
+    let want = mem.search_exhaustive("qa qb", k, None, None).unwrap();
+    assert_eq!(mem.search("qa qb", k, None).unwrap(), want, "k={k}");
+    let frozen = mem.freeze().unwrap();
+    assert_eq!(frozen.search("qa qb", k, None).unwrap(), want, "k={k}");
+  }
+}

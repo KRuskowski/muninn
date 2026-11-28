@@ -9,6 +9,7 @@
 //! text_prof build <collection.tsv> <limit> <default|english> <out.idx>
 //! text_prof query <index.idx> <queries.tsv> <passes> [check] [slow]
 //! text_prof one <index.idx> <query>
+//! text_prof churn <index.idx> <queries.tsv> <passes>
 //! text_prof tbuild <collection.tsv> <limit> <default|english> <dir>
 //! text_prof cmp <index.idx> <tantivy dir> <analyzer> <queries.tsv> <passes>
 //! ```
@@ -16,7 +17,9 @@
 //! `query` reports one-thread QPS and latency percentiles (best of
 //! `passes`); `check` first compares pruned and exhaustive results for
 //! k = 10 and 100, `slow` lists the slowest queries. `one` prints a
-//! query's terms, best latency and hits. `cmp` times every query in both
+//! query's terms, best latency and hits. `churn` is `query` with supplied
+//! statistics whose average length changes on every query (as for a
+//! memtable taking writes), so no per-query table can be reused. `cmp` times every query in both
 //! engines (best of `passes`, tantivy configured as in `muninn-bench
 //! text`) and lists the queries where muninn loses most.
 
@@ -327,6 +330,30 @@ fn one(args: &[String]) -> Result<()> {
   Ok(())
 }
 
+fn churn(args: &[String]) -> Result<()> {
+  let [idx, qs, passes] = args else {
+    return Err("churn <index> <queries> <passes>".into());
+  };
+  let index = TextIndex::open(map_file(Path::new(idx))?)?;
+  let (_, queries) = read_tsv(Path::new(qs), None)?;
+  let stats: Vec<_> = queries
+    .iter()
+    .map(|q| index.stats_for(q))
+    .collect::<muninn_core::Result<_>>()?;
+  let mut best = f64::MAX;
+  for pass in 0..passes.parse::<u64>()? {
+    let t = Instant::now();
+    for (i, (q, st)) in queries.iter().zip(&stats).enumerate() {
+      let mut st = st.clone();
+      st.total_doc_len += pass * queries.len() as u64 + i as u64 + 1;
+      black_box(index.search_with_stats(q, 10, None, &st)?);
+    }
+    best = best.min(t.elapsed().as_secs_f64());
+  }
+  println!("churn qps {:.0}", queries.len() as f64 / best);
+  Ok(())
+}
+
 fn main() -> Result<()> {
   let args: Vec<String> = std::env::args().skip(1).collect();
   match args.first().map(String::as_str) {
@@ -334,6 +361,7 @@ fn main() -> Result<()> {
     Some("query") => query(&args[1..]),
     Some("tbuild") => tbuild(&args[1..]),
     Some("one") => one(&args[1..]),
+    Some("churn") => churn(&args[1..]),
     Some("cmp") => cmp(&args[1..]),
     _ => Err("usage: text_prof build|query|one|tbuild|cmp ...".into()),
   }

@@ -486,3 +486,58 @@ fn reads_format_1_files() {
   assert_eq!(&merged.as_slice()[16..20], &FORMAT_VERSION.to_le_bytes());
   assert_eq!(merged.as_slice(), bytes_of(&mem).as_slice());
 }
+
+/// Writes `mem`, sets `last_doc` of skip record `rec` to `u32::MAX`,
+/// and opens the result.
+fn with_corrupt_skip_last_doc(mem: &MemTextIndex, rec: usize) -> TextIndex {
+  let buf = mem.write_to(AlignedBuf::new()).unwrap();
+  let bytes = buf.as_slice().to_vec();
+  let region = Region::new(buf);
+  let base = region.bytes().as_ptr() as usize;
+  let c = Container::open(region.clone()).unwrap();
+  let skips = c.section(tag("skips")).unwrap();
+  assert!(skips.bytes().len() >= (rec + 1) * 32);
+  let off = skips.bytes().as_ptr() as usize - base + rec * 32;
+  let mut bad = bytes;
+  bad[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+  let mut b = AlignedBuf::new();
+  b.extend_from_slice(&bad);
+  TextIndex::open(Region::new(b)).unwrap()
+}
+
+/// A block of the only essential term that fails to decode in the last
+/// window (its corrupt `last_doc` makes that window end at the last id)
+/// is reported, like the exhaustive search reports it.
+#[test]
+fn corrupt_block_in_the_last_window_is_reported() {
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..2000u32 {
+    let text = match id {
+      0 => "qa qb",
+      1..=399 => "qa",
+      400..=1900 => "qb",
+      _ => "qc",
+    };
+    mem.add(id, text).unwrap();
+  }
+  // "qa" sorts first: its skip records are 0..4; record 2 is block 2.
+  let idx = with_corrupt_skip_last_doc(&mem, 2);
+  assert!(idx.search_exhaustive("qa qb", 1, None, None).is_err());
+  let got = idx.search("qa qb", 1, None);
+  assert!(matches!(got, Err(Error::Corrupt(_))), "{got:?}");
+}
+
+/// A single-term search skips block 1 by its bound without decoding it;
+/// that block claiming to end at `u32::MAX` must be reported as corrupt
+/// when the next block is located, not overflow (a panic in debug builds,
+/// silently rescanning block 0 in release builds).
+#[test]
+fn corrupt_skipped_block_ending_at_the_last_id_is_reported() {
+  let mut mem = MemTextIndex::new(Analyzer::default());
+  for id in 0..400u32 {
+    mem.add(id, if id == 300 { "qa" } else { "qa qc" }).unwrap();
+  }
+  let idx = with_corrupt_skip_last_doc(&mem, 1);
+  let got = idx.search("qa", 1, None);
+  assert!(matches!(got, Err(Error::Corrupt(_))), "{got:?}");
+}

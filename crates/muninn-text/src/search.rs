@@ -460,6 +460,9 @@ impl<'a, 'c> Pruner<'a, 'c> {
       }
       window_min = window_max + 1;
     }
+    // Every exit: a cursor that failed to decode in the last window is
+    // still in `cs` and must be reported.
+    self.corrupt |= self.cs.iter().any(|c| c.corrupt);
   }
 
   /// Sum of the non-essential terms' window bounds (any order).
@@ -668,7 +671,11 @@ impl<'a, 'c> Pruner<'a, 'c> {
       }
       // The block ended inside the window: continue with the next one.
       let c = &mut self.cs[li];
-      if c.exhausted() || c.advance(c.block_first()) > window_max {
+      if c.exhausted() {
+        return;
+      }
+      let first = c.block_first();
+      if c.advance(first) > window_max {
         return;
       }
     }

@@ -476,7 +476,12 @@ impl<'a> Cursor<'a> {
     };
     let mut b = b0 + 1;
     while b <= b1 {
-      if b.is_multiple_of(GROUP) && b + GROUP - 1 <= b1 {
+      // Groups cover closed blocks only: a live list's open block is
+      // not in `skips`.
+      if b.is_multiple_of(GROUP)
+        && b + GROUP - 1 <= b1
+        && b + GROUP <= self.skips.len()
+      {
         q = fmin(q, self.group_qmin(b / GROUP, norms));
         b += GROUP;
       } else {
@@ -540,13 +545,20 @@ impl<'a> Cursor<'a> {
     }
   }
 
-  /// First doc id the current block can hold.
+  /// First doc id the current block can hold. A previous block (never
+  /// decoded, so never validated) claiming to end at the last possible
+  /// id is corrupt: the cursor fails and this returns [`END`].
   #[inline]
-  pub fn block_first(&self) -> DocId {
+  pub fn block_first(&mut self) -> DocId {
     if self.block == 0 {
-      0
-    } else {
-      self.rec(self.block - 1).last_doc + 1
+      return 0;
+    }
+    match self.rec(self.block - 1).last_doc.checked_add(1) {
+      Some(d) => d,
+      None => {
+        self.fail();
+        END
+      }
     }
   }
 
