@@ -10,13 +10,18 @@
 //! compacts it into one segment, then alternates rounds of the same
 //! queries through the engine and through the segment's index file
 //! opened on its own, on one thread and on all threads, and prints the
-//! best throughput of each.
+//! best throughput of each. With `FRESH=1` it also builds a graph over
+//! the same vectors in one go and compares it with the one the engine
+//! built (through flushes and merges): recall@10 against exact search
+//! and single-thread throughput.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use muninn::store::map_file;
-use muninn::vector::{HnswIndex, SearchParams, VectorIndex};
+use muninn::vector::{
+  FlatIndex, HnswIndex, HnswParams, SearchParams, VectorIndex,
+};
 use muninn::{
   Database, Document, Durability, Metric, Options, Query, Schema, VectorField,
 };
@@ -123,7 +128,68 @@ fn main() {
     best[3],
     (best[3] / best[2] - 1.0) * 100.0
   );
+  if std::env::var_os("FRESH").is_some() {
+    compare_fresh(dim, &base, &queries[..1000], &raw, &params);
+  }
   drop(c);
   drop(db);
   let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recall@10 and single-thread throughput of the engine's graph against
+/// one built over the same vectors in a single batch.
+fn compare_fresh(
+  dim: usize,
+  base: &[f32],
+  queries: &[&[f32]],
+  engine_graph: &HnswIndex,
+  params: &SearchParams,
+) {
+  let t = Instant::now();
+  let fresh = HnswIndex::build(
+    dim,
+    Metric::L2,
+    HnswParams::default().with_m(16).with_ef_construction(200),
+    base,
+  )
+  .unwrap();
+  println!("fresh graph built in {:.1} s", t.elapsed().as_secs_f64());
+  let flat = FlatIndex::from_vectors(dim, Metric::L2, base).unwrap();
+  let exact: Vec<Vec<u32>> = queries
+    .iter()
+    .map(|q| {
+      let h = flat.search(q, &SearchParams::new(10), None).unwrap();
+      h.iter().map(|x| x.id).collect()
+    })
+    .collect();
+  let recall = |g: &HnswIndex| {
+    let found: usize = queries
+      .iter()
+      .zip(&exact)
+      .map(|(q, e)| {
+        let h = g.search(q, params, None).unwrap();
+        h.iter().filter(|x| e.contains(&x.id)).count()
+      })
+      .sum();
+    found as f64 / (queries.len() * 10) as f64
+  };
+  let a = |q: &[f32]| {
+    std::hint::black_box(engine_graph.search(q, params, None).unwrap());
+  };
+  let b = |q: &[f32]| {
+    std::hint::black_box(fresh.search(q, params, None).unwrap());
+  };
+  let mut best = [0f64; 2];
+  for _ in 0..6 {
+    best[0] = best[0].max(qps(queries, false, &a));
+    best[1] = best[1].max(qps(queries, false, &b));
+  }
+  println!(
+    "engine-built graph: recall@10 {:.4}, {:.0} q/s; fresh graph: recall@10 \
+     {:.4}, {:.0} q/s",
+    recall(engine_graph),
+    best[0],
+    recall(&fresh),
+    best[1]
+  );
 }
