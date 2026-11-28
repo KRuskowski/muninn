@@ -24,12 +24,16 @@ const COLLECTIONS_DIR: &str = "collections";
 ///
 /// Opening replays every collection's write-ahead log, so all
 /// acknowledged writes are back, per the durability mode they were made
-/// with.
+/// with. A collection that cannot be opened (damaged files) does not stop
+/// the others: it is listed by [`Database::open_failures`] and asking for
+/// it returns the error.
 pub struct Database {
   dir: PathBuf,
   opts: Options,
   lock: Arc<DirLock>,
   collections: Mutex<BTreeMap<String, Collection>>,
+  /// Collections that failed to open, with the reason.
+  failures: Mutex<BTreeMap<String, String>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -67,6 +71,7 @@ impl Database {
       sync_dir(&dir)?;
     }
     let mut collections = BTreeMap::new();
+    let mut failures = BTreeMap::new();
     let mut leftovers = Vec::new();
     for e in std::fs::read_dir(&cdir)? {
       let e = e?;
@@ -83,9 +88,18 @@ impl Database {
         }
         continue;
       }
-      let core = Core::open(&e.path(), &name, &opts)?;
-      let h = Handle::start(core, lock.clone())?;
-      collections.insert(name, Collection { h });
+      match Core::open(&e.path(), &name, &opts) {
+        Ok(core) => {
+          let h = Handle::start(core, lock.clone())?;
+          collections.insert(name, Collection { h });
+        }
+        // An I/O error may be transient (or the whole disk): report it
+        // rather than pretend the database opened.
+        Err(Error::Io(e)) => return Err(Error::Io(e)),
+        Err(e) => {
+          failures.insert(name, e.to_string());
+        }
+      }
     }
     for p in leftovers {
       std::fs::remove_dir_all(&p)?;
@@ -95,6 +109,7 @@ impl Database {
       opts,
       lock,
       collections: Mutex::new(collections),
+      failures: Mutex::new(failures),
     })
   }
 
@@ -102,6 +117,20 @@ impl Database {
     self.collections.lock().map_err(|_| {
       Error::Io(std::io::Error::other("database lock poisoned by a panic"))
     })
+  }
+
+  /// Collections that could not be opened, with the reason. Their files
+  /// are left untouched; [`Database::drop_collection`] deletes them.
+  pub fn open_failures(&self) -> Vec<(String, String)> {
+    self
+      .failures
+      .lock()
+      .map(|f| f.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+      .unwrap_or_default()
+  }
+
+  fn failure(&self, name: &str) -> Option<String> {
+    self.failures.lock().ok().and_then(|f| f.get(name).cloned())
   }
 
   /// The database directory.
@@ -140,11 +169,15 @@ impl Database {
 
   /// A handle to an existing collection.
   pub fn collection(&self, name: &str) -> Result<Collection> {
-    self
-      .map()?
-      .get(name)
-      .cloned()
-      .ok_or_else(|| Error::NotFound(format!("collection {name:?}")))
+    if let Some(c) = self.map()?.get(name) {
+      return Ok(c.clone());
+    }
+    match self.failure(name) {
+      Some(reason) => Err(Error::Corrupt(format!(
+        "collection {name:?} could not be opened: {reason}"
+      ))),
+      None => Err(Error::NotFound(format!("collection {name:?}"))),
+    }
   }
 
   /// Names of all collections, sorted.
@@ -155,6 +188,14 @@ impl Database {
   /// Deletes a collection and its files. Handles to it still held fail
   /// with `NotFound` from then on.
   pub fn drop_collection(&self, name: &str) -> Result<()> {
+    if self.failure(name).is_some() && !self.map()?.contains_key(name) {
+      let path = self.dir.join(COLLECTIONS_DIR).join(name);
+      self.remove_dir(&path)?;
+      if let Ok(mut f) = self.failures.lock() {
+        f.remove(name);
+      }
+      return Ok(());
+    }
     let c = self
       .map()?
       .remove(name)
@@ -163,10 +204,15 @@ impl Database {
     c.h.stop();
     let path = c.h.core.dir.clone();
     drop(c);
-    // Rename first so a crash never leaves half a collection under its
-    // name; the leftover is removed now or at the next open.
-    let aside = temp_path_for(&path).with_extension("dropped");
-    std::fs::rename(&path, &aside)?;
+    self.remove_dir(&path)
+  }
+
+  /// Removes a collection directory: renamed first so a crash never
+  /// leaves half a collection under its name; the leftover is removed now
+  /// or at the next open.
+  fn remove_dir(&self, path: &Path) -> Result<()> {
+    let aside = temp_path_for(path).with_extension("dropped");
+    std::fs::rename(path, &aside)?;
     sync_dir(&self.dir.join(COLLECTIONS_DIR))?;
     std::fs::remove_dir_all(&aside)?;
     Ok(())

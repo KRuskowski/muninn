@@ -123,4 +123,15 @@ pub enum Failpoint {
   /// flush or merge has captured state that concurrent writes may change
   /// before it publishes, so tests can hit those races reliably.
   SlowPublish,
+  /// Not a crash: a flush pauses 300 ms after rotating the log, before it
+  /// captures tombstones, so a test can write during the flush.
+  SlowFlush,
+  /// The worker panics at the start of a flush.
+  PanicInFlush,
+  /// A full compaction fails (an I/O-like error) after writing its
+  /// segment files, before the manifest commit.
+  FailCompaction,
+  /// A flush reports an error right after its manifest commit, as when
+  /// the directory fsync after the rename fails.
+  FailAfterCommit,
 }

@@ -15,6 +15,12 @@
 //! exactly what the newest version says. Both critical sections are
 //! short: one batch on the write side, one memtable-sized text search on
 //! the read side. Vector scans never take the lock.
+//!
+//! Trade-off: a slow text query over a large memtable delays writers for
+//! its duration, and because `std::sync::RwLock` lets a waiting writer go
+//! first on most platforms, new text searches then wait behind that
+//! writer too. Memtables are bounded (`Options::memtable_max_docs`), which
+//! bounds both waits.
 
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 

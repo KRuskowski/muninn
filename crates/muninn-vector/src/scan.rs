@@ -191,8 +191,8 @@ mod tests {
     let (n, dim) = (9000, 70);
     let d = data(n, dim);
     let q: Vec<f32> = d[5 * dim..6 * dim].to_vec();
-    let sparse = |id: DocId| id % 13 == 0;
-    let dense = |id: DocId| id % 3 != 0;
+    let sparse = |id: DocId| id.is_multiple_of(13);
+    let dense = |id: DocId| !id.is_multiple_of(3);
     for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
       let filters: [Option<&dyn DocFilter>; 3] =
         [None, Some(&sparse), Some(&dense)];

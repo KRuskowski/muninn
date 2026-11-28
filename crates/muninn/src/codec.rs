@@ -42,6 +42,50 @@ const ID_STR: u8 = 1;
 /// Largest string id, in bytes.
 pub(crate) const MAX_ID_BYTES: usize = 64 << 10;
 
+/// Deepest payload nesting accepted. serde_json writes any depth but
+/// refuses to read past 128 levels, so a deeper payload could be logged
+/// yet never read back; this keeps a safe margin.
+pub const MAX_PAYLOAD_DEPTH: usize = 100;
+
+/// Largest squared norm of a vector. With `|a|^2, |b|^2 <= M`, every
+/// squared L2 distance is at most `4 M` and every dot product at most `M`,
+/// so no distance between accepted vectors overflows `f32`.
+const MAX_NORM_SQ: f64 = f32::MAX as f64 / 4.0;
+
+/// Whether `v` nests deeper than `limit` levels (scalars are depth 0).
+/// Recursion stops at `limit + 1` levels, and nothing is allocated, so
+/// this costs one pass over the payload's containers.
+fn deeper_than(v: &serde_json::Value, limit: usize) -> bool {
+  use serde_json::Value;
+  match v {
+    Value::Array(a) => {
+      limit == 0 || a.iter().any(|x| deeper_than(x, limit - 1))
+    }
+    Value::Object(o) => {
+      limit == 0 || o.values().any(|x| deeper_than(x, limit - 1))
+    }
+    _ => false,
+  }
+}
+
+/// Checks a vector (document or query) is usable: finite components and
+/// a squared norm that keeps every distance finite.
+pub(crate) fn check_vector(v: &[f32], what: &str) -> Result<()> {
+  if let Some(x) = v.iter().find(|x| !x.is_finite()) {
+    return Err(Error::invalid(format!(
+      "{what} has a non-finite vector component {x}"
+    )));
+  }
+  let norm_sq: f64 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+  if norm_sq > MAX_NORM_SQ {
+    return Err(Error::invalid(format!(
+      "{what} has a vector of squared length {norm_sq:e}, above the \
+       {MAX_NORM_SQ:e} at which distances overflow"
+    )));
+  }
+  Ok(())
+}
+
 pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
   while v >= 0x80 {
     out.push(v as u8 | 0x80);
@@ -97,12 +141,7 @@ pub(crate) fn encode_upsert(
             got: v.len(),
           });
         }
-        if let Some(x) = v.iter().find(|x| !x.is_finite()) {
-          return Err(Error::invalid(format!(
-            "document {:?} has a non-finite vector component {x}",
-            d.id
-          )));
-        }
+        check_vector(v, &format!("document {:?}", d.id))?;
       }
       (Some(_), None) => {
         return Err(Error::invalid(format!(
@@ -141,6 +180,13 @@ pub(crate) fn encode_upsert(
       out.extend_from_slice(text.as_bytes());
     }
     payload.clear();
+    if deeper_than(&d.payload, MAX_PAYLOAD_DEPTH) {
+      return Err(Error::invalid(format!(
+        "document {:?} has a payload nested deeper than \
+         {MAX_PAYLOAD_DEPTH} levels",
+        d.id
+      )));
+    }
     if !d.payload.is_null() {
       serde_json::to_writer(&mut payload, &d.payload)
         .map_err(|e| Error::invalid(format!("payload JSON: {e}")))?;
@@ -444,6 +490,26 @@ mod tests {
     assert!(
       encode_upsert(&t, &[Document::new(1u64).vector(vec![1.0])]).is_err()
     );
+  }
+
+  #[test]
+  fn depth_and_norm_limits() {
+    let mut v = serde_json::json!(1);
+    for i in 0..MAX_PAYLOAD_DEPTH {
+      v = if i % 2 == 0 {
+        serde_json::json!([v])
+      } else {
+        serde_json::json!({"a": v})
+      };
+    }
+    assert!(!deeper_than(&v, MAX_PAYLOAD_DEPTH));
+    assert!(deeper_than(&serde_json::json!([v]), MAX_PAYLOAD_DEPTH));
+    let small = serde_json::json!({"a": {"b": [1]}});
+    assert!(!deeper_than(&small, 3) && deeper_than(&small, 2));
+    assert!(!deeper_than(&serde_json::json!(3), 0));
+    check_vector(&[1e18; 4], "v").unwrap();
+    assert!(check_vector(&[1e19; 4], "v").is_err());
+    assert!(check_vector(&[f32::INFINITY], "v").is_err());
   }
 
   #[test]
