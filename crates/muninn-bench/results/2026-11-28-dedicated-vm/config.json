@@ -1,0 +1,9 @@
+{"datasets": "sift-128-euclidean,glove-100-angular,nytimes-256-angular", "engines": "muninn,muninn-flat,muninn-engine,hnswlib,faiss,usearch", "quant": "none,sq8",
+ "M": 16, "ef_construction": 200, "efs": "10,16,24,32,48,64,96,128,192,256,384,512", "k": 10,
+ "runs": 3, "queries": "", "flat_queries": 1000,
+ "threads": 16, "cpus": "", "text": 1,
+ "msmarco_limit": 1000000, "analyzers": "default english",
+ "engine_text": 1, "engine_batch": 1000,
+ "engine_durability": "each",
+ "tantivy_index_threads": "1,16",
+ "rustflags": "-C target-cpu=native", "git_commit": "ac3828c8c74ad6b01aa6b0285779c6df2fd0e952"}

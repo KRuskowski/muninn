@@ -1,0 +1,15 @@
+glove-100-angular: 1183514 x 100 (cosine), 10000 queries; faiss-hnsw 1.16.0 M=16 efC=200 on 16 threads
+  built in 35.1 s, file 644.2 MB
+  ef   10: recall 0.4758  1t     37369 q/s  16t    355481 q/s  p50    29.2 us  p99    57.3 us
+  ef   16: recall 0.5629  1t     26656 q/s  16t    253897 q/s  p50    39.5 us  p99    75.1 us
+  ef   24: recall 0.6313  1t     19548 q/s  16t    186697 q/s  p50    52.3 us  p99    97.1 us
+  ef   32: recall 0.6755  1t     15591 q/s  16t    149688 q/s  p50    65.4 us  p99   118.2 us
+  ef   48: recall 0.7315  1t     11154 q/s  16t    109750 q/s  p50    90.1 us  p99   156.8 us
+  ef   64: recall 0.7639  1t      8662 q/s  16t     86915 q/s  p50   114.6 us  p99   189.0 us
+  ef   96: recall 0.8064  1t      6115 q/s  16t     61981 q/s  p50   164.9 us  p99   258.0 us
+  ef  128: recall 0.8322  1t      4696 q/s  16t     48269 q/s  p50   215.7 us  p99   323.4 us
+  ef  192: recall 0.8628  1t      3210 q/s  16t     33631 q/s  p50   321.3 us  p99   449.1 us
+  ef  256: recall 0.8827  1t      2474 q/s  16t     25870 q/s  p50   429.6 us  p99   578.4 us
+  ef  384: recall 0.9067  1t      1676 q/s  16t     17616 q/s  p50   610.2 us  p99   774.8 us
+  ef  512: recall 0.9212  1t      1253 q/s  16t     13363 q/s  p50   818.1 us  p99  1044.9 us
+/home/karl/bench-results/final/glove-100-angular__faiss-hnsw__M16_efc200.json

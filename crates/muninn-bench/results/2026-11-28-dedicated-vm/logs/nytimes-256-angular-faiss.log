@@ -1,0 +1,15 @@
+nytimes-256-angular: 290000 x 256 (cosine), 10000 queries; faiss-hnsw 1.16.0 M=16 efC=200 on 16 threads
+  built in 12.8 s, file 338.8 MB
+  ef   10: recall 0.6081  1t     28406 q/s  16t    273571 q/s  p50    37.4 us  p99    69.1 us
+  ef   16: recall 0.6922  1t     20350 q/s  16t    192608 q/s  p50    50.8 us  p99    94.9 us
+  ef   24: recall 0.7523  1t     14817 q/s  16t    144344 q/s  p50    68.7 us  p99   126.4 us
+  ef   32: recall 0.7840  1t     11790 q/s  16t    116719 q/s  p50    85.4 us  p99   155.5 us
+  ef   48: recall 0.8216  1t      8595 q/s  16t     85583 q/s  p50   118.2 us  p99   206.2 us
+  ef   64: recall 0.8428  1t      6775 q/s  16t     68127 q/s  p50   150.5 us  p99   254.9 us
+  ef   96: recall 0.8665  1t      4789 q/s  16t     49061 q/s  p50   215.5 us  p99   343.0 us
+  ef  128: recall 0.8809  1t      3718 q/s  16t     38298 q/s  p50   282.7 us  p99   424.3 us
+  ef  192: recall 0.8980  1t      2544 q/s  16t     26817 q/s  p50   407.6 us  p99   553.7 us
+  ef  256: recall 0.9085  1t      1968 q/s  16t     20436 q/s  p50   530.8 us  p99   691.6 us
+  ef  384: recall 0.9233  1t      1336 q/s  16t     13820 q/s  p50   787.3 us  p99   976.5 us
+  ef  512: recall 0.9327  1t      1004 q/s  16t     10374 q/s  p50  1054.2 us  p99  1277.8 us
+/home/karl/bench-results/final/nytimes-256-angular__faiss-hnsw__M16_efc200.json

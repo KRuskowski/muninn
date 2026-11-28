@@ -1,0 +1,15 @@
+sift-128-euclidean: 1000000 x 128 (l2), 10000 queries; usearch 2.26.6 M=16 efC=200 on 16 threads
+  built in 38.4 s, file 660.5 MB
+  ef   10: recall 0.7104  1t     20996 q/s  16t    208197 q/s  p50    55.4 us  p99    91.6 us
+  ef   16: recall 0.8007  1t     15497 q/s  16t    154766 q/s  p50    72.7 us  p99   115.1 us
+  ef   24: recall 0.8642  1t     11639 q/s  16t    117000 q/s  p50    95.5 us  p99   141.5 us
+  ef   32: recall 0.9022  1t      9399 q/s  16t     93231 q/s  p50   116.8 us  p99   164.7 us
+  ef   48: recall 0.9427  1t      6853 q/s  16t     67922 q/s  p50   159.5 us  p99   216.4 us
+  ef   64: recall 0.9635  1t      5401 q/s  16t     53381 q/s  p50   201.2 us  p99   262.9 us
+  ef   96: recall 0.9814  1t      3844 q/s  16t     37866 q/s  p50   280.1 us  p99   360.4 us
+  ef  128: recall 0.9889  1t      3013 q/s  16t     29743 q/s  p50   357.3 us  p99   459.0 us
+  ef  192: recall 0.9944  1t      2128 q/s  16t     20775 q/s  p50   505.6 us  p99   654.0 us
+  ef  256: recall 0.9969  1t      1662 q/s  16t     16089 q/s  p50   647.3 us  p99   840.6 us
+  ef  384: recall 0.9983  1t      1163 q/s  16t     11346 q/s  p50   911.5 us  p99  1202.9 us
+  ef  512: recall 0.9987  1t       905 q/s  16t      8781 q/s  p50  1165.4 us  p99  1549.4 us
+/home/karl/bench-results/final/sift-128-euclidean__usearch__M16_efc200.json

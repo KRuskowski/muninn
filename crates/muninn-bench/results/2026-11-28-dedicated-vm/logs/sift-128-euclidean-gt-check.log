@@ -1,0 +1,2 @@
+sift-128-euclidean: 1000 queries, id sets equal 0.9920, equal up to ties 1.0000, recall 0.9992
+/home/karl/bench-results/final/sift-128-euclidean__gt-check.json

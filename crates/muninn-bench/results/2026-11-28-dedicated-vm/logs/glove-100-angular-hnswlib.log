@@ -1,0 +1,15 @@
+glove-100-angular: 1183514 x 100 (cosine), 10000 queries; hnswlib 0.8.0 M=16 efC=200 on 16 threads
+  built in 38.7 s, file 649.2 MB
+  ef   10: recall 0.4709  1t     35179 q/s  16t    306318 q/s  p50    28.2 us  p99    53.2 us
+  ef   16: recall 0.5587  1t     25089 q/s  16t    222651 q/s  p50    39.1 us  p99    72.4 us
+  ef   24: recall 0.6273  1t     18487 q/s  16t    167386 q/s  p50    52.8 us  p99    94.7 us
+  ef   32: recall 0.6718  1t     14887 q/s  16t    133912 q/s  p50    66.0 us  p99   117.0 us
+  ef   48: recall 0.7281  1t     10659 q/s  16t     97554 q/s  p50    92.6 us  p99   158.7 us
+  ef   64: recall 0.7620  1t      8387 q/s  16t     77676 q/s  p50   117.7 us  p99   195.0 us
+  ef   96: recall 0.8051  1t      5925 q/s  16t     55423 q/s  p50   168.2 us  p99   260.9 us
+  ef  128: recall 0.8315  1t      4645 q/s  16t     43332 q/s  p50   217.0 us  p99   321.5 us
+  ef  192: recall 0.8626  1t      3208 q/s  16t     30412 q/s  p50   316.8 us  p99   438.1 us
+  ef  256: recall 0.8837  1t      2473 q/s  16t     23444 q/s  p50   411.7 us  p99   552.0 us
+  ef  384: recall 0.9095  1t      1718 q/s  16t     16260 q/s  p50   594.1 us  p99   762.6 us
+  ef  512: recall 0.9256  1t      1314 q/s  16t     12468 q/s  p50   776.2 us  p99   981.7 us
+/home/karl/bench-results/final/glove-100-angular__hnswlib__M16_efc200.json

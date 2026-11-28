@@ -1,0 +1,16 @@
+glove-100-angular: engine ingest of 1183514 vectors in batches of 1000 (durability each), HNSW M=16 efC=200
+  upserted 1183514 docs in 41.9 s (28227 docs/s)
+  flush 11.2 s (2 segments), compact 5.3 s (1 segments); 711.2 MB on disk after compact, 711.2 MB after reopening (0.00 s), 711.2 MB live
+  ef   10: recall 0.4867  1t     35062 q/s  16t    365537 q/s  p50    27.1 us  p99    50.7 us
+  ef   16: recall 0.5777  1t     25374 q/s  16t    267048 q/s  p50    37.4 us  p99    70.1 us
+  ef   24: recall 0.6459  1t     19191 q/s  16t    201843 q/s  p50    49.8 us  p99    89.3 us
+  ef   32: recall 0.6906  1t     15541 q/s  16t    164001 q/s  p50    61.6 us  p99   108.0 us
+  ef   48: recall 0.7449  1t     11409 q/s  16t    120075 q/s  p50    85.2 us  p99   142.8 us
+  ef   64: recall 0.7786  1t      9100 q/s  16t     96083 q/s  p50   107.8 us  p99   174.1 us
+  ef   96: recall 0.8213  1t      6462 q/s  16t     68541 q/s  p50   153.6 us  p99   235.1 us
+  ef  128: recall 0.8468  1t      5058 q/s  16t     53845 q/s  p50   197.8 us  p99   291.9 us
+  ef  192: recall 0.8771  1t      3571 q/s  16t     37885 q/s  p50   282.2 us  p99   397.6 us
+  ef  256: recall 0.8967  1t      2783 q/s  16t     29243 q/s  p50   363.5 us  p99   497.8 us
+  ef  384: recall 0.9197  1t      1867 q/s  16t     20080 q/s  p50   543.8 us  p99   722.9 us
+  ef  512: recall 0.9339  1t      1416 q/s  16t     15242 q/s  p50   717.1 us  p99   953.5 us
+/home/karl/bench-results/final/glove-100-angular__muninn-engine__M16_efc200.json

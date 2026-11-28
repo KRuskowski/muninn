@@ -1,0 +1,31 @@
+sift-128-euclidean: 1000000 x 128 (L2), 10000 queries; HNSW M=16 efC=200 on 16 threads
+  built in 21.9 s (graph 141.5 MB, max level 5, avg degree 22)
+  muninn-hnsw: quantiser 0.00 s, file 665.5 MB written in 2.97 s
+  ef   10: recall 0.7236  1t     47864 q/s  16t    497212 q/s  p50    20.3 us  p99    33.9 us
+  ef   16: recall 0.8147  1t     35837 q/s  16t    367438 q/s  p50    27.5 us  p99    44.4 us
+  ef   24: recall 0.8787  1t     27097 q/s  16t    277680 q/s  p50    36.8 us  p99    54.6 us
+  ef   32: recall 0.9146  1t     21782 q/s  16t    223061 q/s  p50    46.2 us  p99    65.5 us
+  ef   48: recall 0.9518  1t     15806 q/s  16t    164146 q/s  p50    64.3 us  p99    86.2 us
+  ef   64: recall 0.9694  1t     12510 q/s  16t    129885 q/s  p50    81.7 us  p99   107.2 us
+  ef   96: recall 0.9855  1t      8894 q/s  16t     92250 q/s  p50   115.1 us  p99   150.5 us
+  ef  128: recall 0.9916  1t      6920 q/s  16t     71800 q/s  p50   148.2 us  p99   192.2 us
+  ef  192: recall 0.9962  1t      4859 q/s  16t     50482 q/s  p50   211.1 us  p99   275.7 us
+  ef  256: recall 0.9979  1t      3735 q/s  16t     39286 q/s  p50   275.8 us  p99   357.5 us
+  ef  384: recall 0.9990  1t      2601 q/s  16t     27630 q/s  p50   395.4 us  p99   518.4 us
+  ef  512: recall 0.9992  1t      2019 q/s  16t     21530 q/s  p50   508.2 us  p99   672.8 us
+  muninn-hnsw-sq8: quantiser 0.64 s, file 797.7 MB written in 3.62 s
+  muninn-hnsw-sq8: 712 vectors scored at full precision
+  ef   10: recall 0.9368  1t     25823 q/s  16t    282562 q/s  p50    39.0 us  p99    52.1 us
+  ef   16: recall 0.9368  1t     25800 q/s  16t    282603 q/s  p50    39.0 us  p99    51.7 us
+  ef   24: recall 0.9368  1t     25725 q/s  16t    282597 q/s  p50    39.2 us  p99    51.9 us
+  ef   32: recall 0.9368  1t     25787 q/s  16t    282503 q/s  p50    39.0 us  p99    51.7 us
+  ef   48: recall 0.9516  1t     22465 q/s  16t    246086 q/s  p50    45.0 us  p99    58.8 us
+  ef   64: recall 0.9694  1t     17964 q/s  16t    196083 q/s  p50    56.7 us  p99    72.0 us
+  ef   96: recall 0.9856  1t     12766 q/s  16t    139714 q/s  p50    80.1 us  p99   100.0 us
+  ef  128: recall 0.9916  1t     10036 q/s  16t    110341 q/s  p50   101.9 us  p99   127.2 us
+  ef  192: recall 0.9962  1t      7058 q/s  16t     77792 q/s  p50   145.4 us  p99   180.9 us
+  ef  256: recall 0.9979  1t      5500 q/s  16t     60690 q/s  p50   186.7 us  p99   233.2 us
+  ef  384: recall 0.9990  1t      3852 q/s  16t     42137 q/s  p50   265.4 us  p99   342.3 us
+  ef  512: recall 0.9992  1t      3000 q/s  16t     32586 q/s  p50   341.2 us  p99   443.2 us
+/home/karl/bench-results/final/sift-128-euclidean__muninn-hnsw__M16_efc200.json
+/home/karl/bench-results/final/sift-128-euclidean__muninn-hnsw-sq8__M16_efc200.json

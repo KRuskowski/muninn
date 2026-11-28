@@ -1,0 +1,31 @@
+glove-100-angular: 1183514 x 100 (Cosine), 10000 queries; HNSW M=16 efC=200 on 16 threads
+  built in 42.2 s (graph 167.5 MB, max level 5, avg degree 27)
+  muninn-hnsw: quantiser 0.00 s, file 655.1 MB written in 2.93 s
+  ef   10: recall 0.4891  1t     38279 q/s  16t    396632 q/s  p50    24.7 us  p99    48.3 us
+  ef   16: recall 0.5765  1t     27775 q/s  16t    288123 q/s  p50    34.3 us  p99    63.6 us
+  ef   24: recall 0.6456  1t     20720 q/s  16t    213378 q/s  p50    46.0 us  p99    83.7 us
+  ef   32: recall 0.6900  1t     16667 q/s  16t    175272 q/s  p50    57.6 us  p99   102.6 us
+  ef   48: recall 0.7448  1t     12121 q/s  16t    127660 q/s  p50    79.9 us  p99   137.5 us
+  ef   64: recall 0.7797  1t      9601 q/s  16t    101093 q/s  p50   102.1 us  p99   168.3 us
+  ef   96: recall 0.8208  1t      6799 q/s  16t     71825 q/s  p50   145.9 us  p99   226.5 us
+  ef  128: recall 0.8445  1t      5323 q/s  16t     56328 q/s  p50   187.5 us  p99   276.9 us
+  ef  192: recall 0.8765  1t      3715 q/s  16t     39488 q/s  p50   271.3 us  p99   380.7 us
+  ef  256: recall 0.8966  1t      2858 q/s  16t     30395 q/s  p50   353.3 us  p99   485.9 us
+  ef  384: recall 0.9202  1t      1944 q/s  16t     20797 q/s  p50   520.2 us  p99   706.2 us
+  ef  512: recall 0.9345  1t      1487 q/s  16t     15862 q/s  p50   681.1 us  p99   929.8 us
+  muninn-hnsw-sq8: quantiser 0.59 s, file 773.6 MB written in 3.49 s
+  muninn-hnsw-sq8: 1239 vectors scored at full precision
+  ef   10: recall 0.7215  1t     18525 q/s  16t    200677 q/s  p50    52.1 us  p99    88.4 us
+  ef   16: recall 0.7215  1t     18737 q/s  16t    202839 q/s  p50    51.6 us  p99    87.0 us
+  ef   24: recall 0.7215  1t     18446 q/s  16t    201920 q/s  p50    52.4 us  p99    88.3 us
+  ef   32: recall 0.7215  1t     18577 q/s  16t    201230 q/s  p50    52.1 us  p99    87.1 us
+  ef   48: recall 0.7448  1t     16598 q/s  16t    175817 q/s  p50    58.5 us  p99    97.9 us
+  ef   64: recall 0.7806  1t     13084 q/s  16t    139719 q/s  p50    74.8 us  p99   121.2 us
+  ef   96: recall 0.8202  1t      9082 q/s  16t    101558 q/s  p50   109.3 us  p99   166.1 us
+  ef  128: recall 0.8449  1t      6929 q/s  16t     79176 q/s  p50   144.3 us  p99   212.1 us
+  ef  192: recall 0.8767  1t      4883 q/s  16t     55530 q/s  p50   205.4 us  p99   290.3 us
+  ef  256: recall 0.8963  1t      3818 q/s  16t     42701 q/s  p50   264.2 us  p99   368.0 us
+  ef  384: recall 0.9202  1t      2608 q/s  16t     29151 q/s  p50   387.4 us  p99   532.1 us
+  ef  512: recall 0.9345  1t      1996 q/s  16t     22045 q/s  p50   503.8 us  p99   700.5 us
+/home/karl/bench-results/final/glove-100-angular__muninn-hnsw__M16_efc200.json
+/home/karl/bench-results/final/glove-100-angular__muninn-hnsw-sq8__M16_efc200.json

@@ -1,0 +1,15 @@
+sift-128-euclidean: 1000000 x 128 (l2), 10000 queries; faiss-hnsw 1.16.0 M=16 efC=200 on 16 threads
+  built in 28.0 s, file 656.3 MB
+  ef   10: recall 0.7157  1t     41099 q/s  16t    357301 q/s  p50    27.1 us  p99    46.6 us
+  ef   16: recall 0.8075  1t     30231 q/s  16t    265280 q/s  p50    36.1 us  p99    59.3 us
+  ef   24: recall 0.8735  1t     22383 q/s  16t    195170 q/s  p50    48.5 us  p99    73.3 us
+  ef   32: recall 0.9108  1t     17912 q/s  16t    157515 q/s  p50    59.6 us  p99    85.0 us
+  ef   48: recall 0.9485  1t     12800 q/s  16t    113904 q/s  p50    83.7 us  p99   112.1 us
+  ef   64: recall 0.9675  1t     10172 q/s  16t     89752 q/s  p50   104.0 us  p99   132.8 us
+  ef   96: recall 0.9835  1t      7111 q/s  16t     62962 q/s  p50   152.3 us  p99   190.1 us
+  ef  128: recall 0.9904  1t      5199 q/s  16t     49040 q/s  p50   204.7 us  p99   250.6 us
+  ef  192: recall 0.9955  1t      3526 q/s  16t     34228 q/s  p50   299.9 us  p99   362.5 us
+  ef  256: recall 0.9974  1t      2750 q/s  16t     26203 q/s  p50   393.5 us  p99   476.0 us
+  ef  384: recall 0.9987  1t      1843 q/s  16t     18245 q/s  p50   569.0 us  p99   687.1 us
+  ef  512: recall 0.9990  1t      1425 q/s  16t     14168 q/s  p50   735.4 us  p99   900.8 us
+/home/karl/bench-results/final/sift-128-euclidean__faiss-hnsw__M16_efc200.json
