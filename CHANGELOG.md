@@ -78,6 +78,7 @@ All notable changes to muninn are recorded here, written for people who use muni
 - The faster index build keeps its accuracy when a collection contains a few extreme vectors (values far outside the rest): it no longer lets them blur its view of all the others, and when extreme values are too common it automatically builds the slower, exact way.
 - A damaged approximate-index file whose document numbering is inconsistent is now refused when it is opened, instead of returning wrong or repeated documents, or crashing on lookup.
 - Collections using one-byte (SQ8) vector compression keep their search accuracy when a few vectors have extreme values: previously a single such vector could make searches miss almost all true neighbours. Extreme vectors themselves are still found.
+- This also holds for compressed collections saved by earlier versions: their compression is checked when they are opened and redone if an extreme vector had spoiled it. Compression also keeps working for sparse vectors (mostly zeros), which previously fell back to slower uncompressed search.
 - The faster index build also keeps its accuracy when different kinds of vectors are added in alternating order.
 - Searches on compressed collections with a filter that matches only a few documents return exactly the closest matching documents again, and do so quickly.
 - Searches whose filter matches far fewer documents than expected (for example after many deletions among them) no longer slow down by examining the whole index.
