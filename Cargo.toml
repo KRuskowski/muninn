@@ -17,6 +17,7 @@ muninn-text = { path = "crates/muninn-text" }
 muninn-store = { path = "crates/muninn-store" }
 muninn-filter = { path = "crates/muninn-filter" }
 muninn = { path = "crates/muninn" }
+muninn-server = { path = "crates/muninn-server" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
