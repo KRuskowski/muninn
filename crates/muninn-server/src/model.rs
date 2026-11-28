@@ -25,6 +25,17 @@ use serde_json::{Map, Value, json};
 /// Largest `k` a search may ask for.
 pub const MAX_K: usize = 10_000;
 
+/// What a partly failed import kept: "nothing was stored", "the 1
+/// document before it was stored", "the N documents before it were
+/// stored".
+pub fn stored_before(n: u64) -> String {
+  match n {
+    0 => "nothing was stored".to_string(),
+    1 => "the 1 document before it was stored".to_string(),
+    n => format!("the {n} documents before it were stored"),
+  }
+}
+
 /// Turns a serde_json error about `what` into `InvalidArgument`.
 pub fn json_error(what: &str, e: serde_json::Error) -> Error {
   Error::invalid(format!("{what}: {e}"))
@@ -522,9 +533,15 @@ impl Serialize for IdOut<'_> {
 /// `f64` first (the `float_roundtrip` feature, needed by payload filters),
 /// which dominates the cost of decoding a vector. The standard library's
 /// parser rounds correctly straight to `f32` (no double rounding) and is
-/// several times faster. `raw` must be valid JSON (as a [`RawValue`] is);
-/// anything but an array of numbers is an error.
-pub fn parse_f32_array(raw: &str) -> std::result::Result<Vec<f32>, String> {
+/// several times faster.
+///
+/// Precondition, not trusted: `raw` comes from a [`RawValue`], so it is
+/// valid JSON. Splitting at commas is only correct for that reason (a
+/// comma inside a string or a nested array yields a token that is not a
+/// number, which is refused). Every token is still checked against the
+/// JSON number grammar before Rust parses it, so text that is not JSON
+/// (`+1`, `.5`, `inf`, `NaN`) is refused even if the precondition fails.
+fn parse_f32_array(raw: &str) -> std::result::Result<Vec<f32>, String> {
   let short = |s: &str| {
     let s = s.trim();
     match s.char_indices().nth(24) {
@@ -543,19 +560,48 @@ pub fn parse_f32_array(raw: &str) -> std::result::Result<Vec<f32>, String> {
   let mut out = Vec::with_capacity(inner.len() / 8 + 1);
   for tok in inner.split(',') {
     let tok = tok.trim();
-    // Valid JSON, so a token starting like a number is a JSON number,
-    // which Rust's grammar accepts; strings, arrays, objects, true,
-    // false and null all start otherwise.
-    let numeric = tok
-      .as_bytes()
-      .first()
-      .is_some_and(|&b| b == b'-' || b.is_ascii_digit());
     match tok.parse::<f32>() {
-      Ok(x) if numeric => out.push(x),
+      Ok(x) if is_json_number(tok.as_bytes()) => out.push(x),
       _ => return Err(format!("expected a number, got {}", short(tok))),
     }
   }
   Ok(out)
+}
+
+/// Whether `t` is a JSON number:
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_json_number(t: &[u8]) -> bool {
+  let mut i = usize::from(t.first() == Some(&b'-'));
+  let digits = |i: &mut usize| {
+    let s = *i;
+    while t.get(*i).is_some_and(u8::is_ascii_digit) {
+      *i += 1;
+    }
+    *i > s
+  };
+  match t.get(i) {
+    Some(b'0') => i += 1,
+    Some(b'1'..=b'9') => {
+      digits(&mut i);
+    }
+    _ => return false,
+  }
+  if t.get(i) == Some(&b'.') {
+    i += 1;
+    if !digits(&mut i) {
+      return false;
+    }
+  }
+  if matches!(t.get(i), Some(b'e' | b'E')) {
+    i += 1;
+    if matches!(t.get(i), Some(b'+' | b'-')) {
+      i += 1;
+    }
+    if !digits(&mut i) {
+      return false;
+    }
+  }
+  i == t.len()
 }
 
 fn fast_vector<E: de::Error>(
@@ -851,6 +897,12 @@ impl SearchRequest {
       q = q.fusion(parse_fusion(f)?);
     }
     if let Some(fields) = self.fields {
+      if fields.is_empty() {
+        return Err(invalid(
+          "fields must name at least one text field (leave it out to \
+           search all)",
+        ));
+      }
       q = q.fields(fields);
     }
     Ok(q)
@@ -998,6 +1050,28 @@ mod tests {
     for bad in ["{}", "1", "[1, \"2\"]", "[[1]]", "[null]", "[true]"] {
       assert!(parse_f32_array(bad).is_err(), "{bad}");
     }
+    // Not JSON, though Rust's float syntax accepts them.
+    for bad in [
+      "[+1]",
+      "[.5]",
+      "[1.]",
+      "[inf]",
+      "[NaN]",
+      "[-]",
+      "[01]",
+      "[1e]",
+      "[1e+]",
+      "[ ]x",
+      "[1,]",
+      "[,1]",
+      "[infinity]",
+      "[-.5]",
+    ] {
+      assert!(parse_f32_array(bad).is_err(), "{bad}");
+    }
+    for good in ["[0]", "[-0]", "[0.5]", "[1e5]", "[1E-5]", "[-12.5e+3]"] {
+      assert!(parse_f32_array(good).is_ok(), "{good}");
+    }
     // Every f32, printed shortest, parses back to the same bits; and
     // decimal text agrees with serde_json up to its double rounding.
     let mut rng = 0x1234_5678_9abc_def0u64;
@@ -1081,5 +1155,7 @@ mod tests {
     let e = q(r#"{"text": "a", "filter": {"eq": 1}}"#).unwrap_err();
     assert!(e.to_string().contains("filter at $"), "{e}");
     assert!(q(r#"{"text": "a", "ids": [1, "b"]}"#).is_ok());
+    let e = q(r#"{"text": "a", "fields": []}"#).unwrap_err();
+    assert!(e.to_string().contains("at least one text field"), "{e}");
   }
 }

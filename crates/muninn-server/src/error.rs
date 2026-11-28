@@ -4,8 +4,8 @@
 //! {"error": {"code": "not_found", "message": "collection \"docs\" not found"}}
 //! ```
 
-use axum::http::StatusCode;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 /// Machine-readable error kind, with its HTTP status.
@@ -13,16 +13,26 @@ use axum::response::{IntoResponse, Response};
 pub enum ErrorCode {
   /// 400: the request is malformed or does not fit the collection.
   InvalidArgument,
+  /// 401: an API key is configured and the request lacks it.
+  Unauthenticated,
+  /// 403: the Host or Origin header names a host that is not allowed.
+  Forbidden,
   /// 404: unknown collection, document or route.
   NotFound,
   /// 405: the route exists but not with this method.
   MethodNotAllowed,
+  /// 408: the request body did not arrive in time.
+  RequestTimeout,
   /// 409: the collection already exists.
   AlreadyExists,
   /// 413: the request body exceeds the configured limit.
   PayloadTooLarge,
+  /// 415: a body without the required `Content-Type`.
+  UnsupportedMediaType,
   /// 500: I/O failure, corrupt data or a server bug.
   Internal,
+  /// 503: too many requests or too much request data in flight; retry.
+  Unavailable,
 }
 
 impl ErrorCode {
@@ -30,11 +40,16 @@ impl ErrorCode {
   pub fn as_str(self) -> &'static str {
     match self {
       Self::InvalidArgument => "invalid_argument",
+      Self::Unauthenticated => "unauthenticated",
+      Self::Forbidden => "forbidden",
       Self::NotFound => "not_found",
       Self::MethodNotAllowed => "method_not_allowed",
+      Self::RequestTimeout => "request_timeout",
       Self::AlreadyExists => "already_exists",
       Self::PayloadTooLarge => "payload_too_large",
+      Self::UnsupportedMediaType => "unsupported_media_type",
       Self::Internal => "internal",
+      Self::Unavailable => "unavailable",
     }
   }
 
@@ -42,11 +57,16 @@ impl ErrorCode {
   pub fn status(self) -> StatusCode {
     match self {
       Self::InvalidArgument => StatusCode::BAD_REQUEST,
+      Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+      Self::Forbidden => StatusCode::FORBIDDEN,
       Self::NotFound => StatusCode::NOT_FOUND,
       Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+      Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
       Self::AlreadyExists => StatusCode::CONFLICT,
       Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+      Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
       Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+      Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     }
   }
 }
@@ -116,11 +136,22 @@ impl IntoResponse for ApiError {
     let body = serde_json::json!({
       "error": {"code": self.code.as_str(), "message": self.message}
     });
-    (
+    let mut resp = (
       self.code.status(),
       [(CONTENT_TYPE, "application/json")],
       body.to_string(),
     )
-      .into_response()
+      .into_response();
+    let h = resp.headers_mut();
+    match self.code {
+      ErrorCode::Unauthenticated => {
+        h.insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+      }
+      ErrorCode::Unavailable => {
+        h.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+      }
+      _ => {}
+    }
+    resp
   }
 }

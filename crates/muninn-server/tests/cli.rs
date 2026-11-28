@@ -233,9 +233,11 @@ fn import_search_stats_compact() {
     &p("docs.jsonl"),
   ]);
   assert!(e.contains("--create-schema"), "{e}");
+  // A failed import says how much of it was stored.
   write(
     &dir.path().join("bad.jsonl"),
-    "{\"id\": 1, \"vector\": [1,0,0,0]}\n\n{\"id\": 2, \"vector\": [1,0,0,0]\n",
+    "{\"id\": 1001, \"vector\": [1,0,0,0]}\n\n\
+     {\"id\": 1002, \"vector\": [1,0,0,0]\n",
   );
   let e = fails(&[
     "import",
@@ -243,9 +245,26 @@ fn import_search_stats_compact() {
     &data,
     "--collection",
     "docs",
+    "--batch",
+    "1",
     &p("bad.jsonl"),
   ]);
   assert!(e.contains("line 3:"), "{e}");
+  assert!(e.contains("; the 1 document before it was stored"), "{e}");
+  let out = ok(&["stats", "--data", &data]);
+  let v: Value = serde_json::from_str(&out).unwrap();
+  assert_eq!(v["collections"]["docs"]["stats"]["live_docs"], 301, "{v}");
+  let e = fails(&[
+    "import",
+    "--data",
+    &data,
+    "--collection",
+    "docs",
+    "--batch",
+    "0",
+    &p("docs.jsonl"),
+  ]);
+  assert!(e.contains("--batch"), "{e}");
   write(
     &dir.path().join("dim.jsonl"),
     "{\"id\": 1, \"vector\": [1,0,0,0]}\n{\"id\": 2, \"vector\": [1,0]}\n",
@@ -259,6 +278,7 @@ fn import_search_stats_compact() {
     &p("dim.jsonl"),
   ]);
   assert!(e.contains("lines 1-2: vector has 2 dimensions"), "{e}");
+  assert!(e.contains("; nothing was stored"), "{e}");
   let e = fails(&[
     "search",
     "--data",
@@ -359,4 +379,102 @@ fn serve_shuts_down_gracefully_on_sigterm() {
   let s = &v["collections"]["s"]["stats"];
   assert_eq!(s["live_docs"], 1, "{v}");
   assert_eq!(s["memtable_docs"], 0, "{v}");
+}
+
+/// With a request stuck, the first SIGTERM waits (up to the shutdown
+/// timeout); a second one stops waiting, and the database is still
+/// flushed and closed before the process exits.
+#[cfg(unix)]
+#[test]
+fn second_sigterm_stops_waiting_but_still_closes() {
+  use std::io::{BufRead, BufReader};
+  use std::net::{SocketAddr, TcpStream};
+  use std::time::{Duration, Instant};
+
+  let dir = TestDir::new("serve2");
+  let data = dir.path().join("data");
+  let data = data.to_str().unwrap();
+  let mut child = Command::new(env!("CARGO_BIN_EXE_muninn"))
+    .args([
+      "serve",
+      "--data",
+      data,
+      "--addr",
+      "127.0.0.1:0",
+      "--shutdown-timeout",
+      "60",
+    ])
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+  let addr: SocketAddr = loop {
+    let line = lines.next().expect("server exited early").unwrap();
+    if let Some((_, a)) = line.split_once("listening on http://") {
+      break a.trim().parse().unwrap();
+    }
+  };
+  let log = std::thread::spawn(move || {
+    lines.map(|l| l.unwrap()).collect::<Vec<_>>().join("\n")
+  });
+  let r = common::http(
+    addr,
+    "PUT",
+    "/v1/collections/s",
+    Some(r#"{"text_fields": ["t"]}"#),
+  );
+  assert_eq!(r.0, 201, "{}", r.1);
+  let r = common::http(
+    addr,
+    "POST",
+    "/v1/collections/s/documents",
+    Some(r#"{"documents": [{"id": 1, "text": {"t": "hello"}}]}"#),
+  );
+  assert_eq!(r.0, 200, "{}", r.1);
+  // A request whose body never completes.
+  let mut stuck = TcpStream::connect(addr).unwrap();
+  write!(
+    stuck,
+    "POST /v1/collections/s/search HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+     Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{\"te"
+  )
+  .unwrap();
+  std::thread::sleep(Duration::from_millis(200));
+
+  let pid = child.id().to_string();
+  let term = || {
+    let ok = Command::new("kill")
+      .args(["-TERM", &pid])
+      .status()
+      .unwrap()
+      .success();
+    assert!(ok);
+  };
+  term();
+  std::thread::sleep(Duration::from_millis(1000));
+  assert!(
+    child.try_wait().unwrap().is_none(),
+    "the first signal should wait for the open request"
+  );
+  term();
+  let t = Instant::now();
+  let exit = loop {
+    if let Some(s) = child.try_wait().unwrap() {
+      break s;
+    }
+    if t.elapsed() > Duration::from_secs(10) {
+      let _ = child.kill();
+      panic!("the second signal did not stop the server");
+    }
+    std::thread::sleep(Duration::from_millis(20));
+  };
+  let log = log.join().unwrap();
+  assert!(exit.success(), "{exit:?}\n{log}");
+  assert!(log.contains("second signal"), "{log}");
+  assert!(log.contains("flushed collection \"s\""), "{log}");
+  drop(stuck);
+  let out = ok(&["stats", "--data", data]);
+  let v: Value = serde_json::from_str(&out).unwrap();
+  assert_eq!(v["collections"]["s"]["stats"]["memtable_docs"], 0, "{v}");
+  assert_eq!(v["collections"]["s"]["stats"]["live_docs"], 1, "{v}");
 }

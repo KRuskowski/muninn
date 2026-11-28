@@ -353,9 +353,14 @@ fn main() {
   let addr = listener.local_addr().unwrap();
   let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
   let state = AppState::new(db.clone(), ServerConfig::default());
-  let server = server_rt.spawn(muninn_server::serve(listener, state, async {
-    let _ = stop_rx.await;
-  }));
+  let server = server_rt.spawn(muninn_server::serve(
+    listener,
+    state,
+    async {
+      let _ = stop_rx.await;
+    },
+    std::future::pending(),
+  ));
   let client_rt = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(env("CLIENT_THREADS", 2))
     .thread_name("bench-client")

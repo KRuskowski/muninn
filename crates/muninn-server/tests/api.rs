@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{TestDir, app, app_with, assert_error, call};
+use common::{TestDir, app, app_with, assert_error, call, call_with};
 use muninn::{Durability, Failpoint, Options};
 use muninn_server::ServerConfig;
 use serde_json::{Value, json};
@@ -569,6 +569,7 @@ async fn oversized_bodies_are_rejected() {
     dir.path(),
     ServerConfig {
       body_limit: 1024,
+      bulk_line_limit: 1024,
       ..ServerConfig::default()
     },
   );
@@ -989,4 +990,204 @@ async fn poisoned_collection_refuses_writes_with_internal_error() {
   let a = app(dir.path(), ServerConfig::default());
   let r = call(&a, "GET", "/v1/collections/docs", "").await;
   assert_eq!(r.1["stats"]["live_docs"], 4, "{}", r.1);
+}
+
+const JSON: (&str, &str) = ("content-type", "application/json");
+const LOCAL: (&str, &str) = ("host", "127.0.0.1:7700");
+
+/// A web page may send a "simple" cross-origin POST (text/plain, form
+/// encoding) without a preflight, and a DNS-rebinding page arrives with
+/// its own Host. All of these are refused before anything is stored.
+#[tokio::test]
+async fn cross_site_requests_are_refused() {
+  let dir = TestDir::new("csrf");
+  let a = setup(&dir).await;
+  let doc = r#"{"documents": [{"id": "pwned", "vector": [1, 0, 0]}]}"#;
+  let up = "/v1/collections/docs/documents";
+  for ct in [
+    "text/plain",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data; boundary=x",
+  ] {
+    let r =
+      call_with(&a, "POST", up, &[LOCAL, ("content-type", ct)], doc).await;
+    assert_eq!(r.0, 415, "{ct}: {}", r.1);
+    assert_eq!(r.1["error"]["code"], "unsupported_media_type");
+  }
+  let r = call_with(&a, "POST", up, &[LOCAL], doc).await;
+  assert_eq!(r.0, 415, "no content type: {}", r.1);
+  let r = call_with(
+    &a,
+    "POST",
+    "/v1/collections/docs/documents:bulk",
+    &[LOCAL, ("content-type", "text/plain")],
+    "{\"id\": \"pwned\", \"vector\": [1, 0, 0]}\n",
+  )
+  .await;
+  assert_eq!(r.0, 415, "{}", r.1);
+  let r = call_with(
+    &a,
+    "POST",
+    "/v1/collections/docs/search",
+    &[LOCAL, ("content-type", "text/plain")],
+    r#"{"text": "x"}"#,
+  )
+  .await;
+  assert_eq!(r.0, 415);
+
+  // DNS rebinding: a foreign Host, even on a GET.
+  let r = call_with(
+    &a,
+    "GET",
+    "/v1/collections",
+    &[("host", "evil.example:7700")],
+    "",
+  )
+  .await;
+  assert_eq!(r.0, 403, "{}", r.1);
+  assert_eq!(r.1["error"]["code"], "forbidden");
+  let r = call_with(&a, "GET", "/v1/collections", &[], "").await;
+  assert_eq!(r.0, 403, "missing Host: {}", r.1);
+  // A cross-origin page, with a correct content type.
+  for origin in ["http://evil.example", "null"] {
+    let r =
+      call_with(&a, "POST", up, &[LOCAL, JSON, ("origin", origin)], doc).await;
+    assert_eq!(r.0, 403, "{origin}: {}", r.1);
+  }
+  assert_error(
+    &call(&a, "GET", "/v1/collections/docs/documents/pwned", "").await,
+    404,
+    "not_found",
+  );
+  // Local pages and other local spellings are fine.
+  for host in ["localhost:7700", "[::1]:7700", "127.0.0.1"] {
+    let r = call_with(&a, "GET", "/v1/health", &[("host", host)], "").await;
+    assert_eq!(r.0, 200, "{host}");
+  }
+  let r = call_with(
+    &a,
+    "GET",
+    "/v1/health",
+    &[LOCAL, ("origin", "http://localhost:3000")],
+    "",
+  )
+  .await;
+  assert_eq!(r.0, 200);
+  // Charset parameters are accepted.
+  let r = call_with(
+    &a,
+    "POST",
+    "/v1/collections/docs/search",
+    &[LOCAL, ("content-type", "application/json; charset=utf-8")],
+    r#"{"text": "database"}"#,
+  )
+  .await;
+  assert_eq!(r.0, 200, "{}", r.1);
+
+  // Extra host names are configurable, or the check can be turned off.
+  let dir2 = TestDir::new("csrf-hosts");
+  let mut cfg = ServerConfig::default();
+  cfg.allow_host("DB.internal:7700");
+  let b = app(dir2.path(), cfg);
+  let r =
+    call_with(&b, "GET", "/v1/health", &[("host", "db.internal")], "").await;
+  assert_eq!(r.0, 200);
+  let r =
+    call_with(&b, "GET", "/v1/health", &[("host", "evil.example")], "").await;
+  assert_eq!(r.0, 403);
+  drop(b);
+  let mut cfg = ServerConfig::default();
+  cfg.allow_host("*");
+  let b = app(dir2.path(), cfg);
+  let r =
+    call_with(&b, "GET", "/v1/health", &[("host", "evil.example")], "").await;
+  assert_eq!(r.0, 200);
+}
+
+#[tokio::test]
+async fn api_key_is_required_when_set() {
+  let dir = TestDir::new("apikey");
+  let a = app(
+    dir.path(),
+    ServerConfig {
+      api_key: Some("s3cret".into()),
+      ..ServerConfig::default()
+    },
+  );
+  let r = call_with(&a, "GET", "/v1/collections", &[LOCAL], "").await;
+  assert_eq!(r.0, 401, "{}", r.1);
+  assert_eq!(r.1["error"]["code"], "unauthenticated");
+  assert_eq!(r.2["www-authenticate"], "Bearer");
+  for wrong in ["Bearer s3cre", "Bearer s3cret2", "s3cret", "Basic s3cret"] {
+    let r = call_with(
+      &a,
+      "GET",
+      "/v1/collections",
+      &[LOCAL, ("authorization", wrong)],
+      "",
+    )
+    .await;
+    assert_eq!(r.0, 401, "{wrong}");
+  }
+  let auth = ("authorization", "Bearer s3cret");
+  let r = call_with(&a, "GET", "/v1/collections", &[LOCAL, auth], "").await;
+  assert_eq!(r.0, 200, "{}", r.1);
+  let r = call_with(
+    &a,
+    "PUT",
+    "/v1/collections/k",
+    &[LOCAL, JSON, auth],
+    r#"{"text_fields": ["t"]}"#,
+  )
+  .await;
+  assert_eq!(r.0, 201, "{}", r.1);
+  // Health stays open for load balancers; the Host check still applies.
+  let r = call_with(&a, "GET", "/v1/health", &[LOCAL], "").await;
+  assert_eq!(r.0, 200);
+  let r =
+    call_with(&a, "GET", "/v1/health", &[("host", "evil.example")], "").await;
+  assert_eq!(r.0, 403);
+}
+
+/// An unknown collection is reported without reading (and buffering) the
+/// body first, so its size does not matter.
+#[tokio::test]
+async fn unknown_collection_is_reported_before_the_body_is_read() {
+  let dir = TestDir::new("early404");
+  let a = app(
+    dir.path(),
+    ServerConfig {
+      body_limit: 1024,
+      ..ServerConfig::default()
+    },
+  );
+  let big = format!(
+    r#"{{"documents": [{{"id": 1, "text": {{"t": "{}"}}}}]}}"#,
+    "x".repeat(4000)
+  );
+  for path in ["documents", "search"] {
+    let uri = format!("/v1/collections/ghost/{path}");
+    let r = call(&a, "POST", &uri, big.clone()).await;
+    assert_error(&r, 404, "not_found");
+  }
+  let r =
+    call(&a, "PUT", "/v1/collections/t", r#"{"text_fields": ["t"]}"#).await;
+  assert_eq!(r.0, 201);
+  assert_error(
+    &call(&a, "POST", "/v1/collections/t/documents", big).await,
+    413,
+    "payload_too_large",
+  );
+  let m = assert_error(
+    &call(
+      &a,
+      "POST",
+      "/v1/collections/t/search",
+      r#"{"text": "x", "fields": []}"#,
+    )
+    .await,
+    400,
+    "invalid_argument",
+  );
+  assert!(m.contains("at least one text field"), "{m}");
 }

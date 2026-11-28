@@ -43,9 +43,14 @@ fn concurrent_clients_upsert_and_search() {
     .unwrap();
   let addr: SocketAddr = listener.local_addr().unwrap();
   let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-  let server = rt.spawn(muninn_server::serve(listener, state, async {
-    let _ = stop_rx.await;
-  }));
+  let server = rt.spawn(muninn_server::serve(
+    listener,
+    state,
+    async {
+      let _ = stop_rx.await;
+    },
+    std::future::pending(),
+  ));
 
   let r = http(
     addr,

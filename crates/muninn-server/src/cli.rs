@@ -118,23 +118,102 @@ pub struct ServeArgs {
   /// Data directory and engine settings.
   #[command(flatten)]
   pub data: DataArgs,
-  /// Address to listen on. Use 127.0.0.1 unless the port is protected
-  /// by a firewall: the API has no authentication.
+  /// Address to listen on. Keep 127.0.0.1 unless the port is protected
+  /// by a firewall, and then also set an API key.
   #[arg(long, default_value = "127.0.0.1:7700")]
   pub addr: String,
-  /// Largest request body, e.g. 1048576, 512KiB, 64MiB, 1GiB.
-  #[arg(long, value_name = "SIZE", default_value = "64MiB",
+  /// Require "Authorization: Bearer KEY" on every request except
+  /// /v1/health. Prefer the environment variable: command lines are
+  /// visible to other users.
+  #[arg(long, env = "MUNINN_API_KEY", hide_env_values = true)]
+  pub api_key: Option<String>,
+  /// Also accept this host name in Host and Origin headers (repeatable;
+  /// "*" accepts any). localhost, 127.0.0.1, ::1 and the --addr host are
+  /// always accepted.
+  #[arg(long, value_name = "HOST")]
+  pub allowed_host: Vec<String>,
+  /// Largest request body, e.g. 1048576, 512KiB, 16MiB.
+  #[arg(long, value_name = "SIZE", default_value = "16MiB",
         value_parser = parse_size)]
   pub body_limit: usize,
+  /// Longest line of a bulk import body.
+  #[arg(long, value_name = "SIZE", default_value = "1MiB",
+        value_parser = parse_size)]
+  pub bulk_line_limit: usize,
+  /// Request bodies held in memory at once over all requests; requests
+  /// beyond it are refused with 503.
+  #[arg(long, value_name = "SIZE", default_value = "64MiB",
+        value_parser = parse_size)]
+  pub max_body_in_flight: usize,
   /// Documents per write batch of the bulk import endpoint.
-  #[arg(long, value_name = "N", default_value_t = 1000)]
-  pub bulk_batch: usize,
+  #[arg(long, value_name = "N", default_value_t = 1000,
+        value_parser = clap::value_parser!(u64).range(1..=crate::MAX_BULK_BATCH as u64))]
+  pub bulk_batch: u64,
+  /// Open connections; further ones are closed at once.
+  #[arg(long, value_name = "N", default_value_t = 512,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub max_connections: u64,
+  /// Requests in flight; further ones are refused with 503.
+  #[arg(long, value_name = "N", default_value_t = 256,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub max_requests: u64,
+  /// Bulk imports in flight; further ones are refused with 503.
+  #[arg(long, value_name = "N", default_value_t = 2,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub max_bulk: u64,
+  /// Seconds a client may take to send request headers; also the
+  /// longest idle time of a keep-alive connection.
+  #[arg(long, value_name = "S", default_value_t = 10,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub header_timeout: u64,
+  /// Seconds a client may take to send a request body.
+  #[arg(long, value_name = "S", default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub body_timeout: u64,
+  /// Longest pause, in seconds, within a bulk import body.
+  #[arg(long, value_name = "S", default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..))]
+  pub bulk_idle_timeout: u64,
+  /// On shutdown, seconds open requests may take to finish. A second
+  /// Ctrl-C or SIGTERM stops waiting; a third exits at once.
+  #[arg(long, value_name = "S", default_value_t = 30)]
+  pub shutdown_timeout: u64,
   /// Worker threads for network I/O (default: one per CPU).
   #[arg(long, value_name = "N")]
   pub threads: Option<usize>,
   /// Log verbosity (logs go to standard error).
   #[arg(long, value_enum, default_value_t = LogLevel::Info)]
   pub log_level: LogLevel,
+}
+
+impl ServeArgs {
+  /// The server settings these flags describe.
+  pub fn config(&self) -> ServerConfig {
+    let secs = Duration::from_secs;
+    let mut cfg = ServerConfig {
+      body_limit: self.body_limit,
+      bulk_line_limit: self.bulk_line_limit,
+      bulk_batch: self.bulk_batch as usize,
+      max_body_bytes_in_flight: self.max_body_in_flight,
+      max_connections: self.max_connections as usize,
+      max_requests: self.max_requests as usize,
+      max_bulk: self.max_bulk as usize,
+      header_timeout: secs(self.header_timeout),
+      body_timeout: secs(self.body_timeout),
+      bulk_idle_timeout: secs(self.bulk_idle_timeout),
+      shutdown_timeout: secs(self.shutdown_timeout),
+      api_key: self.api_key.clone().filter(|k| !k.is_empty()),
+      ..ServerConfig::default()
+    };
+    let host = crate::guard::host_of(&self.addr);
+    if !matches!(host.as_str(), "" | "0.0.0.0" | "::") {
+      cfg.allow_host(&host);
+    }
+    for h in &self.allowed_host {
+      cfg.allow_host(h);
+    }
+    cfg
+  }
 }
 
 /// `muninn import`.
@@ -151,8 +230,9 @@ pub struct ImportArgs {
   #[arg(long, value_name = "FILE")]
   pub create_schema: Option<PathBuf>,
   /// Documents per write batch (each batch is stored all-or-nothing).
-  #[arg(long, value_name = "N", default_value_t = 1000)]
-  pub batch: usize,
+  #[arg(long, value_name = "N", default_value_t = 1000,
+        value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
+  pub batch: u64,
   /// Do not write the imported documents to segments at the end.
   #[arg(long)]
   pub no_flush: bool,
@@ -273,17 +353,19 @@ fn init_logging(level: LogLevel) {
 /// `muninn serve`: runs until SIGINT/SIGTERM, then flushes and closes.
 pub fn serve(a: ServeArgs) -> CliResult {
   init_logging(a.log_level);
-  if a.bulk_batch == 0 || a.bulk_batch > crate::MAX_BULK_BATCH {
-    return Err(
-      format!(
-        "--bulk-batch must be between 1 and {}",
-        crate::MAX_BULK_BATCH
-      )
-      .into(),
+  let cfg = a.config();
+  if cfg.allowed_hosts.iter().any(|h| h == "*") && cfg.api_key.is_none() {
+    tracing::warn!(
+      "any Host is accepted and no API key is set: web pages can reach this \
+       server through DNS rebinding"
     );
   }
   let mut rt = tokio::runtime::Builder::new_multi_thread();
-  rt.enable_all().thread_name("muninn-http");
+  // Requests run their engine work in place, which needs a spare thread
+  // each; bulk imports and closing need a few more.
+  rt.enable_all()
+    .thread_name("muninn-http")
+    .max_blocking_threads(cfg.max_requests + cfg.max_bulk + 32);
   if let Some(n) = a.threads {
     rt.worker_threads(n.max(1));
   }
@@ -293,19 +375,28 @@ pub fn serve(a: ServeArgs) -> CliResult {
   for (name, reason) in db.open_failures() {
     tracing::error!("collection {name:?} is unavailable: {reason}");
   }
-  let cfg = ServerConfig {
-    body_limit: a.body_limit,
-    bulk_batch: a.bulk_batch,
-  };
   let state = AppState::new(db.clone(), cfg);
-  rt.block_on(async {
+  let r = rt.block_on(async {
     let listener = tokio::net::TcpListener::bind(&a.addr).await?;
     tracing::info!("listening on http://{}", listener.local_addr()?);
-    crate::serve(listener, state, crate::shutdown_signal()).await
-  })?;
-  drop(rt);
-  tracing::info!("flushing and closing the database");
-  crate::close(db, Duration::from_secs(30))?;
+    let signals = crate::Signals::listen()?;
+    crate::serve(listener, state, signals.nth(1), signals.nth(2)).await?;
+    // Flush and close; one more signal exits without waiting (the
+    // write-ahead log already holds every acknowledged write).
+    let forced = signals.count() >= 2;
+    let wait = Duration::from_secs(if forced { 2 } else { 30 });
+    tracing::info!("flushing and closing the database");
+    let mut closing = tokio::task::spawn_blocking(move || crate::close(db, wait));
+    tokio::select! {
+      r = &mut closing => r.map_err(std::io::Error::other)?.map_err(std::io::Error::other),
+      () = signals.nth(signals.count() + 1) => {
+        tracing::error!("exiting before the database finished closing");
+        std::process::exit(130);
+      }
+    }
+  });
+  rt.shutdown_timeout(Duration::from_secs(1));
+  r?;
   Ok(())
 }
 
@@ -318,6 +409,24 @@ pub struct ImportReport {
   pub elapsed: Duration,
 }
 
+/// A failed import: the error, and how many documents (whole batches
+/// before the failing one) were stored before it.
+#[derive(Debug)]
+pub struct ImportFailure {
+  /// What went wrong.
+  pub error: Error,
+  /// Documents stored before the error.
+  pub stored: u64,
+}
+
+impl std::fmt::Display for ImportFailure {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{}; {}", self.error, model::stored_before(self.stored))
+  }
+}
+
+impl std::error::Error for ImportFailure {}
+
 /// Bytes of complete lines read per chunk when a batch is not yet full.
 const IMPORT_CHUNK_BYTES: usize = 16 << 20;
 
@@ -325,13 +434,14 @@ const IMPORT_CHUNK_BYTES: usize = 16 << 20;
 /// atomic batches of `batch` documents, keeping the order of the input
 /// (a later line with the same id wins). Reading, parsing (on all cores)
 /// and writing overlap. `progress` is called after every batch with the
-/// documents stored so far.
+/// documents stored so far. On failure the batches before the failing
+/// one stay stored, and the error says how many documents that is.
 pub fn import_jsonl(
   c: &Collection,
   input: impl BufRead + Send,
   batch: usize,
   mut progress: impl FnMut(u64),
-) -> Result<ImportReport> {
+) -> std::result::Result<ImportReport, ImportFailure> {
   let batch = batch.max(1);
   let start = Instant::now();
   // (first line number, number of lines, complete lines / documents)
@@ -414,6 +524,10 @@ pub fn import_jsonl(
       Some(e) => Err(e),
       None => parse_r.and(read_r),
     }
+  })
+  .map_err(|error| ImportFailure {
+    error,
+    stored: docs,
   })?;
   Ok(ImportReport {
     docs,
@@ -476,7 +590,7 @@ pub fn import(a: ImportArgs) -> CliResult {
   let mut last = Instant::now();
   let tty = std::io::stderr().is_terminal();
   let quiet = a.quiet;
-  let report = import_jsonl(&c, input, a.batch, |n| {
+  let report = import_jsonl(&c, input, a.batch as usize, |n| {
     if quiet || last.elapsed() < Duration::from_secs(1) {
       return;
     }
@@ -570,20 +684,28 @@ pub fn search(a: SearchArgs) -> CliResult {
 pub fn stats(a: DataArgs) -> CliResult {
   let db = a.open()?;
   let mut out = serde_json::Map::new();
+  let mut unavailable = match model::unavailable_json(&db) {
+    Value::Object(m) => m,
+    _ => serde_json::Map::new(),
+  };
+  // One failing collection is listed, not fatal.
   for name in db.list_collections()? {
-    let c = db.collection(&name)?;
-    out.insert(
-      name,
-      json!({
-        "schema": model::schema_to_json(c.schema()),
-        "stats": model::stats_to_json(&c.stats()?),
-      }),
-    );
+    match db.collection(&name).and_then(|c| Ok((c.stats()?, c))) {
+      Ok((s, c)) => {
+        out.insert(
+          name,
+          json!({
+            "schema": model::schema_to_json(c.schema()),
+            "stats": model::stats_to_json(&s),
+          }),
+        );
+      }
+      Err(e) => {
+        unavailable.insert(name, Value::String(e.to_string()));
+      }
+    }
   }
-  let out = json!({
-    "collections": out,
-    "unavailable": model::unavailable_json(&db),
-  });
+  let out = json!({ "collections": out, "unavailable": unavailable });
   let mut stdout = std::io::stdout().lock();
   serde_json::to_writer_pretty(&mut stdout, &out)?;
   writeln!(stdout)?;

@@ -63,6 +63,7 @@ pub async fn call(
   let req = Request::builder()
     .method(method)
     .uri(uri)
+    .header("host", "127.0.0.1:7700")
     .header("content-type", "application/json")
     .body(body.into())
     .unwrap();
@@ -79,6 +80,32 @@ pub async fn call(
     })
   };
   (status, v)
+}
+
+/// Sends one request with exactly `headers` (no defaults).
+pub async fn call_with(
+  app: &Router,
+  method: &str,
+  uri: &str,
+  headers: &[(&str, &str)],
+  body: impl Into<Body>,
+) -> (StatusCode, Value, axum::http::HeaderMap) {
+  let mut req = Request::builder().method(method).uri(uri);
+  for (k, v) in headers {
+    req = req.header(*k, *v);
+  }
+  let resp = app
+    .clone()
+    .oneshot(req.body(body.into()).unwrap())
+    .await
+    .unwrap();
+  let status = resp.status();
+  let headers = resp.headers().clone();
+  let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    .await
+    .unwrap();
+  let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+  (status, v, headers)
 }
 
 /// Asserts an error response with `code`, returning its message.

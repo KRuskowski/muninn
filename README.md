@@ -18,7 +18,8 @@ scripts/check.sh   # format, lints, tests
 The `muninn` command runs the HTTP server or works on a data directory directly.
 
 ```sh
-# HTTP/JSON server (see docs/API.md for every endpoint)
+# HTTP/JSON server on 127.0.0.1 (see docs/API.md for every endpoint and
+# the security model; set MUNINN_API_KEY before exposing it further)
 muninn serve --data ./data --addr 127.0.0.1:7700 [--durability each|batch|none]
 
 # Import newline-delimited JSON, creating the collection from a schema file
