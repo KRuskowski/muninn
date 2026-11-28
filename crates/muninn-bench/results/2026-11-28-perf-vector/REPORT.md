@@ -98,3 +98,16 @@ The review fixes (outlier-robust build codes with a quality check, order-map val
 | GloVe muninn-hnsw-sq8 | 123.2 | 10,714 (96) / 27,931 (96) | 3,150 (384) / 8,318 (384) | - | - | - |
 
 Recall at equal `ef` is unchanged within build-to-build variation (SIFT ef 128: 0.9918 both runs; GloVe ef 384: 0.9185 vs 0.9198).
+
+## Re-check after the second review (130f796)
+
+Second-review fixes: SQ8 codes (search and build) from clipped quantiles of hashed samples with a quality check, far-out vectors scored at full precision (`exact_rows`: SIFT 519, GloVe 1,315), quantised flat search exact over selective id sets, pass-rate abort with hints, no `-0.0`. Muninn only, same VM and pinning, fresh builds, 3 runs per point; competitors not re-run (rows above). Files: `*__after-review2-130f796.json`.
+
+| engine | build s | r>=0.8 | r>=0.9 | r>=0.95 | r>=0.98 | r>=0.99 |
+|---|---|---|---|---|---|---|
+| SIFT muninn-hnsw | 66.0 | 33,347 (16) / 87,482 (16) | 20,224 (32) / 53,724 (32) | 14,681 (48) / 39,819 (48) | 8,226 (96) / 22,318 (96) | 6,520 (128) / 17,692 (128) |
+| SIFT muninn-hnsw-sq8 | 66.6 | 27,827 (16) / 78,588 (24) | 27,827 (16) / 78,588 (24) | 24,084 (48) / 68,648 (48) | 13,925 (96) / 39,956 (96) | 11,070 (128) / 31,124 (128) |
+| GloVe muninn-hnsw | 125.2 | 6,557 (96) / 17,850 (96) | 1,940 (384) / 5,198 (384) | - | - | - |
+| GloVe muninn-hnsw-sq8 | 125.8 | 10,055 (96) / 26,730 (96) | 3,013 (384) / 8,111 (384) | - | - | - |
+
+Against the first re-check, SQ8 search is a few percent slower: on the same GloVe graph, A/B, 2-4% (the exact-row check), with equal recall (ef 384: 0.9191 vs 0.9188). SIFT SQ8 at r>=0.8 on one thread (27,827) is now level with faiss from the earlier session (27,888); every other cell stays ahead of both competitors.
