@@ -1,0 +1,7 @@
+{"datasets": "sift-128-euclidean,glove-100-angular,nytimes-256-angular", "engines": "muninn,muninn-flat", "quant": "none,sq8",
+ "M": 16, "ef_construction": 200, "efs": "10,16,24,32,48,64,96,128,192,256,384,512", "k": 10,
+ "runs": 2, "queries": "", "flat_queries": 1000,
+ "threads": 4, "cpus": "0,1,8,9", "text": 1,
+ "msmarco_limit": 1000000, "analyzers": "default english",
+ "tantivy_index_threads": "1,4",
+ "rustflags": "-C target-cpu=native", "git_commit": "bcdd9f7"}

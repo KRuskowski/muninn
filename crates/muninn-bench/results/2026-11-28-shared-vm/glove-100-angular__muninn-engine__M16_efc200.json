@@ -1,0 +1,287 @@
+{
+  "kind": "vector",
+  "engine": "muninn-engine",
+  "engine_version": "0.1.0 (7b12b34)",
+  "dataset": {
+    "name": "glove-100-angular",
+    "metric": "cosine",
+    "n": 1183514,
+    "dim": 100,
+    "queries": 10000,
+    "meta": {
+      "dim": 100,
+      "files": {
+        "base.fbin": {
+          "bytes": 473405608,
+          "sha256": "e2fdc4d26bf3156a47f0baecbf7d61a58671f92b851e52040a67c8593546219e"
+        },
+        "gt.ibin": {
+          "bytes": 4000008,
+          "sha256": "3f43ac9b7edd0b06b197c3e86615d94a333a8994bbd6f50e339ac98234890e43"
+        },
+        "query.fbin": {
+          "bytes": 4000008,
+          "sha256": "9fe959d97e44ccd8fefb889499a06bf9222c0493536c7f585ae103ea52987d3b"
+        }
+      },
+      "gt_k": 100,
+      "n": 1183514,
+      "origin": "ann-benchmarks",
+      "prepared": "2026-11-27T23:38:42Z",
+      "queries": 10000,
+      "source_distance": "angular",
+      "sources": [
+        {
+          "bytes": 485413888,
+          "file": "glove-100-angular.hdf5",
+          "sha256": "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4",
+          "url": "http://ann-benchmarks.com/glove-100-angular.hdf5",
+          "verified": true
+        }
+      ]
+    }
+  },
+  "k": 10,
+  "threads": 4,
+  "params": {
+    "M": 16,
+    "batch": 1000,
+    "durability": "each",
+    "ef_construction": 200,
+    "level0_neighbours": 32,
+    "memtable_max_docs": 50000
+  },
+  "build": {
+    "seconds": 354.38576215,
+    "threads": 4,
+    "index_bytes": 755878080,
+    "rss_delta_bytes": 135962624,
+    "peak_rss_bytes": 2252263424,
+    "details": {
+      "batch": 1000,
+      "bytes_by_kind": {
+        "docs": 26039056,
+        "ids": 101775672,
+        "other": 3383,
+        "vec": 1291320088,
+        "wal": 54185480
+      },
+      "compact_seconds": 133.950983425,
+      "dir_bytes": 1473323679,
+      "dir_bytes_after_compact": 1473323679,
+      "docs": 1183514,
+      "flush_seconds": 7.64262956,
+      "live_bytes": 755878080,
+      "reopen_seconds": 0.001910682,
+      "rss_delta_bytes": 135962624,
+      "segments_after_compact": 1,
+      "segments_after_flush": 6,
+      "upsert_seconds": 212.792149165
+    }
+  },
+  "results": [
+    {
+      "ef": 10,
+      "recall": 0.47004,
+      "qps_1t": 30088.459288006798,
+      "qps_nt": 74592.37226606368,
+      "latency": {
+        "mean_us": 33.169977700000004,
+        "p50_us": 31.34,
+        "p95_us": 51.041,
+        "p99_us": 62.382,
+        "max_us": 90.868
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 16,
+      "recall": 0.5564,
+      "qps_1t": 21498.491509971598,
+      "qps_nt": 52848.29618070807,
+      "latency": {
+        "mean_us": 46.4662302,
+        "p50_us": 43.816,
+        "p95_us": 71.014,
+        "p99_us": 85.656,
+        "max_us": 208.742
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 24,
+      "recall": 0.6267,
+      "qps_1t": 16025.977596853216,
+      "qps_nt": 39904.065996472826,
+      "latency": {
+        "mean_us": 62.3424384,
+        "p50_us": 59.193,
+        "p95_us": 93.412,
+        "p99_us": 110.304,
+        "max_us": 161.075
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 32,
+      "recall": 0.67063,
+      "qps_1t": 12879.65628473422,
+      "qps_nt": 31878.256174591086,
+      "latency": {
+        "mean_us": 77.58538,
+        "p50_us": 74.002,
+        "p95_us": 113.751,
+        "p99_us": 136.888,
+        "max_us": 186.31
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 48,
+      "recall": 0.72594,
+      "qps_1t": 9499.67334185755,
+      "qps_nt": 23588.510474350696,
+      "latency": {
+        "mean_us": 105.210479,
+        "p50_us": 101.627,
+        "p95_us": 150.448,
+        "p99_us": 178.965,
+        "max_us": 245.285
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 64,
+      "recall": 0.76089,
+      "qps_1t": 7420.267274747478,
+      "qps_nt": 18693.965189855255,
+      "latency": {
+        "mean_us": 134.7074202,
+        "p50_us": 131.424,
+        "p95_us": 186.142,
+        "p99_us": 220.944,
+        "max_us": 320.708
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 96,
+      "recall": 0.8051,
+      "qps_1t": 5332.157775969959,
+      "qps_nt": 13468.644090790325,
+      "latency": {
+        "mean_us": 187.4628587,
+        "p50_us": 185.081,
+        "p95_us": 249.455,
+        "p99_us": 295.398,
+        "max_us": 402.744
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 128,
+      "recall": 0.83182,
+      "qps_1t": 4123.046133893731,
+      "qps_nt": 10659.50546876601,
+      "latency": {
+        "mean_us": 242.379613,
+        "p50_us": 241.26,
+        "p95_us": 316.125,
+        "p99_us": 368.369,
+        "max_us": 480.791
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 192,
+      "recall": 0.8651,
+      "qps_1t": 2856.1558553639193,
+      "qps_nt": 7503.539695429417,
+      "latency": {
+        "mean_us": 350.0154531,
+        "p50_us": 351.721,
+        "p95_us": 446.456,
+        "p99_us": 497.539,
+        "max_us": 636.155
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 256,
+      "recall": 0.88532,
+      "qps_1t": 2224.139673298957,
+      "qps_nt": 5826.366918771912,
+      "latency": {
+        "mean_us": 449.4923047,
+        "p50_us": 454.544,
+        "p95_us": 566.732,
+        "p99_us": 613.888,
+        "max_us": 887.989
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 384,
+      "recall": 0.91085,
+      "qps_1t": 1528.2073200086556,
+      "qps_nt": 4066.171793282781,
+      "latency": {
+        "mean_us": 654.2454296000001,
+        "p50_us": 664.17,
+        "p95_us": 816.001,
+        "p99_us": 867.005,
+        "max_us": 1186.101
+      },
+      "deterministic": true
+    },
+    {
+      "ef": 512,
+      "recall": 0.92624,
+      "qps_1t": 1177.6741292147326,
+      "qps_nt": 3152.9697612350933,
+      "latency": {
+        "mean_us": 849.0158098,
+        "p50_us": 865.386,
+        "p95_us": 1055.614,
+        "p99_us": 1108.829,
+        "max_us": 1441.441
+      },
+      "deterministic": true
+    }
+  ],
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "7b12b34",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795831474
+  },
+  "notes": [
+    "End to end through Collection::upsert / flush / compact / search; build seconds = upsert + flush + compact (to one segment).",
+    "Index size counts the files the current manifest references (vectors, graph, id map, stored documents) plus manifest and log, after closing and reopening the database; dir_bytes also counts the previous generation kept as a crash fallback. Searches run on the reopened collection."
+  ]
+}

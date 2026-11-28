@@ -1,0 +1,145 @@
+{
+  "kind": "text",
+  "dataset": {
+    "collection": "collection.tsv",
+    "docs": 1000000,
+    "name": "msmarco-passage",
+    "queries": 6980,
+    "queries_file": "queries.dev.small.tsv",
+    "text_bytes": 335479702
+  },
+  "analyzer": "english",
+  "k": 10,
+  "threads": 4,
+  "engines": [
+    {
+      "engine": "muninn-engine",
+      "engine_version": "0.1.0 (7b12b34)",
+      "analyzer": "alphanumeric runs, Unicode lowercase, Latin diacritic folding, tokens > 255 bytes dropped, Lucene English stop words, Porter stemmer",
+      "index": {
+        "threads": 1,
+        "index_seconds": 11.439045193,
+        "finish_seconds": 4.141265204,
+        "total_seconds": 15.580310397,
+        "docs_per_sec": 64183.573659261034,
+        "index_bytes": 510780445,
+        "rss_delta_bytes": 173428736,
+        "details": {
+          "batch": 1000,
+          "bytes_by_kind": {
+            "docs": 698935840,
+            "ids": 91499056,
+            "other": 2807,
+            "t0": 137096624,
+            "wal": 52527461
+          },
+          "compact_seconds": 3.046337687,
+          "dir_bytes": 980061788,
+          "dir_bytes_after_compact": 980061788,
+          "docs": 1000000,
+          "flush_seconds": 1.094927517,
+          "live_bytes": 510780445,
+          "reopen_seconds": 0.002239471,
+          "rss_delta_bytes": 173428736,
+          "segments_after_compact": 1,
+          "segments_after_flush": 5,
+          "upsert_seconds": 11.439045193
+        }
+      },
+      "other_index_runs": [],
+      "search": {
+        "k": 10,
+        "queries": 6980,
+        "qps_1t": 1799.0513653183937,
+        "qps_nt": 4978.239267436429,
+        "latency": {
+          "mean_us": 555.7826929799427,
+          "p50_us": 326.687,
+          "p95_us": 1819.091,
+          "p99_us": 3218.919,
+          "max_us": 8782.471
+        },
+        "mean_hits": 9.99785100286533,
+        "deterministic": true
+      }
+    },
+    {
+      "engine": "muninn",
+      "engine_version": "0.1.0 (7b12b34)",
+      "analyzer": "alphanumeric runs, Unicode lowercase, Latin diacritic folding, tokens > 255 bytes dropped, Lucene English stop words, Porter stemmer",
+      "index": {
+        "threads": 1,
+        "index_seconds": 7.028342417,
+        "finish_seconds": 0.435054836,
+        "total_seconds": 7.463397253,
+        "docs_per_sec": 133987.24014027772,
+        "index_bytes": 67230056,
+        "rss_delta_bytes": 91406336,
+        "details": {
+          "in_memory_index_bytes": 136110162,
+          "terms": 343514
+        }
+      },
+      "other_index_runs": [],
+      "search": {
+        "k": 10,
+        "queries": 6980,
+        "qps_1t": 1811.772477424359,
+        "qps_nt": 5036.741463109635,
+        "latency": {
+          "mean_us": 551.894927077364,
+          "p50_us": 321.934,
+          "p95_us": 1819.342,
+          "p99_us": 3194.308,
+          "max_us": 8814.908
+        },
+        "mean_hits": 9.99785100286533,
+        "deterministic": true
+      }
+    }
+  ],
+  "overlap": {
+    "engines": [
+      "muninn-engine",
+      "muninn"
+    ],
+    "mean": 1.0,
+    "identical_sets": 1.0,
+    "same_top1": 1.0
+  },
+  "system": {
+    "hostname": "muninn-build",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz",
+    "cpu_flags": [
+      "sse4_2",
+      "avx",
+      "avx2",
+      "fma",
+      "f16c",
+      "avx512f",
+      "avx512bw",
+      "avx512vl",
+      "avx512dq",
+      "avx512_vnni",
+      "avx512_bf16",
+      "avx512_fp16",
+      "avx_vnni",
+      "amx_tile"
+    ],
+    "available_cpus": 4,
+    "cpu_pinning": "0,1,8,9",
+    "mem_total_bytes": 63206424576,
+    "kernel": "6.1.0-56-cloud-amd64",
+    "machine_type": "c4-standard-16",
+    "git_commit": "7b12b34",
+    "rustflags": "-C target-cpu=native",
+    "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+    "label": "Shared build VM (other agents compiling on other cores): numbers are NOISY, for pipeline validation only.",
+    "muninn_simd_isa": "avx512",
+    "timestamp": 1795831847
+  },
+  "notes": [
+    "End to end through Collection::upsert / flush / compact / search, next to the component-level index on the same passages.",
+    "Engine: batches of 1000 documents, durability each."
+  ]
+}

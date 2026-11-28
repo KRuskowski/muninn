@@ -1,0 +1,27 @@
+[package]
+name = "muninn-bench"
+description = "Reproducible benchmarks comparing muninn with other engines."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+# Heavy dependencies are fine here: this crate is a tool, never a
+# dependency of the library.
+[dependencies]
+muninn.workspace = true
+muninn-core.workspace = true
+muninn-simd.workspace = true
+muninn-store.workspace = true
+muninn-text.workspace = true
+muninn-vector.workspace = true
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tantivy = "0.27"
+
+[lints]
+workspace = true
